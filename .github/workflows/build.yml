@@ -9,15 +9,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
 
-      - name: Build All Targets
+      - name: Build App
         run: |
           PROJECT_PATH=$(find . -name "iSH-AOK.xcodeproj" -type d | head -n 1)
           
-          # We use -alltargets to avoid the "Target not found" error
+          # Target 'iSH-AOK' specifically to avoid the "Multiple commands produce" error
           xcodebuild -project "$PROJECT_PATH" \
-            -alltargets \
+            -target "iSH-AOK" \
             -sdk iphoneos \
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
@@ -30,20 +29,13 @@ jobs:
       - name: Package IPA
         run: |
           mkdir -p Payload
-          # Search the build folder for the actual .app file produced
-          APP_PATH=$(find build/Release-iphoneos -name "*.app" -type d | head -n 1)
-          
-          if [ -z "$APP_PATH" ]; then
-            echo "Error: No .app file found in build directory!"
-            exit 1
-          fi
-          
-          echo "Found App at: $APP_PATH"
+          # Find the .app folder and zip it
+          APP_PATH=$(find build/Release-iphoneos -name "iSH-AOK.app" -type d | head -n 1)
           cp -r "$APP_PATH" Payload/
           zip -r iSH-AOK.ipa Payload
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ish-aok-sideload-me
+          name: ish-aok-jit-build
           path: iSH-AOK.ipa
