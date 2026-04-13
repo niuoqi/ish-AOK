@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -11,37 +11,36 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Set up Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
-
-      - name: Build Archive
+      - name: Debug Project Info
         run: |
-          # 1. Locate the AOK-specific project file
           PROJECT_PATH=$(find . -name "iSH-AOK.xcodeproj" -type d | head -n 1)
-          echo "Building project at: $PROJECT_PATH"
+          xcodebuild -list -project "$PROJECT_PATH"
 
-          # 2. Archive the app (Bypasses 'iSH-AOK pre' script hangs)
-          # We use -scheme iSH as it is the standard app scheme in the AOK fork
-          xcodebuild archive \
-            -project "$PROJECT_PATH" \
-            -scheme iSH \
-            -archivePath $PWD/build/iSH.xcarchive \
+      - name: Build App
+        run: |
+          PROJECT_PATH=$(find . -name "iSH-AOK.xcodeproj" -type d | head -n 1)
+          
+          # We build the 'iSH' TARGET directly. This is more reliable than Schemes in CI.
+          xcodebuild -project "$PROJECT_PATH" \
+            -target "iSH" \
             -sdk iphoneos \
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            AD_HOC_CODE_SIGNING_ALLOWED=YES
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            clean build
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          # 3. Extract the compiled .app from the archive
-          APP_PATH=$(find build/iSH.xcarchive -name "*.app" -type d | head -n 1)
+          # Locate the .app file in the build folder
+          APP_PATH=$(find . -name "iSH.app" -type d | grep "Release-iphoneos" | head -n 1)
+          echo "Found App at: $APP_PATH"
           cp -r "$APP_PATH" Payload/
           zip -r iSH-AOK.ipa Payload
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ish-aok-jit-build
+          name: ish-aok-final
           path: iSH-AOK.ipa
