@@ -7,6 +7,8 @@
 #include "fs/devices.h"
 #include "util/sync.h"
 
+extern time_t boot_time;
+
 extern struct tty_driver pty_master;
 extern struct tty_driver pty_slave;
 
@@ -28,6 +30,9 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->driver = driver;
     tty->type = type;
     tty->num = num;
+    tty->atime = (dword_t) boot_time;
+    tty->mtime = (dword_t) boot_time;
+    tty->ctime = (dword_t) boot_time;
     tty->hung_up = false;
     tty->ever_opened = false;
     tty->session = 0;
@@ -40,7 +45,7 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
     // from include/asm-generic/termios.h
     memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
-    memset(&tty->winsize, 0, sizeof(tty->winsize));
+    tty->winsize = (struct winsize_) {.row = 24, .col = 80};
 
     lock_init(&tty->lock, "tty_alloc\0");
     lock_init(&tty->fds_lock, "tty_alloc_fds\0");
@@ -144,16 +149,14 @@ void tty_release(struct tty *tty) {
     }
 }
 
-// must call with tty lock
-static void tty_set_controlling(struct tgroup *group, struct tty *tty) {
-    lock(&group->lock, 0);
+// must call with group->lock and tty->lock
+static void tty_set_controlling_locked(struct tgroup *group, struct tty *tty) {
     if (group->tty == NULL) {
         tty->refcount++;
         group->tty = tty;
         tty->session = group->sid;
         tty->fg_group = group->pgid;
     }
-    unlock(&group->lock);
 }
 
 // by default, /dev/console is /dev/tty1
@@ -171,12 +174,12 @@ int tty_open(struct tty *tty, struct fd *fd) {
         // Make this our controlling terminal if:
         // - the terminal doesn't already have a session
         // - we're a session leader
-        complex_lockt(&pids_lock, 0);
+        lock(&current->group->lock, 0);
         lock(&tty->lock, 0);
         if (tty->session == 0 && current->group->sid == current->pid)
-            tty_set_controlling(current->group, tty);
+            tty_set_controlling_locked(current->group, tty);
         unlock(&tty->lock);
-        unlock(&pids_lock);
+        unlock(&current->group->lock);
     }
 
 
@@ -291,6 +294,12 @@ static bool tty_trace_signal_enabled(void) {
     if (current == NULL)
         return false;
     return tty_trace_comm(current->comm);
+}
+
+static bool tty_trace_timed_raw_enabled(struct tty *tty) {
+    if (current == NULL || tty == NULL)
+        return false;
+    return !(tty->termios.lflags & ICANON_) && tty->termios.cc[VTIME_] > 0;
 }
 
 static bool tty_send_input_signal(struct tty *tty, char ch, sigset_t_ *queue) {
@@ -452,8 +461,13 @@ no_special:
         }
     }
 
-    if (done_size > 0)
+    if (done_size > 0) {
+        dword_t now = (dword_t) time(NULL);
+        lock(&tty->lock, 0);
+        tty->atime = now;
+        unlock(&tty->lock);
         return done_size;
+    }
     return err;
 }
 
@@ -491,19 +505,21 @@ static bool tty_is_current(struct tty *tty) {
     return is_current;
 }
 
-static int tty_signal_if_background(struct tty *tty, pid_t_ current_pgid, int sig) {
-    // you can apparently access a terminal that's not your controlling
-    // terminal all you want
-    if (!tty_is_current(tty))
+// must call with tty->lock
+static int tty_signal_if_background_locked(struct tty *tty, int sig) {
+    pid_t_ current_pgid;
+    bool is_current;
+    lock(&current->group->lock, 0);
+    is_current = current->group->tty == tty;
+    current_pgid = current->group->pgid;
+    unlock(&current->group->lock);
+    if (!is_current)
         return 0;
-    // check if we're in the foreground
     if (tty->fg_group == 0 || current_pgid == tty->fg_group)
         return 0;
-
     if (!try_self_signal(sig))
         return _EIO;
-    else
-        return _EINTR;
+    return _EINTR;
 }
 
 static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
@@ -513,16 +529,12 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
 
     int err = 0;
     struct tty *tty = fd->tty;
-    complex_lockt(&pids_lock, 1); // MKEMKE
     lock(&tty->lock, 0);
     if (tty->hung_up) {
-        unlock(&pids_lock);
         goto error;
     }
 
-    pid_t_ current_pgid = current->group->pgid;
-    unlock(&pids_lock);
-    err = tty_signal_if_background(tty, current_pgid, SIGTTIN_);
+    err = tty_signal_if_background_locked(tty, SIGTTIN_);
     if (err < 0)
         goto error;
 
@@ -566,6 +578,17 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
     } else {
         dword_t min = tty->termios.cc[VMIN_];
         dword_t time = tty->termios.cc[VTIME_];
+        if (tty_trace_timed_raw_enabled(tty)) {
+            printk("INFO: top tty_read enter pid=%d tty=%d:%d bufsize=%zu req=%zu min=%u time=%u flags=%#x\n",
+                   current->pid,
+                   tty->driver != NULL ? tty->driver->major : -1,
+                   tty->num,
+                   tty->bufsize,
+                   bufsize,
+                   min,
+                   time,
+                   fd->flags);
+        }
 
         struct timespec timeout;
         // time is in tenths of a second
@@ -584,6 +607,17 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
                 goto error;
             // there should be no timeout for the first character read
             err = wait_for(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
+            if (tty_trace_timed_raw_enabled(tty)) {
+                printk("INFO: top tty_read wait pid=%d tty=%d:%d bufsize=%zu min=%u time=%u err=%d first=%d\n",
+                       current->pid,
+                       tty->driver != NULL ? tty->driver->major : -1,
+                       tty->num,
+                       tty->bufsize,
+                       min,
+                       time,
+                       err,
+                       tty->bufsize == 0);
+            }
             if (err == _ETIMEDOUT)
                 break;
             if (err == _EINTR)
@@ -668,6 +702,18 @@ static int tty_poll(struct fd *fd) {
     }
     if (tty->driver == &pty_master && tty->packet_flags != 0)
         types |= POLL_PRI;
+    if (tty_trace_timed_raw_enabled(tty)) {
+        printk("INFO: top tty_poll pid=%d tty=%d:%d lflags=%#x vmin=%u vtime=%u bufsize=%zu hung=%d types=%#x\n",
+               current->pid,
+               tty->driver != NULL ? tty->driver->major : -1,
+               tty->num,
+               tty->termios.lflags,
+               tty->termios.cc[VMIN_],
+               tty->termios.cc[VTIME_],
+               tty->bufsize,
+               tty->hung_up,
+               types);
+    }
     unlock(&tty->lock);
     return types;
 }
@@ -691,10 +737,9 @@ static ssize_t tty_ioctl_size(int cmd) {
 
 static int tiocsctty(struct tty *tty, int force) {
     int err = 0;
-    unlock(&tty->lock); //aaaaaaaa
-    // it's safe because literally nothing happens between that unlock and the last lock, and repulsive for the same reason
-    // locking is ***hard**
+    unlock(&tty->lock);
     complex_lockt(&pids_lock, 0);
+    lock(&current->group->lock, 0);
     lock(&tty->lock, 0);
     // do nothing if this is already our controlling tty
     if (current->group->sid == current->pid && current->group->sid == tty->session)
@@ -724,8 +769,9 @@ static int tiocsctty(struct tty *tty, int force) {
         }
     }
 
-    tty_set_controlling(current->group, tty);
+    tty_set_controlling_locked(current->group, tty);
 out:
+    unlock(&current->group->lock);
     unlock(&pids_lock);
     return err;
 }
@@ -828,13 +874,13 @@ static int tty_ioctl(struct fd *fd, int cmd, void *arg) {
             break;
 
         case TIOCSPGRP_:
-            // see "aaaaaaaa" comment above
             unlock(&tty->lock);
-            complex_lockt(&pids_lock, 0);
+            lock(&current->group->lock, 0);
             lock(&tty->lock, 0);
             pid_t_ sid = current->group->sid;
-            unlock(&pids_lock);
-            if (!tty_is_current(tty) || sid != tty->session) {
+            bool is_current = current->group->tty == tty;
+            unlock(&current->group->lock);
+            if (!is_current || sid != tty->session) {
                 err = _ENOTTY;
                 break;
             }
@@ -868,7 +914,7 @@ void tty_set_winsize(struct tty *tty, struct winsize_ winsize) {
     tty->winsize = winsize;
     if (tty->fg_group == 0)
         return;
-    if (pthread_mutex_trylock(&pids_lock.m) != 0)
+    if (trylock(&pids_lock) != 0)
         return;
     struct pid *pid = pid_get(tty->fg_group);
     if (pid != NULL) {
@@ -877,7 +923,7 @@ void tty_set_winsize(struct tty *tty, struct winsize_ winsize) {
             send_signal(tgroup->leader, SIGWINCH_, SIGINFO_NIL);
         }
     }
-    pthread_mutex_unlock(&pids_lock.m);
+    unlock(&pids_lock);
 }
 
 void tty_hangup(struct tty *tty) {
@@ -885,6 +931,50 @@ void tty_hangup(struct tty *tty) {
     tty_poll_wakeup(tty, POLL_READ | POLL_WRITE | POLL_ERR | POLL_HUP);
     if (tty->driver == &pty_slave && tty->pty.other != NULL)
         tty_poll_wakeup_unlocked(tty->pty.other, POLL_READ | POLL_HUP);
+}
+
+bool tty_stat_rdev(dev_t_ rdev, struct statbuf *stat) {
+    int major = dev_major(rdev);
+    int minor = dev_minor(rdev);
+    bool tty_alias = false;
+    if (major == TTY_ALTERNATE_MAJOR && minor == DEV_CONSOLE_MINOR) {
+        major = console_major;
+        minor = console_minor;
+        tty_alias = true;
+    }
+
+    if (major == TTY_ALTERNATE_MAJOR && minor == DEV_TTY_MINOR)
+        tty_alias = true;
+
+    if (!tty_alias &&
+            major != TTY_CONSOLE_MAJOR && major != TTY_PSEUDO_MASTER_MAJOR &&
+            major != TTY_PSEUDO_SLAVE_MAJOR)
+        return false;
+
+    dword_t stamp = (dword_t) boot_time;
+    struct tty_driver *driver = tty_drivers[major];
+    if (driver == NULL || minor < 0 || (unsigned) minor >= driver->limit) {
+        stat->atime = stamp;
+        stat->mtime = stamp;
+        stat->ctime = stamp;
+        return true;
+    }
+
+    lock(&ttys_lock, 0);
+    struct tty *tty = driver->ttys[minor];
+    if (tty != NULL && tty != (void *) 1) {
+        lock(&tty->lock, 0);
+        stat->atime = tty->atime;
+        stat->mtime = tty->mtime;
+        stat->ctime = tty->ctime;
+        unlock(&tty->lock);
+    } else {
+        stat->atime = stamp;
+        stat->mtime = stamp;
+        stat->ctime = stamp;
+    }
+    unlock(&ttys_lock);
+    return true;
 }
 
 struct dev_ops tty_dev = {

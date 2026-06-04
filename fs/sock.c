@@ -5,9 +5,13 @@
 #if defined(__APPLE__)
 #include <net/if_dl.h>
 #endif
+#include <netinet/icmp6.h>
+#include <netinet/ip6.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -128,6 +132,14 @@ struct sockaddr_in_ {
     uint16_t sin_port;
     uint32_t sin_addr;
     uint8_t sin_zero[8];
+};
+
+struct sockaddr_in6_ {
+    uint16_t sin6_family;
+    uint16_t sin6_port;
+    uint32_t sin6_flowinfo;
+    struct in6_addr sin6_addr;
+    uint32_t sin6_scope_id;
 };
 
 struct guest_ifreq_addr_ {
@@ -668,10 +680,151 @@ static bool sock_trace_comm(const char *comm) {
         strncmp(comm, "update-ca-certi", 15) == 0;
 }
 
+static bool sock_debug_comm(const char *comm) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_SOCK_DEBUG") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    if (comm == NULL)
+        return false;
+    return strcmp(comm, "apt") == 0 ||
+        strcmp(comm, "apt-get") == 0 ||
+        strncmp(comm, "http", 4) == 0;
+}
+
+static void sock_debug_event(const char *op, struct fd *sock, ssize_t result, int mapped_err) {
+    if (current == NULL || !sock_debug_comm(current->comm))
+        return;
+    fprintf(stderr,
+            "ish-sock:%s pid=%d comm=%s guest_domain=%d guest_type=%d protocol=%d real=%d result=%zd err=%d\n",
+            op, current->pid, current->comm,
+            sock != NULL ? sock->socket.domain : -1,
+            sock != NULL ? sock->socket.type : -1,
+            sock != NULL ? sock->socket.protocol : -1,
+            sock != NULL ? sock->real_fd : -1,
+            result, mapped_err);
+}
+
+static void sock_debug_guest_sockaddr(const char *op, struct fd *sock,
+        guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
+    if (current == NULL || !sock_debug_comm(current->comm))
+        return;
+    if (sockaddr_addr == 0 || sockaddr_len < offsetof(struct sockaddr_, data) ||
+            sockaddr_len > sizeof(struct sockaddr_max_)) {
+        fprintf(stderr,
+                "ish-sock:%s-addr pid=%d comm=%s real=%d guest_domain=%d guest_type=%d addr=%#llx len=%u detail=<none>\n",
+                op, current->pid, current->comm,
+                sock != NULL ? sock->real_fd : -1,
+                sock != NULL ? sock->socket.domain : -1,
+                sock != NULL ? sock->socket.type : -1,
+                (unsigned long long) sockaddr_addr, sockaddr_len);
+        return;
+    }
+
+    struct sockaddr_max_ fake_addr = {};
+    if (user_read(sockaddr_addr, &fake_addr, sockaddr_len)) {
+        fprintf(stderr,
+                "ish-sock:%s-addr pid=%d comm=%s real=%d guest_domain=%d guest_type=%d addr=%#llx len=%u detail=<fault>\n",
+                op, current->pid, current->comm,
+                sock != NULL ? sock->real_fd : -1,
+                sock != NULL ? sock->socket.domain : -1,
+                sock != NULL ? sock->socket.type : -1,
+                (unsigned long long) sockaddr_addr, sockaddr_len);
+        return;
+    }
+
+    char detail[SOCKADDR_DATA_MAX + 32];
+    if (fake_addr.family == AF_LOCAL_) {
+        size_t path_size = sockaddr_len - offsetof(struct sockaddr_, data);
+        if (path_size == 0) {
+            snprintf(detail, sizeof(detail), "unix:<empty>");
+        } else if (fake_addr.data[0] == '\0') {
+            size_t copy = path_size - 1;
+            if (copy > SOCKADDR_DATA_MAX)
+                copy = SOCKADDR_DATA_MAX;
+            char path[SOCKADDR_DATA_MAX + 1];
+            memcpy(path, fake_addr.data + 1, copy);
+            path[copy] = '\0';
+            snprintf(detail, sizeof(detail), "unix-abstract:%s", path);
+        } else {
+            size_t copy = path_size;
+            if (copy > SOCKADDR_DATA_MAX)
+                copy = SOCKADDR_DATA_MAX;
+            char path[SOCKADDR_DATA_MAX + 1];
+            memcpy(path, fake_addr.data, copy);
+            path[copy] = '\0';
+            snprintf(detail, sizeof(detail), "unix:%s", path);
+        }
+    } else if (fake_addr.family == AF_INET_) {
+        struct sockaddr_in_ *addr4 = (struct sockaddr_in_ *) &fake_addr;
+        struct in_addr real_addr = {.s_addr = addr4->sin_addr};
+        char host[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &real_addr, host, sizeof(host));
+        snprintf(detail, sizeof(detail), "inet:%s:%u", host, ntohs(addr4->sin_port));
+    } else if (fake_addr.family == AF_INET6_) {
+        snprintf(detail, sizeof(detail), "inet6");
+    } else if (fake_addr.family == AF_NETLINK_) {
+        struct sockaddr_nl_ *addr_nl = (struct sockaddr_nl_ *) &fake_addr;
+        snprintf(detail, sizeof(detail), "netlink:pid=%u groups=%#x",
+                addr_nl->nl_pid, addr_nl->nl_groups);
+    } else {
+        snprintf(detail, sizeof(detail), "family=%u", fake_addr.family);
+    }
+
+    fprintf(stderr,
+            "ish-sock:%s-addr pid=%d comm=%s real=%d guest_domain=%d guest_type=%d addr=%#llx len=%u detail=%s\n",
+            op, current->pid, current->comm,
+            sock != NULL ? sock->real_fd : -1,
+            sock != NULL ? sock->socket.domain : -1,
+            sock != NULL ? sock->socket.type : -1,
+            (unsigned long long) sockaddr_addr, sockaddr_len, detail);
+}
+
 static bool sock_trace_enabled(void) {
     if (current == NULL)
         return false;
     return sock_trace_comm(current->comm) && false;
+}
+
+static bool sock_is_x11_unix_socket(struct fd *sock) {
+    if (sock == NULL || sock->socket.domain != AF_LOCAL_)
+        return false;
+    size_t name_len = sock->socket.unix_name_len;
+    if (name_len == 0)
+        return false;
+    const char *name = sock->socket.unix_name;
+    if (name[0] == '\0') {
+        name++;
+        name_len--;
+    }
+    static const char x11_prefix[] = "/tmp/.X11-unix/X";
+    return name_len >= sizeof(x11_prefix) - 1 &&
+        memcmp(name, x11_prefix, sizeof(x11_prefix) - 1) == 0;
+}
+
+static void sock_x11_event(const char *op, struct fd *sock, ssize_t result, int err, size_t requested) {
+    if (!sock_is_x11_unix_socket(sock))
+        return;
+    size_t name_len = sock->socket.unix_name_len;
+    const char *name = sock->socket.unix_name;
+    if (name_len != 0 && name[0] == '\0') {
+        name++;
+        name_len--;
+    }
+    if (name_len > 107)
+        name_len = 107;
+    printk("INFO: x11sock %s pid=%d comm=%s real=%d requested=%zu result=%zd err=%d flags=%#x peer_pending=%d name=%.*s\n",
+           op, current ? current->pid : -1, current ? current->comm : "?",
+           sock->real_fd, requested, result, err, sock->flags,
+           (int) sock->socket.unix_peer_pending, (int) name_len, name);
+}
+
+static size_t sock_iov_requested(const struct iovec *iov, size_t iovlen) {
+    size_t total = 0;
+    for (size_t i = 0; i < iovlen; i++)
+        total += iov[i].iov_len;
+    return total;
 }
 
 static bool sock_is_devlog_sink(const struct fd *sock) {
@@ -780,7 +933,7 @@ static int sock_ifconf(struct guest_ifconf_ *ifconf) {
     return 0;
 }
 
-static bool guest_sockaddr_is_devlog(addr_t sockaddr_addr, uint_t sockaddr_len) {
+static bool guest_sockaddr_is_devlog(guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sockaddr_addr == 0)
         return false;
     if (sockaddr_len < offsetof(struct sockaddr_, data))
@@ -804,7 +957,7 @@ static bool guest_sockaddr_is_devlog(addr_t sockaddr_addr, uint_t sockaddr_len) 
         memcmp(fake_addr.data, devlog_path, strlen(devlog_path)) == 0;
 }
 
-static bool guest_sockaddr_is_initctl(addr_t sockaddr_addr, uint_t sockaddr_len) {
+static bool guest_sockaddr_is_initctl(guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sockaddr_addr == 0)
         return false;
     if (sockaddr_len < offsetof(struct sockaddr_, data))
@@ -831,7 +984,7 @@ static bool guest_sockaddr_is_initctl(addr_t sockaddr_addr, uint_t sockaddr_len)
             memcmp(fake_addr.data, dev_initctl_path, strlen(dev_initctl_path)) == 0);
 }
 
-static bool guest_sockaddr_is_abstract_local(addr_t sockaddr_addr, uint_t sockaddr_len) {
+static bool guest_sockaddr_is_abstract_local(guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
     if (sockaddr_addr == 0)
         return false;
     if (sockaddr_len < offsetof(struct sockaddr_, data))
@@ -897,6 +1050,79 @@ static bool socket_should_retry_io_eintr(struct fd *sock, int real_flags) {
         return false;
 #endif
     return !socket_guest_signal_pending();
+}
+
+static bool socket_call_is_blocking(struct fd *sock, int real_flags) {
+    if (fd_getflags(sock) & O_NONBLOCK_)
+        return false;
+#ifdef MSG_DONTWAIT
+    if (real_flags & MSG_DONTWAIT)
+        return false;
+#endif
+    return true;
+}
+
+static bool socket_should_retry_io_eagain(struct fd *sock, int real_flags) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK)
+        return false;
+    return socket_call_is_blocking(sock, real_flags);
+}
+
+static bool socket_should_map_unix_eperm_to_eagain(struct fd *sock, int real_flags) {
+    if (errno != EPERM)
+        return false;
+    if (sock->socket.domain != AF_LOCAL_)
+        return false;
+    return !socket_call_is_blocking(sock, real_flags);
+}
+
+static bool socket_blocking_syscall_begin(sigset_t *oldmask) {
+    sigset_t sigusr1;
+    sigemptyset(&sigusr1);
+    sigaddset(&sigusr1, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &sigusr1, oldmask);
+
+    if (sigunwind_start()) {
+        pthread_sigmask(SIG_SETMASK, oldmask, NULL);
+        errno = EINTR;
+        return false;
+    }
+
+    if (socket_guest_signal_pending()) {
+        sigunwind_end();
+        pthread_sigmask(SIG_SETMASK, oldmask, NULL);
+        errno = EINTR;
+        return false;
+    }
+
+    pthread_sigmask(SIG_SETMASK, oldmask, NULL);
+    return true;
+}
+
+static void socket_blocking_syscall_end(void) {
+    sigunwind_end();
+}
+
+static int socket_wait_ready(struct fd *sock, short events) {
+    struct pollfd pfd = {
+        .fd = sock->real_fd,
+        .events = events | POLLERR | POLLHUP,
+    };
+    for (;;) {
+        sigset_t oldmask;
+        if (!socket_blocking_syscall_begin(&oldmask))
+            return errno_map();
+        errno = 0;
+        int wait_res = poll(&pfd, 1, -1);
+        socket_blocking_syscall_end();
+        if (wait_res > 0)
+            return 0;
+        if (wait_res == 0)
+            continue;
+        if (errno == EINTR && !socket_guest_signal_pending())
+            continue;
+        return errno_map();
+    }
 }
 
 #if defined(__APPLE__)
@@ -1088,7 +1314,7 @@ static void sock_trace_iov_preview(struct fd *sock, const struct iovec *iov, siz
            sock->real_fd, total, preview);
 }
 
-static int unix_socket_finish_peer(struct fd *sock, bool wait);
+static int unix_socket_finish_peer(struct fd *sock);
 
 static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
@@ -1104,7 +1330,26 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
         cond_init(&fd->socket.unix_got_peer);
         list_init(&fd->socket.unix_scm);
     }
+    sock_debug_event("fd-create", fd, 0, 0);
     return f_install(fd, type & ~SOCKET_TYPE_MASK);
+}
+
+static bool unix_seqpacket_fallback_needed(int domain, int type, int protocol, int err) {
+    if (domain != AF_LOCAL_)
+        return false;
+    if ((type & SOCKET_TYPE_MASK) != SOCK_SEQPACKET_)
+        return false;
+    if (protocol != 0)
+        return false;
+    switch (err) {
+        case EPROTONOSUPPORT:
+        case EPROTOTYPE:
+        case ESOCKTNOSUPPORT:
+        case EOPNOTSUPP:
+            return true;
+        default:
+            return false;
+    }
 }
 
 int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
@@ -1142,8 +1387,17 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         protocol = IPPROTO_ICMP;
 
     int sock = socket(real_domain, real_type, protocol);
+#if defined(__APPLE__)
+    if (sock < 0 && unix_seqpacket_fallback_needed(domain, type, protocol, errno))
+        sock = socket(real_domain, SOCK_STREAM, protocol);
+#endif
     if (sock < 0)
         return errno_map();
+    if (sock_debug_comm(current != NULL ? current->comm : NULL))
+        fprintf(stderr, "ish-sock:socket-host pid=%d comm=%s domain=%d type=%d protocol=%d real=%d\n",
+                current != NULL ? current->pid : -1,
+                current != NULL ? current->comm : "?",
+                domain, type, protocol, sock);
 
 #ifdef __APPLE__
     if (domain == AF_INET_ && type == SOCK_DGRAM_) {
@@ -1260,6 +1514,15 @@ static int diag_socket_push(struct diag_socket_entry *entries, struct fd *fd) {
     return 0;
 }
 
+static struct fdtable *diag_task_files_retain(struct task *task) {
+    struct fdtable *files = NULL;
+    lock(&task->general_lock, 0);
+    if (task->files != NULL)
+        files = fdtable_retain(task->files);
+    unlock(&task->general_lock);
+    return files;
+}
+
 static void diag_socket_release(struct diag_socket_entry *entries) {
     for (unsigned i = 0; i < entries->count; i++)
         fd_close(entries->fds[i]);
@@ -1267,16 +1530,21 @@ static void diag_socket_release(struct diag_socket_entry *entries) {
 }
 
 static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, int type) {
-    int err = 0;
-    complex_lockt(&pids_lock, 0);
-    struct pid *pid_entry;
-    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
-        if (task == NULL || task->files == NULL)
+    struct task_snapshot snapshot = {};
+    int err = task_snapshot_collect(&snapshot, false);
+    if (err < 0)
+        return err;
+
+    for (unsigned i = 0; i < snapshot.count; i++) {
+        struct task *task = snapshot.tasks[i];
+        if (task == NULL)
             continue;
-        lock(&task->files->lock, 0);
-        for (fd_t fd_no = 0; (unsigned) fd_no < task->files->size; fd_no++) {
-            struct fd *fd = fdtable_get(task->files, fd_no);
+        struct fdtable *files = diag_task_files_retain(task);
+        if (files == NULL)
+            continue;
+        lock(&files->lock, 0);
+        for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
+            struct fd *fd = fdtable_get(files, fd_no);
             if (fd == NULL || fd->ops != &socket_fdops)
                 continue;
             if (fd->socket.domain != domain)
@@ -1289,11 +1557,12 @@ static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, i
             if (err < 0)
                 break;
         }
-        unlock(&task->files->lock);
+        unlock(&files->lock);
+        fdtable_release(files);
         if (err < 0)
             break;
     }
-    unlock(&pids_lock);
+    task_snapshot_release(&snapshot);
     return err;
 }
 
@@ -1310,6 +1579,98 @@ static int diag_recv_q(struct fd *fd) {
     if (fd->real_fd >= 0 && ioctl(fd->real_fd, FIONREAD, &bytes) == 0 && bytes > 0)
         return bytes;
     return 0;
+}
+
+struct inet_bind_info {
+    sa_family_t family;
+    uint16_t port;
+    bool wildcard;
+    uint32_t scope_id;
+    union {
+        struct in_addr v4;
+        struct in6_addr v6;
+    } addr;
+};
+
+static bool inet_bind_info_from_sockaddr(const struct sockaddr *sa, struct inet_bind_info *info) {
+    if (sa == NULL || info == NULL)
+        return false;
+    memset(info, 0, sizeof(*info));
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *) sa;
+        info->family = AF_INET;
+        info->port = sin->sin_port;
+        info->addr.v4 = sin->sin_addr;
+        info->wildcard = sin->sin_addr.s_addr == htonl(INADDR_ANY);
+        return info->port != 0;
+    }
+    if (sa->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *) sa;
+        info->family = AF_INET6;
+        info->port = sin6->sin6_port;
+        info->addr.v6 = sin6->sin6_addr;
+        info->scope_id = sin6->sin6_scope_id;
+        info->wildcard = IN6_IS_ADDR_UNSPECIFIED(&sin6->sin6_addr);
+        return info->port != 0;
+    }
+    return false;
+}
+
+static bool inet_bind_addr_overlaps(const struct inet_bind_info *a, const struct inet_bind_info *b) {
+    if (a->family != b->family || a->port != b->port)
+        return false;
+    if (a->wildcard || b->wildcard)
+        return true;
+    if (a->family == AF_INET)
+        return a->addr.v4.s_addr == b->addr.v4.s_addr;
+    if (a->family == AF_INET6)
+        return memcmp(&a->addr.v6, &b->addr.v6, sizeof(a->addr.v6)) == 0 &&
+            a->scope_id == b->scope_id;
+    return false;
+}
+
+static bool sock_bound_inet_conflicts(struct fd *sock, const struct inet_bind_info *candidate) {
+    struct task_snapshot snapshot = {};
+    bool conflict = false;
+    if (task_snapshot_collect(&snapshot, false) < 0)
+        return false;
+
+    for (unsigned i = 0; i < snapshot.count && !conflict; i++) {
+        struct task *task = snapshot.tasks[i];
+        if (task == NULL)
+            continue;
+        struct fdtable *files = diag_task_files_retain(task);
+        if (files == NULL)
+            continue;
+        lock(&files->lock, 0);
+        for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
+            struct fd *other = fdtable_get(files, fd_no);
+            if (other == NULL || other == sock || other->ops != &socket_fdops)
+                continue;
+            if (other->socket.domain != sock->socket.domain ||
+                    other->socket.type != sock->socket.type ||
+                    other->real_fd < 0) {
+                continue;
+            }
+            struct sockaddr_storage other_addr = {};
+            socklen_t other_addr_len = sizeof(other_addr);
+            if (getsockname(other->real_fd, (struct sockaddr *) &other_addr, &other_addr_len) < 0)
+                continue;
+            struct inet_bind_info other_info = {};
+            if (!inet_bind_info_from_sockaddr((const struct sockaddr *) &other_addr, &other_info))
+                continue;
+            if (!inet_bind_addr_overlaps(candidate, &other_info))
+                continue;
+            if (sock->socket.reuseport && other->socket.reuseport)
+                continue;
+            conflict = true;
+            break;
+        }
+        unlock(&files->lock);
+        fdtable_release(files);
+    }
+    task_snapshot_release(&snapshot);
+    return conflict;
 }
 
 static int diag_tcp_state(struct fd *fd) {
@@ -1606,7 +1967,7 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
     return (int) copied;
 }
 
-static int netlink_sockaddr_write(addr_t sockaddr_addr, const void *sockaddr, uint_t *sockaddr_len) {
+static int netlink_sockaddr_write(guest_addr_t sockaddr_addr, const void *sockaddr, uint_t *sockaddr_len) {
     uint_t actual_len = sizeof(struct sockaddr_nl_);
     uint_t copy_len = *sockaddr_len;
     if (copy_len > actual_len)
@@ -1624,6 +1985,8 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     struct statbuf stat;
     err = mount->fs->stat(mount, path, &stat);
 
@@ -1680,38 +2043,80 @@ out:
     return err;
 }
 
-static int unix_socket_finish_peer(struct fd *sock, bool wait) {
+static int unix_socket_send_peer_token(struct fd *sock) {
+    size_t sent = 0;
+    const char *buf = (const char *) &sock;
+    while (sent < sizeof(sock)) {
+        ssize_t res = 0;
+        TASK_MAY_BLOCK {
+            while (1) {
+                errno = 0;
+                res = write(sock->real_fd, buf + sent, sizeof(sock) - sent);
+                if (res >= 0)
+                    break;
+                if (socket_should_retry_io_eintr(sock, 0))
+                    continue;
+                if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                        socket_call_is_blocking(sock, 0)) {
+                    int wait_err = socket_wait_ready(sock, POLLOUT);
+                    if (wait_err < 0) {
+                        res = wait_err;
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        if (res < 0)
+            return res > -4096 && res < 0 ? (int) res : errno_map();
+        if (res == 0)
+            return _EPIPE;
+        sent += (size_t) res;
+    }
+    return 0;
+}
+
+static int unix_socket_finish_peer(struct fd *sock) {
     if (sock->socket.domain != AF_LOCAL_)
         return 0;
 
     if (sock->socket.unix_peer_pending) {
-        int recv_flags = 0;
-        if (!wait || (fd_getflags(sock) & O_NONBLOCK_))
-            recv_flags |= MSG_DONTWAIT;
-        else
-            recv_flags |= MSG_WAITALL;
+        int recv_flags = MSG_WAITALL;
 
         while (sock->socket.unix_peer_off < sizeof(struct fd *)) {
             ssize_t res = 0;
             TASK_MAY_BLOCK {
-                do {
+                while (1) {
                     errno = 0;
                     res = recv(sock->real_fd,
                                sock->socket.unix_peer_buf + sock->socket.unix_peer_off,
                                sizeof(struct fd *) - sock->socket.unix_peer_off,
                                recv_flags);
-                } while (res < 0 && errno == EINTR);
+                    if (res >= 0)
+                        break;
+                    if (errno == EINTR) {
+                        if (socket_guest_signal_pending())
+                            break;
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        int wait_err = socket_wait_ready(sock, POLLIN);
+                        if (wait_err < 0) {
+                            res = wait_err;
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
+                }
             }
             if (res < 0)
-                return errno_map();
+                return res > -4096 && res < 0 ? (int) res : errno_map();
             if (res == 0)
                 return _ECONNRESET;
             sock->socket.unix_peer_off += res;
-            if (!wait || (fd_getflags(sock) & O_NONBLOCK_))
-                break;
         }
-        if (sock->socket.unix_peer_off < sizeof(struct fd *))
-            return _EAGAIN;
 
         struct fd *peer = NULL;
         memcpy(&peer, sock->socket.unix_peer_buf, sizeof(peer));
@@ -1754,6 +2159,8 @@ static uint32_t str_hash(const char *str) {
 struct unix_abstract {
     unsigned refcount;
     uint32_t hash;
+    size_t name_len;
+    char *name;
     uint32_t socket_id;
     struct list links;
 };
@@ -1763,6 +2170,7 @@ static lock_t unix_abstract_lock = LOCK_INITIALIZER;
 
 static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *socket_id) {
     uint32_t hash = str_hash(name);
+    size_t name_len = strlen(name);
     lock(&unix_abstract_lock, 0);
     struct unix_abstract *sock_tmp;
     struct unix_abstract *sock = NULL;
@@ -1770,7 +2178,9 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
     if (list_null(bucket))
         list_init(bucket);
     list_for_each_entry(bucket, sock_tmp, links) {
-        if (sock_tmp->hash == hash) {
+        if (sock_tmp->hash == hash &&
+                sock_tmp->name_len == name_len &&
+                memcmp(sock_tmp->name, name, name_len) == 0) {
             sock = sock_tmp;
             break;
         }
@@ -1787,8 +2197,19 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
 
     if (sock == NULL) {
         sock = malloc(sizeof(struct unix_abstract));
+        if (sock == NULL) {
+            unlock(&unix_abstract_lock);
+            return _ENOMEM;
+        }
+        sock->name = strdup(name);
+        if (sock->name == NULL) {
+            free(sock);
+            unlock(&unix_abstract_lock);
+            return _ENOMEM;
+        }
         sock->refcount = 0;
         sock->hash = hash;
+        sock->name_len = name_len;
         sock->socket_id = unix_socket_next_id();
         list_add(bucket, &sock->links);
     }
@@ -1801,10 +2222,16 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
     return 0;
 }
 
+static bool unix_socket_should_fallback_x11_path(const char *name) {
+    static const char x11_prefix[] = "/tmp/.X11-unix/";
+    return strncmp(name, x11_prefix, strlen(x11_prefix)) == 0;
+}
+
 static void unix_abstract_release(struct unix_abstract *name) {
     lock(&unix_abstract_lock, 0);
     if (--name->refcount == 0) {
         list_remove(&name->links);
+        free(name->name);
         free(name);
     }
     unlock(&unix_abstract_lock);
@@ -1812,41 +2239,70 @@ static void unix_abstract_release(struct unix_abstract *name) {
 
 const char *sock_tmp_prefix = "/tmp/ishsock";
 
-static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
     // Make sure we can read things without overflowing buffers
     if (*sockaddr_len < 2)
         return _EINVAL;
-    if (*sockaddr_len > sizeof(struct sockaddr_max_))
-        return _EINVAL;
-
-    if (user_read(sockaddr_addr, sockaddr, *sockaddr_len))
+    uint16_t guest_family;
+    if (user_read(sockaddr_addr, &guest_family, sizeof(guest_family)))
         return _EFAULT;
-    struct sockaddr_ *fake_addr = sockaddr;
-    int real_family = sock_family_to_real(fake_addr->family);
+    int real_family = sock_family_to_real(guest_family);
 
     switch (real_family) {
-        case PF_INET:
-            if (*sockaddr_len < sizeof(struct sockaddr_in))
+        case PF_INET: {
+            if (*sockaddr_len < sizeof(struct sockaddr_in_))
                 return _EINVAL;
+            struct sockaddr_in_ guest_addr;
+            if (user_read(sockaddr_addr, &guest_addr, sizeof(guest_addr)))
+                return _EFAULT;
+            {
+                struct sockaddr_in *real_addr = (struct sockaddr_in *) sockaddr;
+                memset(real_addr, 0, sizeof(*real_addr));
 #ifdef __APPLE__
-            ((struct sockaddr_in *) sockaddr)->sin_len = sizeof(struct sockaddr_in);
+                real_addr->sin_len = sizeof(*real_addr);
 #endif
-            ((struct sockaddr_in *) sockaddr)->sin_family = PF_INET;
+                real_addr->sin_family = PF_INET;
+                real_addr->sin_port = guest_addr.sin_port;
+                real_addr->sin_addr.s_addr = guest_addr.sin_addr;
+            }
+            *sockaddr_len = sizeof(struct sockaddr_in);
             break;
-        case PF_INET6:
-            if (*sockaddr_len < sizeof(struct sockaddr_in6))
+        }
+        case PF_INET6: {
+            if (*sockaddr_len < sizeof(struct sockaddr_in6_))
                 return _EINVAL;
+            struct sockaddr_in6_ guest_addr;
+            if (user_read(sockaddr_addr, &guest_addr, sizeof(guest_addr)))
+                return _EFAULT;
+            {
+                struct sockaddr_in6 *real_addr = (struct sockaddr_in6 *) sockaddr;
+                memset(real_addr, 0, sizeof(*real_addr));
 #ifdef __APPLE__
-            ((struct sockaddr_in6 *) sockaddr)->sin6_len = sizeof(struct sockaddr_in6);
+                real_addr->sin6_len = sizeof(*real_addr);
 #endif
-            ((struct sockaddr_in6 *) sockaddr)->sin6_family = PF_INET6;
+                real_addr->sin6_family = PF_INET6;
+                real_addr->sin6_port = guest_addr.sin6_port;
+                real_addr->sin6_flowinfo = guest_addr.sin6_flowinfo;
+                real_addr->sin6_addr = guest_addr.sin6_addr;
+                real_addr->sin6_scope_id = guest_addr.sin6_scope_id;
+            }
+            *sockaddr_len = sizeof(struct sockaddr_in6);
             break;
+        }
         case PF_NETLINK_:
             if (*sockaddr_len < sizeof(struct sockaddr_nl_))
                 return _EINVAL;
+            if (user_read(sockaddr_addr, sockaddr, sizeof(struct sockaddr_nl_)))
+                return _EFAULT;
+            *sockaddr_len = sizeof(struct sockaddr_nl_);
             break;
 
         case PF_LOCAL: {
+            if (*sockaddr_len > sizeof(struct sockaddr_max_))
+                return _EINVAL;
+            if (user_read(sockaddr_addr, sockaddr, *sockaddr_len))
+                return _EFAULT;
+            struct sockaddr_ *fake_addr = sockaddr;
             // First pull out the path, being careful to not overflow anything.
             char path[SOCKADDR_DATA_MAX + 1];
             size_t path_size = *sockaddr_len - offsetof(struct sockaddr_, data);
@@ -1863,6 +2319,11 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
             } else {
                 STRACE(" unix abstract socket %s", path + 1);
                 err = unix_abstract_get(path + 1, bind_fd, &socket_id);
+                if (err == _ENOENT && bind_fd == NULL &&
+                        unix_socket_should_fallback_x11_path(path + 1)) {
+                    STRACE(" unix abstract fallback to path %s", path + 1);
+                    err = unix_socket_get(path + 1, bind_fd, &socket_id);
+                }
             }
             if (err < 0)
                 return err;
@@ -1872,7 +2333,10 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
             }
 
             struct sockaddr_un *real_addr_un = sockaddr;
-            size_t path_len = sprintf(real_addr_un->sun_path, "%s.%u", sock_tmp_prefix, socket_id);
+            size_t path_len = snprintf(real_addr_un->sun_path, sizeof(real_addr_un->sun_path), "%s.%u", sock_tmp_prefix, socket_id);
+            if (path_len >= sizeof(real_addr_un->sun_path)) {
+                return _ENAMETOOLONG;
+            }
 #ifdef __APPLE__
             real_addr_un->sun_len = offsetof(struct sockaddr_un, sun_path) + path_len;
 #endif
@@ -1892,14 +2356,16 @@ static int sockaddr_read_bind(addr_t sockaddr_addr, void *sockaddr, uint_t *sock
     return 0;
 }
 
-static int sockaddr_read(addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
+static int sockaddr_read(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
     struct inode_data *inode = NULL;
     int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL);
     inode_release_if_exist(inode);
     return err;
 }
 
-static int sockaddr_write(addr_t sockaddr_addr, void *sockaddr, uint_t buffer_len, uint_t *sockaddr_len) {
+static int ipv6_recverr_fd_get(struct fd *sock);
+
+static int sockaddr_write(guest_addr_t sockaddr_addr, void *sockaddr, uint_t buffer_len, uint_t *sockaddr_len) {
     struct sockaddr *real_addr = sockaddr;
     struct sockaddr_ *fake_addr = sockaddr;
     fake_addr->family = sock_family_from_real(real_addr->sa_family);
@@ -1931,8 +2397,8 @@ static int sockaddr_write(addr_t sockaddr_addr, void *sockaddr, uint_t buffer_le
     return 0;
 }
 
-int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
-    STRACE("bind(%d, 0x%x, %d)", sock_fd, sockaddr_addr, sockaddr_len);
+static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
+    STRACE("bind(%d, 0x%llx, %d)", sock_fd, (unsigned long long) sockaddr_addr, sockaddr_len);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
@@ -1952,6 +2418,17 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         return 0;
     }
 
+#if defined(__APPLE__)
+    if ((sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_) &&
+            sock->socket.type == SOCK_STREAM_) {
+        struct inet_bind_info candidate = {};
+        if (inet_bind_info_from_sockaddr((const struct sockaddr *) &sockaddr, &candidate) &&
+                sock_bound_inet_conflicts(sock, &candidate)) {
+            return _EADDRINUSE;
+        }
+    }
+#endif
+
     err = bind(sock->real_fd, (void *) &sockaddr, sockaddr_len);
     if (err < 0) {
         inode_release_if_exist(sock->socket.unix_name_inode);
@@ -1963,28 +2440,39 @@ int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
     return 0;
 }
 
+int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
+    return sys_bind_common(sock_fd, sockaddr_addr, sockaddr_len);
+}
+
+int_t sys_bind_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
+    return sys_bind_common(sock_fd, sockaddr_addr, sockaddr_len);
+}
+
 static void fill_cred(struct ucred_ *cred) {
     cred->pid = current->pid;
     cred->uid = current->euid;
     cred->gid = current->egid;
 }
 
-int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
-    STRACE("connect(%d, 0x%x, %d)", sock_fd, sockaddr_addr, sockaddr_len);
+static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
+    STRACE("connect(%d, 0x%llx, %d)", sock_fd, (unsigned long long) sockaddr_addr, sockaddr_len);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    sock_debug_guest_sockaddr("connect", sock, sockaddr_addr, sockaddr_len);
     if (sock->socket.domain == AF_LOCAL_) {
         sock->socket.unix_devlog_sink = false;
         sock->socket.unix_initctl_sink = false;
         if (guest_sockaddr_is_devlog(sockaddr_addr, sockaddr_len)) {
             sock->socket.unix_devlog_sink = true;
             fill_cred(&sock->socket.unix_cred);
+            sock_debug_event("connect-devlog", sock, 0, 0);
             return 0;
         }
         if (guest_sockaddr_is_initctl(sockaddr_addr, sockaddr_len)) {
             sock->socket.unix_initctl_sink = true;
             fill_cred(&sock->socket.unix_cred);
+            sock_debug_event("connect-initctl", sock, 0, 0);
             return 0;
         }
     }
@@ -1996,6 +2484,7 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         if (err == _ENOENT && sock->socket.domain == AF_LOCAL_ &&
                 guest_sockaddr_is_abstract_local(sockaddr_addr, sockaddr_len))
             return _ECONNREFUSED;
+        sock_debug_event("connect-parse-fail", sock, -1, err);
         return err;
     }
 
@@ -2006,6 +2495,7 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         if (addr->nl_pid != 0)
             return _ECONNREFUSED;
         sock->socket.netlink_groups = addr->nl_groups;
+        sock_debug_event("connect-netlink", sock, 0, 0);
         return 0;
     }
 
@@ -2082,13 +2572,27 @@ int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
         // later, but do not wait for that acknowledgement here. Linux connect()
         // completes once the transport connection exists; waiting for accept()
         // to run can wedge clients on daemons that accept asynchronously.
-        (void) write(sock->real_fd, &sock, sizeof(struct fd *));
+        int peer_err = unix_socket_send_peer_token(sock);
+        if (peer_err < 0) {
+            sock_trace("connect", sock, -1, peer_err);
+            sock_debug_event("connect-peer-token", sock, -1, peer_err);
+            return peer_err;
+        }
     }
 
     sock_trace("connect", sock, err, 0);
     sock_trace_sockaddr("local", sock->real_fd);
     sock_trace_sockaddr("peer", sock->real_fd);
+    sock_debug_event("connect", sock, err, 0);
     return err;
+}
+
+int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len) {
+    return sys_connect_common(sock_fd, sockaddr_addr, sockaddr_len);
+}
+
+int_t sys_connect_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len) {
+    return sys_connect_common(sock_fd, sockaddr_addr, sockaddr_len);
 }
 
 int_t sys_listen(fd_t sock_fd, int_t backlog) {
@@ -2105,12 +2609,17 @@ int_t sys_listen(fd_t sock_fd, int_t backlog) {
 }
 
 int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
-    STRACE("accept(%d, 0x%x, 0x%x)", sock_fd, sockaddr_addr, sockaddr_len_addr);
     return sys_accept4(sock_fd, sockaddr_addr, sockaddr_len_addr, 0);
 }
 
-int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, int_t flags) {
-    STRACE("accept4(%d, 0x%x, 0x%x, %#x)", sock_fd, sockaddr_addr, sockaddr_len_addr, flags);
+int_t sys_accept_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    return sys_accept4_guest(sock_fd, sockaddr_addr, sockaddr_len_addr, 0);
+}
+
+static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr, int_t flags) {
+    STRACE("accept4(%d, 0x%llx, 0x%llx, %#x)", sock_fd,
+            (unsigned long long) sockaddr_addr,
+            (unsigned long long) sockaddr_len_addr, flags);
     if (flags & ~(O_CLOEXEC_ | O_NONBLOCK_))
         return _EINVAL;
     struct fd *sock = sock_getfd(sock_fd);
@@ -2153,14 +2662,24 @@ int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, 
     if (sock->socket.domain == AF_LOCAL_) {
         struct fd *client_fd = f_get(client_f);
         fill_cred(&client_fd->socket.unix_cred);
+        client_fd->socket.unix_name_len = sock->socket.unix_name_len;
+        memcpy(client_fd->socket.unix_name, sock->socket.unix_name, sock->socket.unix_name_len);
         client_fd->socket.unix_peer_pending = true;
         client_fd->socket.unix_peer_off = 0;
-        int peer_err = unix_socket_finish_peer(client_fd, !(fd_getflags(client_fd) & O_NONBLOCK_));
+        int peer_err = unix_socket_finish_peer(client_fd);
         if (peer_err < 0 && peer_err != _EAGAIN)
             STRACE("accept4(%d) deferred unix peer link err=%d", sock_fd, peer_err);
     }
 
     return client_f;
+}
+
+int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, int_t flags) {
+    return sys_accept4_common(sock_fd, sockaddr_addr, sockaddr_len_addr, flags);
+}
+
+int_t sys_accept4_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr, int_t flags) {
+    return sys_accept4_common(sock_fd, sockaddr_addr, sockaddr_len_addr, flags);
 }
 
 static void copy_unix_name(char *sockaddr, dword_t *sockaddr_len, struct fd *sock) {
@@ -2177,7 +2696,7 @@ static void copy_unix_name(char *sockaddr, dword_t *sockaddr_len, struct fd *soc
 }
 
 static int copy_unix_peer_name(char *sockaddr, dword_t *sockaddr_len, struct fd *sock) {
-    int err = unix_socket_finish_peer(sock, true);
+    int err = unix_socket_finish_peer(sock);
     if (err < 0 && err != _ENOTCONN)
         return err;
 
@@ -2190,8 +2709,10 @@ static int copy_unix_peer_name(char *sockaddr, dword_t *sockaddr_len, struct fd 
     return peer == NULL ? _ENOTCONN : 0;
 }
 
-int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
-    STRACE("getsockname(%d, 0x%x, 0x%x)", sock_fd, sockaddr_addr, sockaddr_len_addr);
+static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    STRACE("getsockname(%d, 0x%llx, 0x%llx)", sock_fd,
+            (unsigned long long) sockaddr_addr,
+            (unsigned long long) sockaddr_len_addr);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
@@ -2239,8 +2760,18 @@ int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
     return res;
 }
 
-int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
-    STRACE("getpeername(%d, 0x%x, 0x%x)", sock_fd, sockaddr_addr, sockaddr_len_addr);
+int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
+    return sys_getsockname_common(sock_fd, sockaddr_addr, sockaddr_len_addr);
+}
+
+int_t sys_getsockname_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    return sys_getsockname_common(sock_fd, sockaddr_addr, sockaddr_len_addr);
+}
+
+static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    STRACE("getpeername(%d, 0x%llx, 0x%llx)", sock_fd,
+            (unsigned long long) sockaddr_addr,
+            (unsigned long long) sockaddr_len_addr);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
@@ -2288,8 +2819,17 @@ int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_ad
     return res;
 }
 
-int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sockets_addr) {
-    STRACE("socketpair(%d, %d, %d, 0x%x)", domain, type, protocol, sockets_addr);
+int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
+    return sys_getpeername_common(sock_fd, sockaddr_addr, sockaddr_len_addr);
+}
+
+int_t sys_getpeername_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    return sys_getpeername_common(sock_fd, sockaddr_addr, sockaddr_len_addr);
+}
+
+static int_t sys_socketpair_common(dword_t domain, dword_t type, dword_t protocol, guest_addr_t sockets_addr) {
+    STRACE("socketpair(%d, %d, %d, 0x%llx)", domain, type, protocol,
+            (unsigned long long) sockets_addr);
     int real_domain = sock_family_to_real(domain);
     if (real_domain < 0)
         return _EINVAL;
@@ -2299,6 +2839,10 @@ int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sock
 
     int sockets[2];
     int err = socketpair(real_domain, real_type, protocol, sockets);
+#if defined(__APPLE__)
+    if (err < 0 && unix_seqpacket_fallback_needed(domain, type, protocol, errno))
+        err = socketpair(real_domain, SOCK_STREAM, protocol, sockets);
+#endif
     if (err < 0)
         return errno_map();
 
@@ -2343,10 +2887,24 @@ close_sockets:
     return err;
 }
 
-int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, dword_t sockaddr_len) {
+int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sockets_addr) {
+    return sys_socketpair_common(domain, type, protocol, sockets_addr);
+}
+
+int_t sys_socketpair_guest(dword_t domain, dword_t type, dword_t protocol, guest_addr_t sockets_addr) {
+    return sys_socketpair_common(domain, type, protocol, sockets_addr);
+}
+
+static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags,
+        guest_addr_t sockaddr_addr, dword_t sockaddr_len) {
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    if (sock->socket.domain == AF_LOCAL_) {
+        int peer_err = unix_socket_finish_peer(sock);
+        if (peer_err < 0)
+            return peer_err;
+    }
     char *buffer = malloc(len + 1);
     if (user_read(buffer_addr, buffer, len))
         return _EFAULT;
@@ -2388,19 +2946,53 @@ int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, a
 
     ssize_t res = 0;
     TASK_MAY_BLOCK {
-        do {
+        while (1) {
             errno = 0;
-            res = sendto(sock->real_fd, buffer, len, real_flags,
-                         sockaddr_addr ? (void *) &sockaddr : NULL, sockaddr_len);
-        } while (res < 0 && socket_should_retry_io_eintr(sock, real_flags));
+            if (sockaddr_addr == 0) {
+                res = send(sock->real_fd, buffer, len, real_flags);
+            } else {
+                res = sendto(sock->real_fd, buffer, len, real_flags,
+                             (void *) &sockaddr, sockaddr_len);
+            }
+            if (res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(sock, real_flags))
+                continue;
+            if (socket_should_retry_io_eagain(sock, real_flags)) {
+                int wait_err = socket_wait_ready(sock, POLLOUT);
+                if (wait_err < 0) {
+                    res = wait_err;
+                    errno = 0;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
     }
     free(buffer);
     if (res < 0) {
+        if (res > -4096 && res < 0 && errno == 0)
+            return res;
+        if (socket_should_map_unix_eperm_to_eagain(sock, real_flags)) {
+            sock_trace("sendto", sock, -1, _EAGAIN);
+            sock_debug_event("sendto", sock, -1, _EAGAIN);
+            sock_x11_event("sendto-eagain", sock, -1, _EAGAIN, len);
+            return _EAGAIN;
+        }
         int mapped_err = errno_map();
         sock_trace("sendto", sock, -1, mapped_err);
+        sock_debug_event("sendto", sock, -1, mapped_err);
+        if (mapped_err == _EAGAIN)
+            sock_x11_event("sendto-eagain", sock, -1, mapped_err, len);
+        else
+            sock_x11_event("sendto-err", sock, -1, mapped_err, len);
         return mapped_err;
     }
     sock_trace("sendto", sock, res, 0);
+    sock_debug_event("sendto", sock, res, 0);
+    if ((size_t) res != len)
+        sock_x11_event("sendto-short", sock, res, 0, len);
     return res;
 
 error:
@@ -2408,11 +3000,28 @@ error:
     return err;
 }
 
-int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
-    STRACE("recvfrom(%d, 0x%x, %d, %d, 0x%x, 0x%x)", sock_fd, buffer_addr, len, flags, sockaddr_addr, sockaddr_len_addr);
+int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, dword_t sockaddr_len) {
+    return sys_sendto_common(sock_fd, buffer_addr, len, flags, sockaddr_addr, sockaddr_len);
+}
+
+int_t sys_sendto_guest(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags, guest_addr_t sockaddr_addr, dword_t sockaddr_len) {
+    return sys_sendto_common(sock_fd, buffer_addr, len, flags, sockaddr_addr, sockaddr_len);
+}
+
+static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags,
+        guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    STRACE("recvfrom(%d, 0x%llx, %d, %d, 0x%llx, 0x%llx)", sock_fd,
+            (unsigned long long) buffer_addr, len, flags,
+            (unsigned long long) sockaddr_addr,
+            (unsigned long long) sockaddr_len_addr);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
+    if (sock->socket.domain == AF_LOCAL_) {
+        int peer_err = unix_socket_finish_peer(sock);
+        if (peer_err < 0)
+            return peer_err;
+    }
     int real_flags = sock_flags_to_real(flags);
     if (real_flags < 0)
         return _EINVAL;
@@ -2464,17 +3073,55 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
     }
     ssize_t res = 0;
     TASK_MAY_BLOCK {
-        do {
+        while (1) {
+            sigset_t oldmask;
+            if (!socket_blocking_syscall_begin(&oldmask)) {
+                res = errno_map();
+                errno = 0;
+                break;
+            }
             errno = 0;
-            res = recvfrom(sock->real_fd, buffer, len, real_flags,
-                           sockaddr_addr != 0 ? (void *) sockaddr : NULL,
-                           sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
-        } while (res < 0 && socket_should_retry_io_eintr(sock, real_flags));
+            if (sockaddr_addr == 0 && sockaddr_len_addr == 0) {
+                res = recv(sock->real_fd, buffer, len, real_flags);
+            } else {
+                res = recvfrom(sock->real_fd, buffer, len, real_flags,
+                               sockaddr_addr != 0 ? (void *) sockaddr : NULL,
+                               sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
+            }
+            socket_blocking_syscall_end();
+            if (res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(sock, real_flags))
+                continue;
+            if (socket_should_retry_io_eagain(sock, real_flags)) {
+                int wait_err = socket_wait_ready(sock, POLLIN);
+                if (wait_err < 0) {
+                    res = wait_err;
+                    errno = 0;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
     }
     if (res < 0) {
         free(buffer);
+        if (res > -4096 && res < 0 && errno == 0)
+            return res;
+        if (socket_should_map_unix_eperm_to_eagain(sock, real_flags)) {
+            sock_trace("recvfrom", sock, -1, _EAGAIN);
+            sock_debug_event("recvfrom", sock, -1, _EAGAIN);
+            sock_x11_event("recvfrom-eagain", sock, -1, _EAGAIN, len);
+            return _EAGAIN;
+        }
         int mapped_err = errno_map();
         sock_trace("recvfrom", sock, -1, mapped_err);
+        sock_debug_event("recvfrom", sock, -1, mapped_err);
+        if (mapped_err == _EAGAIN)
+            sock_x11_event("recvfrom-eagain", sock, -1, mapped_err, len);
+        else
+            sock_x11_event("recvfrom-err", sock, -1, mapped_err, len);
         return mapped_err;
     }
 
@@ -2492,7 +3139,18 @@ int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags,
         if (user_put(sockaddr_len_addr, sockaddr_len))
             return _EFAULT;
     sock_trace("recvfrom", sock, res, 0);
+    sock_debug_event("recvfrom", sock, res, 0);
+    if (res == 0)
+        sock_x11_event("recvfrom-eof", sock, 0, 0, len);
     return res;
+}
+
+int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, addr_t sockaddr_len_addr) {
+    return sys_recvfrom_common(sock_fd, buffer_addr, len, flags, sockaddr_addr, sockaddr_len_addr);
+}
+
+int_t sys_recvfrom_guest(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
+    return sys_recvfrom_common(sock_fd, buffer_addr, len, flags, sockaddr_addr, sockaddr_len_addr);
 }
 
 int_t sys_send(fd_t sock_fd, addr_t buf, dword_t len, int_t flags) {
@@ -2516,10 +3174,13 @@ int_t sys_shutdown(fd_t sock_fd, dword_t how) {
 
 static void sock_init_emulation_defaults(struct fd *fd) {
     strcpy(fd->socket.tcp_congestion, DEFAULT_TCP_CONGESTION);
+    fd->socket.ipv6_recverr_fd = -1;
 }
 
-int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
-    STRACE("setsockopt(%d, %d, %d, 0x%x, %d)", sock_fd, level, option, value_addr, value_len);
+static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
+        guest_addr_t value_addr, dword_t value_len, enum guest_abi abi) {
+    STRACE("setsockopt(%d, %d, %d, %#llx, %d)", sock_fd, level, option,
+            (unsigned long long) value_addr, value_len);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
@@ -2564,6 +3225,19 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         if (value_len < sizeof(dword_t))
             return _EINVAL;
         sock->socket.ipv6_recverr = (*(dword_t *) value) != 0;
+        if (sock->socket.ipv6_recverr) {
+            if (ipv6_recverr_fd_get(sock) < 0)
+                return errno_map();
+        } else if (sock->socket.ipv6_recverr_fd >= 0) {
+            close(sock->socket.ipv6_recverr_fd);
+            sock->socket.ipv6_recverr_fd = -1;
+        }
+        return 0;
+    }
+    if (level == IPPROTO_IP && option == IP_RETOPTS_) {
+        // Linux ping probes this on IPv4 sockets. Darwin raw sockets do not
+        // provide a compatible implementation, and the option is not required
+        // for basic echo functionality.
         return 0;
     }
     if (level == IPPROTO_TCP && option == TCP_CONGESTION_) {
@@ -2637,13 +3311,14 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         }
     }
     if (level == SOL_SOCKET_ && (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_)) {
-        if (value_len < sizeof(struct timeval_))
+        if (value_len < guest_timeval_size(abi))
             return _EINVAL;
-        struct timeval_ guest_timeout;
-        memcpy(&guest_timeout, value, sizeof(guest_timeout));
+        struct timeval guest_timeout;
+        if (read_guest_timeval_abi(abi, value_addr, &guest_timeout))
+            return _EFAULT;
         struct timeval host_timeout = {
-            .tv_sec = guest_timeout.sec,
-            .tv_usec = guest_timeout.usec,
+            .tv_sec = guest_timeout.tv_sec,
+            .tv_usec = guest_timeout.tv_usec,
         };
         int err = setsockopt(sock->real_fd, SOL_SOCKET,
                 option == SO_RCVTIMEO_OLD_ ? SO_RCVTIMEO : SO_SNDTIMEO,
@@ -2653,6 +3328,15 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         return 0;
     }
     if (level == SOL_SOCKET_) {
+        if (option == SO_REUSEADDR_) {
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            sock->socket.reuseaddr = (*(dword_t *) value) != 0;
+        } else if (option == SO_REUSEPORT_) {
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            sock->socket.reuseport = (*(dword_t *) value) != 0;
+        }
         if (option == SO_SNDBUFFORCE_) {
             option = SO_SNDBUF_;
         } else if (option == SO_RCVBUFFORCE_) {
@@ -2678,6 +3362,22 @@ int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     return 0;
 }
 
+int_t sys_setsockopt_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, dword_t value_len) {
+    return sys_setsockopt_guest_abi(sock_fd, level, option, value_addr, value_len, GUEST_ABI_I386);
+}
+
+int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
+    return sys_setsockopt_guest(sock_fd, level, option, value_addr, value_len);
+}
+
+int_t sys_setsockopt_amd64(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len) {
+    return sys_setsockopt_guest_abi(sock_fd, level, option, value_addr, value_len, GUEST_ABI_AMD64);
+}
+
+int_t sys_setsockopt_amd64_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, dword_t value_len) {
+    return sys_setsockopt_guest_abi(sock_fd, level, option, value_addr, value_len, GUEST_ABI_AMD64);
+}
+
 static void sockopt_store_value(void *dst, dword_t dst_len, dword_t *result_len,
         const void *src, dword_t src_len) {
     size_t copy_len = dst_len < src_len ? dst_len : src_len;
@@ -2699,8 +3399,10 @@ static bool sockopt_is_linux_soft_unsupported(dword_t level, dword_t option) {
     return false;
 }
 
-int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t len_addr) {
-    STRACE("getsockopt(%d, %d, %d, %#x, %#x)", sock_fd, level, option, value_addr, len_addr);
+static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
+        guest_addr_t value_addr, guest_addr_t len_addr, enum guest_abi abi) {
+    STRACE("getsockopt(%d, %d, %d, %#llx, %#llx)", sock_fd, level, option,
+            (unsigned long long) value_addr, (unsigned long long) len_addr);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
@@ -2723,7 +3425,7 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
         sockopt_store_value(value, user_value_len, &value_len, &value_p, sizeof(value_p));
     } else if (level == SOL_SOCKET_ && option == SO_PEERCRED_) {
         struct ucred_ cred;
-        int err = unix_socket_finish_peer(sock, true);
+        int err = unix_socket_finish_peer(sock);
         if (err < 0 && err != _ENOTCONN)
             return err;
         lock(&peer_lock, 0);
@@ -2791,11 +3493,19 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
                 &host_timeout, &host_timeout_len);
         if (err < 0)
             return errno_map();
-        struct timeval_ guest_timeout = {
-            .sec = host_timeout.tv_sec,
-            .usec = host_timeout.tv_usec,
-        };
-        sockopt_store_value(value, user_value_len, &value_len, &guest_timeout, sizeof(guest_timeout));
+        if (abi == GUEST_ABI_AMD64) {
+            struct amd64_timeval_ guest_timeout = {
+                .sec = host_timeout.tv_sec,
+                .usec = host_timeout.tv_usec,
+            };
+            sockopt_store_value(value, user_value_len, &value_len, &guest_timeout, sizeof(guest_timeout));
+        } else {
+            struct timeval_ guest_timeout = {
+                .sec = host_timeout.tv_sec,
+                .usec = host_timeout.tv_usec,
+            };
+            sockopt_store_value(value, user_value_len, &value_len, &guest_timeout, sizeof(guest_timeout));
+        }
     } else if (level == IPPROTO_ICMPV6 && option == ICMP6_FILTER_) {
         if (sock->socket.type != SOCK_RAW_ || sock->socket.protocol != IPPROTO_ICMPV6)
             return _ENOPROTOOPT;
@@ -2906,31 +3616,306 @@ int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_a
     return 0;
 }
 
+int_t sys_getsockopt_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, guest_addr_t len_addr) {
+    return sys_getsockopt_guest_abi(sock_fd, level, option, value_addr, len_addr, GUEST_ABI_I386);
+}
+
+int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t len_addr) {
+    return sys_getsockopt_guest(sock_fd, level, option, value_addr, len_addr);
+}
+
+int_t sys_getsockopt_amd64(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t len_addr) {
+    return sys_getsockopt_guest_abi(sock_fd, level, option, value_addr, len_addr, GUEST_ABI_AMD64);
+}
+
+int_t sys_getsockopt_amd64_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, guest_addr_t len_addr) {
+    return sys_getsockopt_guest_abi(sock_fd, level, option, value_addr, len_addr, GUEST_ABI_AMD64);
+}
+
 static void scm_free(struct scm *scm) {
     for (unsigned i = 0; i < scm->num_fds; i++)
         fd_close(scm->fds[i]);
     free(scm);
 }
 
-static size_t fake_cmsg_space(size_t data_len) {
-    return (sizeof(struct cmsghdr_) + data_len + sizeof(dword_t) - 1) &
-        ~(size_t) (sizeof(dword_t) - 1);
+struct guest_msghdr_marshaled {
+    guest_addr_t msg_name;
+    uint_t msg_namelen;
+    guest_addr_t msg_iov;
+    uint_t msg_iovlen;
+    guest_addr_t msg_control;
+    uint_t msg_controllen;
+    int_t msg_flags;
+};
+
+struct guest_cmsghdr_marshaled {
+    size_t len;
+    int_t level;
+    int_t type;
+};
+
+static size_t guest_mmsghdr_size(enum guest_abi abi) {
+    return abi == GUEST_ABI_AMD64 ? sizeof(struct amd64_mmsghdr_) : sizeof(struct i386_mmsghdr_);
 }
 
-static bool fake_cmsg_append(uint8_t *buffer, size_t capacity, size_t *used,
+static size_t guest_mmsghdr_len_offset(enum guest_abi abi) {
+    return abi == GUEST_ABI_AMD64 ? offsetof(struct amd64_mmsghdr_, len) : offsetof(struct i386_mmsghdr_, len);
+}
+
+static bool guest_msghdr_addr_valid(enum guest_abi abi, qword_t addr) {
+    return guest_abi_addr_valid(abi, addr);
+}
+
+static int read_guest_msghdr(guest_addr_t msghdr_addr, enum guest_abi abi, struct guest_msghdr_marshaled *msg) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_msghdr_ raw;
+        if (user_read(msghdr_addr, &raw, sizeof(raw)))
+            return _EFAULT;
+        if (!guest_msghdr_addr_valid(abi, raw.msg_name) ||
+                !guest_msghdr_addr_valid(abi, raw.msg_iov) ||
+                !guest_msghdr_addr_valid(abi, raw.msg_control) ||
+                raw.msg_namelen > UINT32_MAX ||
+                raw.msg_iovlen > UINT32_MAX ||
+                raw.msg_controllen > UINT32_MAX)
+            return _EINVAL;
+        *msg = (struct guest_msghdr_marshaled) {
+            .msg_name = raw.msg_name,
+            .msg_namelen = raw.msg_namelen,
+            .msg_iov = raw.msg_iov,
+            .msg_iovlen = (uint_t) raw.msg_iovlen,
+            .msg_control = raw.msg_control,
+            .msg_controllen = (uint_t) raw.msg_controllen,
+            .msg_flags = raw.msg_flags,
+        };
+        return 0;
+    }
+
+    struct i386_msghdr_ raw;
+    if (user_read(msghdr_addr, &raw, sizeof(raw)))
+        return _EFAULT;
+    *msg = (struct guest_msghdr_marshaled) {
+        .msg_name = raw.msg_name,
+        .msg_namelen = raw.msg_namelen,
+        .msg_iov = raw.msg_iov,
+        .msg_iovlen = raw.msg_iovlen,
+        .msg_control = raw.msg_control,
+        .msg_controllen = raw.msg_controllen,
+        .msg_flags = raw.msg_flags,
+    };
+    return 0;
+}
+
+static int write_guest_msghdr(guest_addr_t msghdr_addr, enum guest_abi abi, const struct guest_msghdr_marshaled *msg) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_msghdr_ raw = {
+            .msg_name = msg->msg_name,
+            .msg_namelen = msg->msg_namelen,
+            .msg_iov = msg->msg_iov,
+            .msg_iovlen = msg->msg_iovlen,
+            .msg_control = msg->msg_control,
+            .msg_controllen = msg->msg_controllen,
+            .msg_flags = msg->msg_flags,
+        };
+        return user_write(msghdr_addr, &raw, sizeof(raw)) ? _EFAULT : 0;
+    }
+
+    struct i386_msghdr_ raw = {
+        .msg_name = msg->msg_name,
+        .msg_namelen = msg->msg_namelen,
+        .msg_iov = msg->msg_iov,
+        .msg_iovlen = msg->msg_iovlen,
+        .msg_control = msg->msg_control,
+        .msg_controllen = msg->msg_controllen,
+        .msg_flags = msg->msg_flags,
+    };
+    return user_write(msghdr_addr, &raw, sizeof(raw)) ? _EFAULT : 0;
+}
+
+static size_t guest_cmsg_hdr_size(enum guest_abi abi) {
+    return abi == GUEST_ABI_AMD64 ? sizeof(struct amd64_cmsghdr_) : sizeof(struct i386_cmsghdr_);
+}
+
+static size_t guest_cmsg_space(enum guest_abi abi, size_t data_len) {
+    size_t align = guest_abi_desc(abi).word_size;
+    size_t cmsg_len = guest_cmsg_hdr_size(abi) + data_len;
+    return (cmsg_len + align - 1) & ~(align - 1);
+}
+
+static bool guest_cmsg_parse(enum guest_abi abi, const uint8_t *buffer, size_t capacity,
+        size_t *offset, struct guest_cmsghdr_marshaled *cmsg, const uint8_t **data,
+        size_t *data_len) {
+    size_t hdr_size = guest_cmsg_hdr_size(abi);
+    if (*offset + hdr_size > capacity)
+        return false;
+
+    size_t len;
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_cmsghdr_ raw;
+        memcpy(&raw, buffer + *offset, sizeof(raw));
+        len = raw.len;
+        cmsg->level = raw.level;
+        cmsg->type = raw.type;
+    } else {
+        struct i386_cmsghdr_ raw;
+        memcpy(&raw, buffer + *offset, sizeof(raw));
+        len = raw.len;
+        cmsg->level = raw.level;
+        cmsg->type = raw.type;
+    }
+
+    if (len < hdr_size)
+        return false;
+    size_t cmsg_space = guest_cmsg_space(abi, len - hdr_size);
+    if (*offset + cmsg_space > capacity)
+        return false;
+
+    cmsg->len = len;
+    *data = buffer + *offset + hdr_size;
+    *data_len = len - hdr_size;
+    *offset += cmsg_space;
+    return true;
+}
+
+static bool guest_cmsg_append(enum guest_abi abi, uint8_t *buffer, size_t capacity, size_t *used,
         int_t level, int_t type, const void *data, size_t data_len) {
-    size_t cmsg_len = sizeof(struct cmsghdr_) + data_len;
-    size_t cmsg_space = fake_cmsg_space(data_len);
+    size_t hdr_size = guest_cmsg_hdr_size(abi);
+    size_t cmsg_len = hdr_size + data_len;
+    size_t cmsg_space = guest_cmsg_space(abi, data_len);
     if (*used + cmsg_space > capacity)
         return false;
-    struct cmsghdr_ *cmsg = (struct cmsghdr_ *) (buffer + *used);
-    cmsg->len = cmsg_len;
-    cmsg->level = level;
-    cmsg->type = type;
-    memcpy(cmsg->data, data, data_len);
-    memset(((uint8_t *) cmsg) + cmsg_len, 0, cmsg_space - cmsg_len);
+
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_cmsghdr_ raw = {
+            .len = cmsg_len,
+            .level = level,
+            .type = type,
+        };
+        memcpy(buffer + *used, &raw, sizeof(raw));
+    } else {
+        struct i386_cmsghdr_ raw = {
+            .len = cmsg_len,
+            .level = level,
+            .type = type,
+        };
+        memcpy(buffer + *used, &raw, sizeof(raw));
+    }
+    memcpy(buffer + *used + hdr_size, data, data_len);
+    memset(buffer + *used + cmsg_len, 0, cmsg_space - cmsg_len);
     *used += cmsg_space;
     return true;
+}
+
+static struct cmsghdr *host_cmsg_first(struct msghdr *msg) {
+    if (msg->msg_control == NULL || msg->msg_controllen < sizeof(struct cmsghdr))
+        return NULL;
+    struct cmsghdr *cmsg = (struct cmsghdr *) msg->msg_control;
+    if (cmsg->cmsg_len < CMSG_LEN(0) || cmsg->cmsg_len > msg->msg_controllen)
+        return NULL;
+    return cmsg;
+}
+
+static struct cmsghdr *host_cmsg_next(struct msghdr *msg, struct cmsghdr *cmsg) {
+    if (msg->msg_control == NULL || cmsg == NULL)
+        return NULL;
+    uint8_t *base = (uint8_t *) msg->msg_control;
+    uint8_t *end = base + msg->msg_controllen;
+    uint8_t *cur = (uint8_t *) cmsg;
+    if (cur < base || cur + sizeof(struct cmsghdr) > end)
+        return NULL;
+    if (cmsg->cmsg_len < CMSG_LEN(0))
+        return NULL;
+    size_t data_len = cmsg->cmsg_len - CMSG_LEN(0);
+    size_t step = CMSG_SPACE(data_len);
+    if (step == 0)
+        return NULL;
+    uint8_t *next = cur + step;
+    if (next + sizeof(struct cmsghdr) > end)
+        return NULL;
+    struct cmsghdr *next_cmsg = (struct cmsghdr *) next;
+    if (next_cmsg->cmsg_len < CMSG_LEN(0) || next + next_cmsg->cmsg_len > end)
+        return NULL;
+    return next_cmsg;
+}
+
+static int sock_cmsg_level_to_fake(int level) {
+    if (level == SOL_SOCKET)
+        return SOL_SOCKET_;
+    return level;
+}
+
+static int sock_cmsg_type_to_fake(int level, int type) {
+    if (level == IPPROTO_IP) {
+        switch (type) {
+            case IP_TTL: return IP_TTL_;
+            case IP_RECVTTL: return IP_TTL_;
+            case IP_TOS: return IP_TOS_;
+            case IP_RECVERR_: return IP_RECVERR_;
+        }
+    } else if (level == IPPROTO_IPV6) {
+        switch (type) {
+            case IPV6_HOPLIMIT: return IPV6_HOPLIMIT_;
+            case IPV6_TCLASS: return IPV6_TCLASS_;
+            case IPV6_RECVERR_: return IPV6_RECVERR_;
+        }
+    }
+    return -1;
+}
+
+static bool sock_cmsg_translate_payload(int level, int type, const void *data, size_t data_len,
+        const void **fake_data, size_t *fake_data_len, int *fake_level, int *fake_type,
+        uint8_t *scratch, size_t scratch_cap) {
+    *fake_level = sock_cmsg_level_to_fake(level);
+    *fake_type = sock_cmsg_type_to_fake(level, type);
+    if (*fake_type < 0)
+        return false;
+
+    *fake_data = data;
+    *fake_data_len = data_len;
+
+    if (level == IPPROTO_IP && type == IP_RECVTTL) {
+        if (data_len < sizeof(uint8_t))
+            return false;
+        if (scratch_cap < sizeof(int))
+            return false;
+        *(int *) scratch = *(const uint8_t *) data;
+        *fake_data = scratch;
+        *fake_data_len = sizeof(int);
+        return true;
+    }
+
+    if (level == IPPROTO_IPV6 && type == IPV6_RECVERR_) {
+        size_t need = sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6_);
+        if (data_len < sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6))
+            return false;
+        if (scratch_cap < need)
+            return false;
+
+        struct sock_extended_err_ *guest_err = (struct sock_extended_err_ *) scratch;
+        memcpy(guest_err, data, sizeof(*guest_err));
+
+        const struct sockaddr_in6 *host_offender =
+            (const struct sockaddr_in6 *) ((const uint8_t *) data + sizeof(*guest_err));
+        struct sockaddr_in6_ *guest_offender =
+            (struct sockaddr_in6_ *) (scratch + sizeof(*guest_err));
+        memset(guest_offender, 0, sizeof(*guest_offender));
+        guest_offender->sin6_family = AF_INET6_;
+        guest_offender->sin6_port = host_offender->sin6_port;
+        guest_offender->sin6_flowinfo = host_offender->sin6_flowinfo;
+        guest_offender->sin6_addr = host_offender->sin6_addr;
+        guest_offender->sin6_scope_id = host_offender->sin6_scope_id;
+
+        *fake_data = scratch;
+        *fake_data_len = need;
+    }
+    return true;
+}
+
+static void free_msghdr_iov(struct iovec *iov, size_t iovlen) {
+    if (iov == NULL)
+        return;
+    for (size_t i = 0; i < iovlen; i++)
+        free(iov[i].iov_base);
+    free(iov);
 }
 
 static bool unix_socket_get_peer_cred(struct fd *sock, struct ucred_ *cred) {
@@ -2947,17 +3932,19 @@ static bool unix_socket_get_peer_cred(struct fd *sock, struct ucred_ *cred) {
     return have_cred;
 }
 
-int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags,
+        enum guest_abi abi) {
     int err;
-    STRACE("sendmsg(%d, %#x, %d)", sock_fd, msghdr_addr, flags);
+    STRACE("sendmsg(%d, %#llx, %d)", sock_fd, (unsigned long long) msghdr_addr, flags);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
 
     struct msghdr msg = {};
-    struct msghdr_ msg_fake;
-    if (user_get(msghdr_addr, msg_fake))
-        return _EFAULT;
+    struct guest_msghdr_marshaled msg_fake;
+    err = read_guest_msghdr(msghdr_addr, abi, &msg_fake);
+    if (err < 0)
+        return err;
 
     // msg_name
     struct sockaddr_max_ msg_name;
@@ -2972,13 +3959,19 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     }
 
     // msg_iovec
-    struct iovec_ msg_iov_fake[msg_fake.msg_iovlen];
-    if (user_get(msg_fake.msg_iov, msg_iov_fake))
-        return _EFAULT;
-    struct iovec msg_iov[msg_fake.msg_iovlen];
-    memset(msg_iov, 0, sizeof(msg_iov));
+    struct guest_iovec_ *msg_iov_fake = user_read_iovecs_abi(current, abi, msg_fake.msg_iov, msg_fake.msg_iovlen);
+    if (IS_ERR(msg_iov_fake))
+        return PTR_ERR(msg_iov_fake);
+    struct iovec *msg_iov = NULL;
+    if (msg_fake.msg_iovlen != 0) {
+        msg_iov = calloc(msg_fake.msg_iovlen, sizeof(*msg_iov));
+        if (msg_iov == NULL) {
+            free(msg_iov_fake);
+            return _ENOMEM;
+        }
+    }
     msg.msg_iov = msg_iov;
-    msg.msg_iovlen = sizeof(msg_iov) / sizeof(msg_iov[0]);
+    msg.msg_iovlen = msg_fake.msg_iovlen;
     for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
         msg_iov[i].iov_len = msg_iov_fake[i].len;
         msg_iov[i].iov_base = malloc(msg_iov_fake[i].len);
@@ -3027,40 +4020,44 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
 
     struct scm *scm = NULL;
     char real_msg_control[CMSG_SPACE(sizeof(int))]; // only used if actually sending an fd
-    if (sock->socket.domain == AF_LOCAL_ && msg_control != NULL && msg_fake.msg_controllen >= sizeof(struct cmsghdr_)) {
-        err = unix_socket_finish_peer(sock, !(real_flags & MSG_DONTWAIT));
+    if (sock->socket.domain == AF_LOCAL_ && msg_control != NULL &&
+            msg_fake.msg_controllen >= guest_cmsg_hdr_size(abi)) {
+        err = unix_socket_finish_peer(sock);
         if (err < 0)
             goto out_free_iov;
         // figure out how many file descriptors we're sending
-        uint8_t *mhdr_end = msg_control + msg_fake.msg_controllen;
         unsigned num_fds = 0;
         struct ucred_ sender_cred = {};
         fill_cred(&sender_cred);
-        struct cmsghdr_ *cmsg;
-        for (cmsg = (void *) msg_control; cmsg != NULL; cmsg = CMSG_NXTHDR_(cmsg, mhdr_end)) {
-            if (cmsg->level != SOL_SOCKET_)
+        size_t cmsg_off = 0;
+        while (cmsg_off < msg_fake.msg_controllen) {
+            struct guest_cmsghdr_marshaled cmsg;
+            const uint8_t *cmsg_data;
+            size_t data_len;
+            if (!guest_cmsg_parse(abi, msg_control, msg_fake.msg_controllen, &cmsg_off, &cmsg, &cmsg_data, &data_len)) {
+                err = _EINVAL;
+                goto out_free_iov;
+            }
+            if (cmsg.level != SOL_SOCKET_)
                 continue;
-            if (cmsg->len < sizeof(struct cmsghdr_))
-                return _EINVAL;
-            size_t data_len = cmsg->len - sizeof(struct cmsghdr_);
-            if (cmsg->type == SCM_RIGHTS_) {
+            if (cmsg.type == SCM_RIGHTS_) {
                 if (data_len % sizeof(fd_t) != 0)
-                    return _EINVAL;
+                    goto out_inval;
                 num_fds += data_len / sizeof(fd_t);
-            } else if (cmsg->type == SCM_CREDENTIALS_) {
+            } else if (cmsg.type == SCM_CREDENTIALS_) {
                 if (data_len != sizeof(struct ucred_))
-                    return _EINVAL;
-                struct ucred_ *cred = (struct ucred_ *) cmsg->data;
+                    goto out_inval;
+                const struct ucred_ *cred = (const struct ucred_ *) cmsg_data;
                 if (cred->pid != sender_cred.pid ||
                         cred->uid != sender_cred.uid ||
                         cred->gid != sender_cred.gid)
-                    return _EPERM;
+                    goto out_perm;
             } else {
-                return _EINVAL;
+                goto out_inval;
             }
         }
         if (num_fds > 253) // *magic*
-            return _EINVAL;
+            goto out_inval;
 
         if (num_fds > 0) {
             // send one (1) real fd and put the rest in a struct scm
@@ -3082,11 +4079,19 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
             list_init(&scm->queue);
             scm->num_fds = num_fds;
             unsigned fd_i = 0;
-            for (cmsg = (void *) msg_control; cmsg != NULL; cmsg = CMSG_NXTHDR_(cmsg, mhdr_end)) {
-                if (cmsg->level != SOL_SOCKET_ || cmsg->type != SCM_RIGHTS_)
+            cmsg_off = 0;
+            while (cmsg_off < msg_fake.msg_controllen) {
+                struct guest_cmsghdr_marshaled cmsg;
+                const uint8_t *cmsg_data;
+                size_t data_len;
+                if (!guest_cmsg_parse(abi, msg_control, msg_fake.msg_controllen, &cmsg_off, &cmsg, &cmsg_data, &data_len)) {
+                    err = _EINVAL;
+                    goto out_free_scm;
+                }
+                if (cmsg.level != SOL_SOCKET_ || cmsg.type != SCM_RIGHTS_)
                     continue;
-                fd_t *fds = (void *) cmsg->data;
-                for (unsigned i = 0; i < (cmsg->len - sizeof(struct cmsghdr_)) / sizeof(fd_t); i++) {
+                const fd_t *fds = (const fd_t *) cmsg_data;
+                for (unsigned i = 0; i < data_len / sizeof(fd_t); i++) {
                     STRACE(" sending fd %d", fds[i]);
                     scm->fds[fd_i++] = fd_retain(f_get(fds[i]));
                 }
@@ -3122,16 +4127,46 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     sock_trace_tcp_info("sendmsg-before", sock);
 #endif
 
+    size_t requested = sock_iov_requested(msg.msg_iov, msg.msg_iovlen);
     ssize_t send_res = 0;
     TASK_MAY_BLOCK {
-        do {
+        while (1) {
             errno = 0;
             send_res = sendmsg(sock->real_fd, &msg, real_flags);
-        } while (send_res < 0 && socket_should_retry_io_eintr(sock, real_flags));
+            if (send_res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(sock, real_flags))
+                continue;
+            if (socket_should_retry_io_eagain(sock, real_flags)) {
+                int wait_err = socket_wait_ready(sock, POLLOUT);
+                if (wait_err < 0) {
+                    send_res = wait_err;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
     }
     if (send_res < 0) {
+        if (send_res > -4096 && send_res < 0 && errno == 0) {
+            err = (int) send_res;
+            goto out_free_scm;
+        }
+        if (socket_should_map_unix_eperm_to_eagain(sock, real_flags)) {
+            err = _EAGAIN;
+            sock_trace("sendmsg", sock, -1, err);
+            sock_debug_event("sendmsg", sock, -1, err);
+            sock_x11_event("sendmsg-eagain", sock, -1, err, requested);
+            goto out_free_scm;
+        }
         err = errno_map();
         sock_trace("sendmsg", sock, -1, err);
+        sock_debug_event("sendmsg", sock, -1, err);
+        if (err == _EAGAIN)
+            sock_x11_event("sendmsg-eagain", sock, -1, err, requested);
+        else
+            sock_x11_event("sendmsg-err", sock, -1, err, requested);
         if (scm != NULL)
             printk("INFO: scm-send pid=%d real sendmsg FAILED: errno=%d err=%d sock_real=%d\n",
                    current ? current->pid : -1, errno, err, sock->real_fd);
@@ -3139,6 +4174,9 @@ int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
     }
     err = send_res;
     sock_trace("sendmsg", sock, err, 0);
+    sock_debug_event("sendmsg", sock, err, 0);
+    if ((size_t) send_res != requested)
+        sock_x11_event("sendmsg-short", sock, send_res, 0, requested);
     if (scm != NULL)
         printk("INFO: scm-send pid=%d real sendmsg OK: sent=%d sock_real=%d ctrl_len=%zu\n",
                current ? current->pid : -1, err, sock->real_fd, msg.msg_controllen);
@@ -3159,56 +4197,249 @@ out_free_scm:
         unlock(&peer_lock);
         scm_free(scm);
     }
+    goto out_free_iov;
+out_perm:
+    err = _EPERM;
+    goto out_free_iov;
+out_inval:
+    err = _EINVAL;
 out_free_iov:
-    for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++)
-        free(msg_iov[i].iov_base);
-  //  if(scm != NULL)
-  //      scm_free(scm);
+    free_msghdr_iov(msg_iov, msg.msg_iovlen);
+    free(msg_iov_fake);
     return err;
 }
 
-int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
-    STRACE("recvmsg(%d, %#x, %d)", sock_fd, msghdr_addr, flags);
+int_t sys_sendmsg_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags) {
+    return sys_sendmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_I386);
+}
+
+int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+    return sys_sendmsg_guest(sock_fd, msghdr_addr, flags);
+}
+
+int_t sys_sendmsg_amd64(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+    return sys_sendmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_AMD64);
+}
+
+int_t sys_sendmsg_amd64_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags) {
+    return sys_sendmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_AMD64);
+}
+
+static int ipv6_recverr_errno_from_icmp6(uint8_t type, uint8_t code) {
+    switch (type) {
+        case ICMP6_DST_UNREACH:
+            return code == ICMP6_DST_UNREACH_NOPORT ? ECONNREFUSED : EHOSTUNREACH;
+        case ICMP6_PACKET_TOO_BIG:
+            return EMSGSIZE;
+        case ICMP6_TIME_EXCEEDED:
+            return EHOSTUNREACH;
+        case ICMP6_PARAM_PROB:
+            return EPROTO;
+        default:
+            return EHOSTUNREACH;
+    }
+}
+
+static int ipv6_recverr_fd_get(struct fd *sock) {
+    if (sock->socket.ipv6_recverr_fd >= 0)
+        return sock->socket.ipv6_recverr_fd;
+    int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6);
+    if (fd < 0)
+        return -1;
+    sock->socket.ipv6_recverr_fd = fd;
+    return fd;
+}
+
+static bool ipv6_recverr_matches_socket(struct fd *sock, const struct ip6_hdr *ip6,
+        const struct udphdr *udp) {
+    struct sockaddr_in6 peer = {};
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(sock->real_fd, (struct sockaddr *) &peer, &peer_len) < 0)
+        return false;
+    if (peer_len < sizeof(peer))
+        return false;
+    if (memcmp(&ip6->ip6_dst, &peer.sin6_addr, sizeof(peer.sin6_addr)) != 0)
+        return false;
+    if (udp->uh_dport != peer.sin6_port)
+        return false;
+
+    struct sockaddr_in6 local = {};
+    socklen_t local_len = sizeof(local);
+    if (getsockname(sock->real_fd, (struct sockaddr *) &local, &local_len) == 0 &&
+            local_len >= sizeof(local)) {
+        if (local.sin6_port != 0 && udp->uh_sport != local.sin6_port)
+            return false;
+    }
+    return true;
+}
+
+static ssize_t recvmsg_ipv6_errqueue(struct fd *sock, struct msghdr *msg, int real_flags) {
+    int errfd = ipv6_recverr_fd_get(sock);
+    if (errfd < 0) {
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+
+    int recv_flags = real_flags & MSG_DONTWAIT;
+    while (1) {
+        uint8_t packet[2048];
+        struct sockaddr_in6 from = {};
+        struct iovec iov = {.iov_base = packet, .iov_len = sizeof(packet)};
+        struct msghdr raw = {
+            .msg_name = &from,
+            .msg_namelen = sizeof(from),
+            .msg_iov = &iov,
+            .msg_iovlen = 1,
+        };
+        ssize_t n = recvmsg(errfd, &raw, recv_flags);
+        if (n < 0)
+            return -1;
+        if ((size_t) n < sizeof(struct icmp6_hdr) + sizeof(struct ip6_hdr) + sizeof(struct udphdr))
+            continue;
+
+        const struct icmp6_hdr *icmp6 = (const struct icmp6_hdr *) packet;
+        switch (icmp6->icmp6_type) {
+            case ICMP6_DST_UNREACH:
+            case ICMP6_PACKET_TOO_BIG:
+            case ICMP6_TIME_EXCEEDED:
+            case ICMP6_PARAM_PROB:
+                break;
+            default:
+                continue;
+        }
+
+        const uint8_t *quoted = packet + sizeof(struct icmp6_hdr);
+        size_t quoted_len = (size_t) n - sizeof(struct icmp6_hdr);
+        if (quoted_len < sizeof(struct ip6_hdr) + sizeof(struct udphdr))
+            continue;
+
+        const struct ip6_hdr *inner_ip6 = (const struct ip6_hdr *) quoted;
+        if (inner_ip6->ip6_nxt != IPPROTO_UDP)
+            continue;
+        const struct udphdr *inner_udp =
+            (const struct udphdr *) (quoted + sizeof(struct ip6_hdr));
+        if (!ipv6_recverr_matches_socket(sock, inner_ip6, inner_udp))
+            continue;
+
+        if (msg->msg_name != NULL) {
+            size_t copy_len = msg->msg_namelen < sizeof(from) ? msg->msg_namelen : sizeof(from);
+            memcpy(msg->msg_name, &from, copy_len);
+            msg->msg_namelen = sizeof(from);
+        }
+
+        if (msg->msg_control != NULL &&
+                msg->msg_controllen >= CMSG_SPACE(sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6))) {
+            struct cmsghdr *cmsg = (struct cmsghdr *) msg->msg_control;
+            cmsg->cmsg_level = IPPROTO_IPV6;
+            cmsg->cmsg_type = IPV6_RECVERR_;
+            cmsg->cmsg_len = CMSG_LEN(sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6));
+
+            struct sock_extended_err_ serr = {
+                .ee_errno = ipv6_recverr_errno_from_icmp6(icmp6->icmp6_type, icmp6->icmp6_code),
+                .ee_origin = SO_EE_ORIGIN_ICMP6_,
+                .ee_type = icmp6->icmp6_type,
+                .ee_code = icmp6->icmp6_code,
+                .ee_info = icmp6->icmp6_type == ICMP6_PACKET_TOO_BIG ? ntohl(icmp6->icmp6_mtu) : 0,
+                .ee_data = 0,
+            };
+            memcpy(CMSG_DATA(cmsg), &serr, sizeof(serr));
+            memcpy((uint8_t *) CMSG_DATA(cmsg) + sizeof(serr), &from, sizeof(from));
+            msg->msg_controllen = CMSG_SPACE(sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6));
+        } else {
+            msg->msg_controllen = 0;
+            msg->msg_flags |= MSG_CTRUNC;
+        }
+
+        size_t payload_len = quoted_len;
+        size_t remaining = payload_len;
+        const uint8_t *src = quoted;
+        for (size_t i = 0; i < (size_t) msg->msg_iovlen && remaining > 0; i++) {
+            size_t chunk = msg->msg_iov[i].iov_len;
+            if (chunk > remaining)
+                chunk = remaining;
+            memcpy(msg->msg_iov[i].iov_base, src, chunk);
+            src += chunk;
+            remaining -= chunk;
+        }
+        msg->msg_flags &= ~MSG_TRUNC;
+        if (remaining > 0)
+            msg->msg_flags |= MSG_TRUNC;
+        return payload_len;
+    }
+}
+
+static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags,
+        enum guest_abi abi) {
+    STRACE("recvmsg(%d, %#llx, %d)", sock_fd, (unsigned long long) msghdr_addr, flags);
     struct fd *sock = sock_getfd(sock_fd);
     if (sock == NULL)
         return _EBADF;
 
     struct msghdr msg = {};
-    struct msghdr_ msg_fake;
-    if (user_get(msghdr_addr, msg_fake))
-        return _EFAULT;
-
-    // msg_name
-    char msg_name[msg_fake.msg_namelen];
-    if (msg_fake.msg_name != 0) {
-        msg.msg_name = msg_name;
-        msg.msg_namelen = sizeof(msg_name);
-    } else {
-        msg.msg_name = NULL;
-        msg.msg_namelen = 0;
-    }
-
-    char real_msg_control[CMSG_SPACE(sizeof(int))] = {}; // only used if needed
-    if (msg_fake.msg_controllen != 0) {
-        // msg_control, include room for one (1) fd
-        msg.msg_control = real_msg_control;
-        msg.msg_controllen = sizeof(real_msg_control);
-    } else {
-        msg.msg_control = NULL;
-        msg.msg_controllen = 0;
-    }
+    struct guest_msghdr_marshaled msg_fake;
+    int err = read_guest_msghdr(msghdr_addr, abi, &msg_fake);
+    if (err < 0)
+        return err;
 
     int real_flags = sock_flags_to_real(flags);
     if (real_flags < 0)
         return _EINVAL;
 
     // msg_iovec (no initial content)
-    struct iovec_ msg_iov_fake[msg_fake.msg_iovlen];
-    if (user_get(msg_fake.msg_iov, msg_iov_fake))
-        return _EFAULT;
-    struct iovec msg_iov[msg_fake.msg_iovlen];
+    struct guest_iovec_ *msg_iov_fake = user_read_iovecs_abi(current, abi, msg_fake.msg_iov, msg_fake.msg_iovlen);
+    if (IS_ERR(msg_iov_fake))
+        return PTR_ERR(msg_iov_fake);
+    struct iovec *msg_iov = NULL;
+    if (msg_fake.msg_iovlen != 0) {
+        msg_iov = calloc(msg_fake.msg_iovlen, sizeof(*msg_iov));
+        if (msg_iov == NULL) {
+            free(msg_iov_fake);
+            return _ENOMEM;
+        }
+    }
+
+    // msg_name
+    char msg_name_stack[128];
+    char *msg_name = msg_name_stack;
+    if (msg_fake.msg_namelen > sizeof(msg_name_stack)) {
+        msg_name = malloc(msg_fake.msg_namelen);
+        if (msg_name == NULL) {
+            free(msg_iov_fake);
+            free(msg_iov);
+            return _ENOMEM;
+        }
+    }
+    if (msg_fake.msg_name != 0) {
+        msg.msg_name = msg_name;
+        msg.msg_namelen = msg_fake.msg_namelen;
+    } else {
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
+    }
+
+    uint_t guest_controllen_max = msg_fake.msg_controllen;
+    char local_rights_msg_control[CMSG_SPACE(sizeof(int))] = {};
+    void *real_msg_control = NULL;
+    if (msg_fake.msg_controllen != 0) {
+        size_t real_msg_controllen = guest_controllen_max;
+        if (sock->socket.domain == AF_LOCAL_ && real_msg_controllen < sizeof(local_rights_msg_control))
+            real_msg_controllen = sizeof(local_rights_msg_control);
+        real_msg_control = calloc(1, real_msg_controllen);
+        if (real_msg_control == NULL) {
+            free(msg_iov_fake);
+            free(msg_iov);
+            if (msg_name != msg_name_stack)
+                free(msg_name);
+            return _ENOMEM;
+        }
+        msg.msg_control = real_msg_control;
+        msg.msg_controllen = real_msg_controllen;
+    } else {
+        msg.msg_control = NULL;
+        msg.msg_controllen = 0;
+    }
     msg.msg_iov = msg_iov;
-    msg.msg_iovlen = sizeof(msg_iov) / sizeof(msg_iov[0]);
+    msg.msg_iovlen = msg_fake.msg_iovlen;
     for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
         msg_iov[i].iov_len = msg_iov_fake[i].len;
         msg_iov[i].iov_base = malloc(msg_iov_fake[i].len);
@@ -3218,10 +4449,14 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         msg_fake.msg_namelen = 0;
         msg_fake.msg_controllen = 0;
         msg_fake.msg_flags = 0;
-        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++)
-            free(msg_iov[i].iov_base);
-        if (user_put(msghdr_addr, msg_fake))
-            return _EFAULT;
+        free_msghdr_iov(msg_iov, msg.msg_iovlen);
+        free(msg_iov_fake);
+        free(real_msg_control);
+        if (msg_name != msg_name_stack)
+            free(msg_name);
+        err = write_guest_msghdr(msghdr_addr, abi, &msg_fake);
+        if (err < 0)
+            return err;
         return 0;
     }
 
@@ -3235,49 +4470,111 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
                     chunk_size = n;
                 if (chunk_size != 0)
                     if (user_write(msg_iov_fake[i].base, msg_iov[i].iov_base, chunk_size)) {
-                        for (size_t j = 0; j < (size_t) msg.msg_iovlen; j++)
-                            free(msg_iov[j].iov_base);
+                        free_msghdr_iov(msg_iov, msg.msg_iovlen);
+                        free(msg_iov_fake);
+                        free(real_msg_control);
+                        if (msg_name != msg_name_stack)
+                            free(msg_name);
                         return _EFAULT;
                     }
                 n -= chunk_size;
             }
         }
-        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++)
-            free(msg_iov[i].iov_base);
-        if (res < 0)
+        free_msghdr_iov(msg_iov, msg.msg_iovlen);
+        free(msg_iov_fake);
+        free(real_msg_control);
+        if (res < 0) {
+            if (msg_name != msg_name_stack)
+                free(msg_name);
             return res;
+        }
         if (msg.msg_name != NULL) {
             int err = netlink_sockaddr_write(msg_fake.msg_name, msg.msg_name, &msg.msg_namelen);
-            if (err < 0)
+            if (err < 0) {
+                if (msg_name != msg_name_stack)
+                    free(msg_name);
                 return err;
+            }
         }
         msg_fake.msg_namelen = msg.msg_namelen;
         msg_fake.msg_controllen = 0;
         msg_fake.msg_flags = sock_flags_from_real(msg.msg_flags);
-        if (user_put(msghdr_addr, msg_fake))
-            return _EFAULT;
+        if (msg_name != msg_name_stack)
+            free(msg_name);
+        err = write_guest_msghdr(msghdr_addr, abi, &msg_fake);
+        if (err < 0)
+            return err;
         return res;
     }
 
     if (sock->socket.domain == AF_LOCAL_) {
-        int peer_err = unix_socket_finish_peer(sock, !(real_flags & MSG_DONTWAIT));
-        if (peer_err < 0)
+        int peer_err = unix_socket_finish_peer(sock);
+        if (peer_err < 0) {
+            free_msghdr_iov(msg_iov, msg.msg_iovlen);
+            free(msg_iov_fake);
+            free(real_msg_control);
+            if (msg_name != msg_name_stack)
+                free(msg_name);
             return peer_err;
+        }
     }
 
     ssize_t res = 0;
     TASK_MAY_BLOCK {
-        do {
+        bool use_ipv6_errqueue =
+            (flags & MSG_ERRQUEUE_) &&
+            sock->socket.domain == AF_INET6_ &&
+            sock->socket.type == SOCK_DGRAM_ &&
+            sock->socket.ipv6_recverr;
+        while (1) {
+            sigset_t oldmask;
+            if (!socket_blocking_syscall_begin(&oldmask)) {
+                res = errno_map();
+                errno = 0;
+                break;
+            }
             errno = 0;
-            res = recvmsg(sock->real_fd, &msg, real_flags);
-        } while (res < 0 && socket_should_retry_io_eintr(sock, real_flags));
+            if (use_ipv6_errqueue)
+                res = recvmsg_ipv6_errqueue(sock, &msg, real_flags);
+            else
+                res = recvmsg(sock->real_fd, &msg, real_flags);
+            socket_blocking_syscall_end();
+            if (res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(sock, real_flags))
+                continue;
+            if (socket_should_retry_io_eagain(sock, real_flags)) {
+                int wait_err = socket_wait_ready(sock, POLLIN);
+                if (wait_err < 0) {
+                    res = wait_err;
+                    errno = 0;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
     }
-    int err = 0;
+    size_t requested = sock_iov_requested(msg.msg_iov, msg.msg_iovlen);
+    err = 0;
     if (res < 0) {
-        err = errno_map();
+        if (res > -4096 && res < 0 && errno == 0)
+            err = (int) res;
+        else if (socket_should_map_unix_eperm_to_eagain(sock, real_flags))
+            err = _EAGAIN;
+        else
+            err = errno_map();
         sock_trace("recvmsg", sock, -1, err);
+        sock_debug_event("recvmsg", sock, -1, err);
+        if (err == _EAGAIN)
+            sock_x11_event("recvmsg-eagain", sock, -1, err, requested);
+        else
+            sock_x11_event("recvmsg-err", sock, -1, err, requested);
     } else {
         sock_trace("recvmsg", sock, res, 0);
+        sock_debug_event("recvmsg", sock, res, 0);
+        if (res == 0)
+            sock_x11_event("recvmsg-eof", sock, 0, 0, requested);
         if (sock_trace_enabled()) {
             printk("INFO: net recvmsg-flags pid=%d comm=%s real=%d flags=%#x namelen=%u controllen=%zu\n",
                    current->pid, current->comm, sock->real_fd, msg.msg_flags,
@@ -3298,17 +4595,25 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
             chunk_size = n;
         if (chunk_size > 0)
             if (user_write(msg_iov_fake[i].base, msg_iov[i].iov_base, chunk_size))
-                return _EFAULT;
+                goto out_recvmsg_fault;
         n -= chunk_size;
-        free(msg_iov[i].iov_base);
     }
+    free_msghdr_iov(msg_iov, msg.msg_iovlen);
+    free(msg_iov_fake);
 
     // msg_control (changed)
-    uint_t guest_controllen_max = msg_fake.msg_controllen; // save before zeroing
     msg_fake.msg_controllen = 0;
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    bool have_rights = sock->socket.domain == AF_LOCAL_ && cmsg != NULL &&
-        cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS;
+    struct cmsghdr *cmsg = host_cmsg_first(&msg);
+    struct cmsghdr *rights_cmsg = NULL;
+    bool have_rights = false;
+    for (struct cmsghdr *iter = cmsg; iter != NULL; iter = host_cmsg_next(&msg, iter)) {
+        if (sock->socket.domain == AF_LOCAL_ &&
+                iter->cmsg_level == SOL_SOCKET && iter->cmsg_type == SCM_RIGHTS) {
+            have_rights = true;
+            rights_cmsg = iter;
+            break;
+        }
+    }
     if (sock->socket.domain == AF_LOCAL_ && msg.msg_control != NULL)
         printk("INFO: scm-recv pid=%d sock_real=%d res=%zd real_ctrl_after=%zu have_rights=%d unix_peer=%p scm_empty=%d\n",
                current ? current->pid : -1, sock->real_fd, res, msg.msg_controllen,
@@ -3318,7 +4623,7 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
         sock->socket.unix_passcred && res >= 0;
     struct scm *scm = NULL;
     if (have_rights) {
-        int dummy_fd = ((int *) CMSG_DATA(cmsg))[0];
+        int dummy_fd = ((int *) CMSG_DATA(rights_cmsg))[0];
         close(dummy_fd);
 
         lock(&sock->lock, 0);
@@ -3329,83 +4634,173 @@ int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
 
         if (res < 0) {
             scm_free(scm);
+            free(real_msg_control);
+            if (msg_name != msg_name_stack)
+                free(msg_name);
             return err;
         }
     }
 
-    if (have_rights || want_passcred) {
-        uint8_t guest_msg_control[sizeof(struct cmsghdr_) + 253 * sizeof(fd_t) +
-                                  sizeof(struct cmsghdr_) + sizeof(struct ucred_)] = {};
+    if (res >= 0 && msg_fake.msg_control != 0 && (cmsg != NULL || want_passcred)) {
         size_t guest_msg_control_len = 0;
         size_t required_msg_control = 0;
         struct ucred_ cred = {};
         bool have_passcred = want_passcred && unix_socket_get_peer_cred(sock, &cred);
 
-        if (have_rights)
-            required_msg_control += fake_cmsg_space(sizeof(fd_t) * scm->num_fds);
+        for (struct cmsghdr *iter = cmsg; iter != NULL; iter = host_cmsg_next(&msg, iter)) {
+            if (iter->cmsg_len < CMSG_LEN(0))
+                continue;
+            size_t data_len = iter->cmsg_len - CMSG_LEN(0);
+            if (sock->socket.domain == AF_LOCAL_ &&
+                    iter->cmsg_level == SOL_SOCKET && iter->cmsg_type == SCM_RIGHTS) {
+                if (have_rights)
+                    required_msg_control += guest_cmsg_space(abi, sizeof(fd_t) * scm->num_fds);
+                continue;
+            }
+            const void *fake_data;
+            size_t fake_data_len;
+            int fake_level;
+            int fake_type;
+            uint8_t scratch[sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6_)];
+            if (!sock_cmsg_translate_payload(iter->cmsg_level, iter->cmsg_type,
+                        CMSG_DATA(iter), data_len, &fake_data, &fake_data_len,
+                        &fake_level, &fake_type, scratch, sizeof(scratch)))
+                continue;
+            required_msg_control += guest_cmsg_space(abi, fake_data_len);
+            (void) fake_level;
+        }
         if (have_passcred)
-            required_msg_control += fake_cmsg_space(sizeof(cred));
+            required_msg_control += guest_cmsg_space(abi, sizeof(cred));
 
-        if (msg_fake.msg_control == 0 || required_msg_control > guest_controllen_max) {
+        if (required_msg_control > guest_controllen_max) {
             msg_fake.msg_flags |= MSG_CTRUNC_;
-        } else {
-            if (have_rights) {
-                fd_t fds[scm->num_fds];
-                for (unsigned i = 0; i < scm->num_fds; i++) {
-                    fd_retain(scm->fds[i]); // f_install takes ownership; scm_free releases separately
-                    fds[i] = f_install(scm->fds[i], 0);
-                    STRACE(" receiving fd %d", fds[i]);
+        } else if (required_msg_control != 0) {
+            uint8_t *guest_msg_control = calloc(1, required_msg_control);
+            if (guest_msg_control == NULL) {
+                if (scm != NULL)
+                    scm_free(scm);
+                free(real_msg_control);
+                if (msg_name != msg_name_stack)
+                    free(msg_name);
+                return _ENOMEM;
+            }
+            for (struct cmsghdr *iter = cmsg; iter != NULL; iter = host_cmsg_next(&msg, iter)) {
+                if (iter->cmsg_len < CMSG_LEN(0))
+                    continue;
+                size_t data_len = iter->cmsg_len - CMSG_LEN(0);
+                if (sock->socket.domain == AF_LOCAL_ &&
+                        iter->cmsg_level == SOL_SOCKET && iter->cmsg_type == SCM_RIGHTS) {
+                    if (!have_rights)
+                        continue;
+                    fd_t fds[scm->num_fds];
+                    for (unsigned i = 0; i < scm->num_fds; i++) {
+                        fd_retain(scm->fds[i]); // f_install takes ownership; scm_free releases separately
+                        fds[i] = f_install(scm->fds[i], 0);
+                        STRACE(" receiving fd %d", fds[i]);
+                    }
+                    bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
+                            SOL_SOCKET_, SCM_RIGHTS_, fds, sizeof(fd_t) * scm->num_fds);
+                    assert(appended);
+                    continue;
                 }
-                bool appended = fake_cmsg_append(guest_msg_control, sizeof(guest_msg_control), &guest_msg_control_len,
-                        SOL_SOCKET_, SCM_RIGHTS_, fds, sizeof(fd_t) * scm->num_fds);
+                int fake_level = sock_cmsg_level_to_fake(iter->cmsg_level);
+                const void *fake_data;
+                size_t fake_data_len;
+                int fake_type;
+                uint8_t scratch[sizeof(struct sock_extended_err_) + sizeof(struct sockaddr_in6_)];
+                if (!sock_cmsg_translate_payload(iter->cmsg_level, iter->cmsg_type,
+                            CMSG_DATA(iter), data_len, &fake_data, &fake_data_len,
+                            &fake_level, &fake_type, scratch, sizeof(scratch)))
+                    continue;
+                bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
+                        fake_level, fake_type, fake_data, fake_data_len);
                 assert(appended);
             }
             if (have_passcred) {
-                bool appended = fake_cmsg_append(guest_msg_control, sizeof(guest_msg_control), &guest_msg_control_len,
+                bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
                         SOL_SOCKET_, SCM_CREDENTIALS_, &cred, sizeof(cred));
                 assert(appended);
             }
             if (user_write(msg_fake.msg_control, guest_msg_control, guest_msg_control_len)) {
                 if (scm != NULL)
                     scm_free(scm);
+                free(guest_msg_control);
+                free(real_msg_control);
+                if (msg_name != msg_name_stack)
+                    free(msg_name);
                 return _EFAULT;
             }
+            free(guest_msg_control);
             msg_fake.msg_controllen = guest_msg_control_len;
         }
-        if (scm != NULL)
-            scm_free(scm);
     }
+    if (scm != NULL)
+        scm_free(scm);
 
     // by now the iovecs and scm have been freed so we can return
-    if (res < 0)
+    if (res < 0) {
+        free(real_msg_control);
+        if (msg_name != msg_name_stack)
+            free(msg_name);
         return err;
+    }
 
     // msg_name (changed)
     if (msg.msg_name != 0) {
-        int err = sockaddr_write(msg_fake.msg_name, msg.msg_name, sizeof(msg_name), &msg.msg_namelen);
-        if (err < 0)
+        int err = sockaddr_write(msg_fake.msg_name, msg.msg_name, msg_fake.msg_namelen, &msg.msg_namelen);
+        if (err < 0) {
+            free(real_msg_control);
+            if (msg_name != msg_name_stack)
+                free(msg_name);
             return err;
+        }
     }
     msg_fake.msg_namelen = msg.msg_namelen;
 
-    if (user_put(msghdr_addr, msg_fake))
-        return _EFAULT;
+    free(real_msg_control);
+    if (msg_name != msg_name_stack)
+        free(msg_name);
+    err = write_guest_msghdr(msghdr_addr, abi, &msg_fake);
+    if (err < 0)
+        return err;
     return res;
+
+out_recvmsg_fault:
+    free_msghdr_iov(msg_iov, msg.msg_iovlen);
+    free(msg_iov_fake);
+    free(real_msg_control);
+    if (msg_name != msg_name_stack)
+        free(msg_name);
+    return _EFAULT;
 }
 
-struct mmsghdr_ {
-    struct msghdr_ hdr;
-    uint_t len;
-};
+int_t sys_recvmsg_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags) {
+    return sys_recvmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_I386);
+}
 
-int_t sys_recvmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t UNUSED(timeout_addr)) {
+int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+    return sys_recvmsg_guest(sock_fd, msghdr_addr, flags);
+}
+
+int_t sys_recvmsg_amd64(fd_t sock_fd, addr_t msghdr_addr, int_t flags) {
+    return sys_recvmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_AMD64);
+}
+
+int_t sys_recvmsg_amd64_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags) {
+    return sys_recvmsg_guest_abi(sock_fd, msghdr_addr, flags, GUEST_ABI_AMD64);
+}
+
+static int_t sys_recvmmsg_guest_abi(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags,
+        guest_addr_t UNUSED(timeout_addr), enum guest_abi abi) {
     int num_received = 0;
     int recv_flags = flags;
+    size_t msg_stride = guest_mmsghdr_size(abi);
+    size_t msg_len_offset = guest_mmsghdr_len_offset(abi);
     for (unsigned i = 0; i < vec_len; i++) {
-        addr_t msghdr = msg_vec + i * sizeof(struct mmsghdr_);
-        int_t res = sys_recvmsg(sock_fd, msghdr, recv_flags);
+        guest_addr_t msghdr = msg_vec + i * msg_stride;
+        int_t res = sys_recvmsg_guest_abi(sock_fd, msghdr, recv_flags, abi);
         if (res >= 0) {
-            addr_t msg_len_addr = msghdr + offsetof(struct mmsghdr_, len);
+            guest_addr_t msg_len_addr = msghdr + msg_len_offset;
             if (user_put(msg_len_addr, res))
                 res = _EFAULT;
         }
@@ -3420,17 +4815,40 @@ int_t sys_recvmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, ad
     return num_received;
 }
 
-int_t sys_recvmmsg_time64(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t timeout_addr) {
-    return sys_recvmmsg(sock_fd, msg_vec, vec_len, flags, timeout_addr);
+int_t sys_recvmmsg_guest(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags, guest_addr_t timeout_addr) {
+    return sys_recvmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, timeout_addr, GUEST_ABI_I386);
 }
 
-int_t sys_sendmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags) {
+int_t sys_recvmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t timeout_addr) {
+    return sys_recvmmsg_guest(sock_fd, msg_vec, vec_len, flags, timeout_addr);
+}
+
+int_t sys_recvmmsg_time64_guest(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags, guest_addr_t timeout_addr) {
+    return sys_recvmmsg_guest(sock_fd, msg_vec, vec_len, flags, timeout_addr);
+}
+
+int_t sys_recvmmsg_time64(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t timeout_addr) {
+    return sys_recvmmsg_time64_guest(sock_fd, msg_vec, vec_len, flags, timeout_addr);
+}
+
+int_t sys_recvmmsg_amd64(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags, addr_t timeout_addr) {
+    return sys_recvmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, timeout_addr, GUEST_ABI_AMD64);
+}
+
+int_t sys_recvmmsg_amd64_guest(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags, guest_addr_t timeout_addr) {
+    return sys_recvmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, timeout_addr, GUEST_ABI_AMD64);
+}
+
+static int_t sys_sendmmsg_guest_abi(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags,
+        enum guest_abi abi) {
     int num_sent = 0;
+    size_t msg_stride = guest_mmsghdr_size(abi);
+    size_t msg_len_offset = guest_mmsghdr_len_offset(abi);
     for (unsigned i = 0; i < vec_len; i++) {
-        addr_t msghdr = msg_vec + i * sizeof(struct mmsghdr_);
-        int_t res = sys_sendmsg(sock_fd, msghdr, flags);
+        guest_addr_t msghdr = msg_vec + i * msg_stride;
+        int_t res = sys_sendmsg_guest_abi(sock_fd, msghdr, flags, abi);
         if (res >= 0) {
-            addr_t msg_len_addr = msghdr + offsetof(struct mmsghdr_, len);
+            guest_addr_t msg_len_addr = msghdr + msg_len_offset;
             if (user_put(msg_len_addr, res))
                 res = _EFAULT;
         }
@@ -3450,6 +4868,22 @@ int_t sys_sendmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags) {
         }
     }
     return num_sent;
+}
+
+int_t sys_sendmmsg_guest(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags) {
+    return sys_sendmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, GUEST_ABI_I386);
+}
+
+int_t sys_sendmmsg(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags) {
+    return sys_sendmmsg_guest(sock_fd, msg_vec, vec_len, flags);
+}
+
+int_t sys_sendmmsg_amd64(fd_t sock_fd, addr_t msg_vec, uint_t vec_len, int_t flags) {
+    return sys_sendmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, GUEST_ABI_AMD64);
+}
+
+int_t sys_sendmmsg_amd64_guest(fd_t sock_fd, guest_addr_t msg_vec, uint_t vec_len, int_t flags) {
+    return sys_sendmmsg_guest_abi(sock_fd, msg_vec, vec_len, flags, GUEST_ABI_AMD64);
 }
 
 static void sock_translate_err(struct fd *fd, int *err) {
@@ -3483,6 +4917,14 @@ static int sock_poll(struct fd *fd) {
     if ((types & POLL_WRITE) && !socket_tcp_connect_write_ready(fd))
         types &= ~POLL_WRITE;
 #endif
+    if (fd->socket.ipv6_recverr && fd->socket.ipv6_recverr_fd >= 0) {
+        struct pollfd err_pfd = {
+            .fd = fd->socket.ipv6_recverr_fd,
+            .events = POLLIN,
+        };
+        if (poll(&err_pfd, 1, 0) > 0 && (err_pfd.revents & POLLIN))
+            types |= POLLERR;
+    }
     return types;
 }
 
@@ -3492,24 +4934,52 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
     if (fd->real_fd < 0)
         return _EOPNOTSUPP;
     if (fd->socket.domain == AF_LOCAL_) {
-        int err = unix_socket_finish_peer(fd, !(fd->flags & O_NONBLOCK_));
+        int err = unix_socket_finish_peer(fd);
         if (err < 0)
             return err;
     }
     ssize_t res = 0;
     TASK_MAY_BLOCK {
-        do {
+        while (1) {
             errno = 0;
             res = read(fd->real_fd, buf, size);
-        } while (res < 0 && socket_should_retry_io_eintr(fd, 0));
+            if (res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(fd, 0))
+                continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                    socket_call_is_blocking(fd, 0)) {
+                int wait_err = socket_wait_ready(fd, POLLIN);
+                if (wait_err < 0) {
+                    res = wait_err;
+                    errno = 0;
+                    goto out_read;
+                }
+                continue;
+            }
+            break;
+        }
     }
+out_read:
     if (res < 0) {
+        if (res > -4096 && res < 0 && errno == 0)
+            return res;
+        if (socket_should_map_unix_eperm_to_eagain(fd, 0)) {
+            sock_x11_event("read-eagain", fd, -1, _EAGAIN, size);
+            return _EAGAIN;
+        }
         int err = errno_map();
         sock_translate_err(fd, &err);
         sock_trace("read", fd, -1, err);
+        if (err == _EAGAIN)
+            sock_x11_event("read-eagain", fd, -1, err, size);
+        else
+            sock_x11_event("read-err", fd, -1, err, size);
         return err;
     }
     sock_trace("read", fd, res, 0);
+    if (res == 0)
+        sock_x11_event("read-eof", fd, 0, 0, size);
     return res;
 }
 
@@ -3522,18 +4992,46 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     sock_trace_write_preview(fd, buf, size);
     ssize_t res = 0;
     TASK_MAY_BLOCK {
-        do {
+        while (1) {
             errno = 0;
             res = write(fd->real_fd, buf, size);
-        } while (res < 0 && socket_should_retry_io_eintr(fd, 0));
+            if (res >= 0)
+                break;
+            if (socket_should_retry_io_eintr(fd, 0))
+                continue;
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+                    socket_call_is_blocking(fd, 0)) {
+                int wait_err = socket_wait_ready(fd, POLLOUT);
+                if (wait_err < 0) {
+                    res = wait_err;
+                    goto out_write;
+                }
+                continue;
+            }
+            break;
+        }
     }
+out_write:
     if (res < 0) {
+        if (res > -4096 && res < 0 && errno == 0)
+            return res;
+        if (socket_should_map_unix_eperm_to_eagain(fd, 0)) {
+            sock_trace("write", fd, -1, _EAGAIN);
+            sock_x11_event("write-eagain", fd, -1, _EAGAIN, size);
+            return _EAGAIN;
+        }
         int err = errno_map();
         sock_translate_err(fd, &err);
         sock_trace("write", fd, -1, err);
+        if (err == _EAGAIN)
+            sock_x11_event("write-eagain", fd, -1, err, size);
+        else
+            sock_x11_event("write-err", fd, -1, err, size);
         return err;
     }
     sock_trace("write", fd, res, 0);
+    if ((size_t) res != size)
+        sock_x11_event("write-short", fd, res, 0, size);
     return res;
 }
 
@@ -3604,6 +5102,10 @@ static int sock_close(struct fd *fd) {
         }
         unlock(&fd->lock);
     }
+    if (fd->socket.ipv6_recverr_fd >= 0) {
+        close(fd->socket.ipv6_recverr_fd);
+        fd->socket.ipv6_recverr_fd = -1;
+    }
     if (fd->real_fd < 0)
         return 0;
     return realfs_close(fd);
@@ -3673,7 +5175,7 @@ static struct socket_call {
 // #define SYS_RECVMMSG    19        /* sys_recvmmsg(2)        */
 // #define SYS_SENDMMSG    20        /* sys_sendmmsg(2)        */
 
-int_t sys_socketcall(dword_t call_num, addr_t args_addr) {
+int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr) {
     STRACE("%d ", call_num);
     if (call_num < 1 || call_num >= sizeof(socket_calls)/sizeof(socket_calls[0]))
         return _EINVAL;
@@ -3688,4 +5190,8 @@ int_t sys_socketcall(dword_t call_num, addr_t args_addr) {
         return _EFAULT;
     int_t result = call.func(args[0], args[1], args[2], args[3], args[4], args[5]);
     return result;
+}
+
+int_t sys_socketcall(dword_t call_num, addr_t args_addr) {
+    return sys_socketcall_guest(call_num, args_addr);
 }

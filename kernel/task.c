@@ -1,11 +1,13 @@
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
+#include "jit/jit.h"
 #include "platform/platform.h"
 #include "util/sync.h"
 #include <libkern/OSAtomic.h>
@@ -19,7 +21,7 @@ pthread_mutex_t extra_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t delay_lock = PTHREAD_MUTEX_INITIALIZER;
 extern lock_t atomic_l_lock;
 pthread_mutex_t wait_for_lock = PTHREAD_MUTEX_INITIALIZER;
-time_t boot_time;  // Store the boot time.  -mke
+time_t boot_time;  // Store the boot time.
 
 struct list tasks_pending_deletion_queue;
 pthread_mutex_t tasks_pending_deletion_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -27,7 +29,7 @@ pthread_mutex_t tasks_pending_deletion_lock = PTHREAD_MUTEX_INITIALIZER;
 int iOSMajorRelease;
 
 bool doEnableMulticore; // Enable multicore if toggled, should default to false
-bool isGlibC = false; // Try to guess if we're running a non musl distro.  -mke
+bool isGlibC = false; // Try to guess if we're running a non-musl distro.
 bool doEnableExtraLocking; // Enable extra locking if toggled, should default to true
 
 __thread struct task *current;
@@ -72,6 +74,51 @@ struct task *pid_get_task(dword_t id) {
     return task;
 }
 
+struct task *pid_get_task_ref(dword_t id) {
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task(id);
+    if (task != NULL)
+        task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
+    return task;
+}
+
+void task_snapshot_release(struct task_snapshot *snapshot) {
+    for (unsigned i = 0; i < snapshot->count; i++)
+        task_ref_cnt_mod(snapshot->tasks[i], -1);
+    free(snapshot->tasks);
+    snapshot->tasks = NULL;
+    snapshot->count = 0;
+}
+
+int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only) {
+    unsigned cap = 0;
+    complex_lockt(&pids_lock, 0);
+    struct pid *pid_entry;
+    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
+        struct task *task = pid_entry->task;
+        if (task == NULL || task->zombie || task->exiting)
+            continue;
+        if (leaders_only && !task_is_leader(task))
+            continue;
+        if (snapshot->count == cap) {
+            unsigned new_cap = cap ? cap * 2 : 64;
+            struct task **new_tasks = realloc(snapshot->tasks, sizeof(*new_tasks) * new_cap);
+            if (new_tasks == NULL) {
+                unlock(&pids_lock);
+                task_snapshot_release(snapshot);
+                return _ENOMEM;
+            }
+            snapshot->tasks = new_tasks;
+            cap = new_cap;
+        }
+        task_ref_cnt_mod(task, 1);
+        snapshot->tasks[snapshot->count++] = task;
+    }
+    unlock(&pids_lock);
+    return 0;
+}
+
 struct pid *pid_get_last_allocated(void) {
     if (!last_allocated_pid) {
         return NULL;
@@ -79,9 +126,9 @@ struct pid *pid_get_last_allocated(void) {
     return pid_get(last_allocated_pid);
 }
 
-inline void task_ref_cnt_mod(struct task *task, int value) { // value Should only be -1 or 1.  -mke
+inline void task_ref_cnt_mod(struct task *task, int value) { // value should only be -1 or 1.
     // Keep track of how many threads are referencing this task
-    if(!doEnableExtraLocking) { // If they want to fly by the seat of their pants...  -mke
+    if(!doEnableExtraLocking) {
         return;
     }
     
@@ -93,9 +140,15 @@ inline void task_ref_cnt_mod(struct task *task, int value) { // value Should onl
         }
     }
 
+    if (value != 1 && value != -1) {
+        printk("ERROR: invalid task refcount delta %d for %s:%d\n",
+               value, task->comm, task->pid);
+        return;
+    }
+
     pthread_mutex_lock(&task->reference.lock);
     
-    if(((task->reference.count + value) < 0) && (task->pid > 9)) { // Prevent our unsigned value attempting to go negative.  -mke
+    if(((task->reference.count + value) < 0) && (task->pid > 9)) { // Prevent the count from going negative.
         void *caller = __builtin_return_address(0);
         Dl_info caller_info = {};
         const char *caller_name = "?";
@@ -141,22 +194,10 @@ dword_t get_count_of_alive_tasks(void) {
 }
 
 struct task *task_create_(struct task *parent) {
-    complex_lockt(&pids_lock, 0);
-    do {
-        last_allocated_pid++;
-        if (last_allocated_pid > MAX_PID) last_allocated_pid = 1;
-    } while (!pid_empty(&pids[last_allocated_pid]));
-    struct pid *pid = &pids[last_allocated_pid];
-    pid->id = last_allocated_pid;
-    list_init(&pid->alive);
-    list_init(&pid->session);
-    list_init(&pid->pgroup);
-
     struct task *task = malloc(sizeof(struct task));
-    if (task == NULL) {
-        unlock(&pids_lock);
+    if (task == NULL)
         return NULL;
-    }
+
     *task = (struct task) {};
     if (parent != NULL)
         *task = *parent;
@@ -164,11 +205,11 @@ struct task *task_create_(struct task *parent) {
         // Treat init/root as starting with the full Linux capability set so
         // guest helpers such as setpriv can drop or reshuffle capabilities
         // without tripping over uninitialized state.
+        task->abi = GUEST_ABI_I386;
         task->cap_effective[0] = task->cap_effective[1] = UINT32_MAX;
         task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
         task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
     }
-    task->pid = pid->id;
     list_init(&task->group_links);
     list_init(&task->children);
     list_init(&task->siblings);
@@ -197,6 +238,9 @@ struct task *task_create_(struct task *parent) {
 
     task->waiting_cond = NULL;
     task->waiting_lock = NULL;
+    task->waiting_interrupt_flag = NULL;
+    task->wait_interrupted = false;
+    task->restart_interrupted_syscall = false;
     lock_init(&task->waiting_cond_lock, "task_creat_wait\0");
     cond_init(&task->pause);
 
@@ -209,6 +253,18 @@ struct task *task_create_(struct task *parent) {
     task->reference.count = 0;
     task->reference.ready_to_be_freed = false;
     pthread_mutex_init(&task->reference.lock, NULL);
+
+    complex_lockt(&pids_lock, 0);
+    do {
+        last_allocated_pid++;
+        if (last_allocated_pid > MAX_PID) last_allocated_pid = 1;
+    } while (!pid_empty(&pids[last_allocated_pid]));
+    struct pid *pid = &pids[last_allocated_pid];
+    pid->id = last_allocated_pid;
+    list_init(&pid->alive);
+    list_init(&pid->session);
+    list_init(&pid->pgroup);
+    task->pid = pid->id;
 
     pid->task = task;
     list_add(&alive_pids_list, &pid->alive);
@@ -226,26 +282,37 @@ bool should_wait(struct task *t) {
     return task_ref_cnt_get(t, 0) > 1 || locks_held_count(t) || !!(t->pending & ~t->blocked);
 }
 
-void task_destroy(struct task *task, int UNUSED(caller)) {
+void task_unlink_locked(struct task *task) {
     task->exiting = true;
-    
-    //printk("TD(%s:%d): Called by %d\n", task->comm, task->pid, caller);
-    
-    // We use a single loop to wait for the task to be ready to destroy.
-    // This loop replaces all the similar while-loops in the original code.
-    int count = -4000; // Counter to limit the number of times we check.
-    while (should_wait(task) && count < 0) {
-        nanosleep(&lock_pause, NULL); // Sleep for a defined amount of time.
-        count++;
-    }
-    
-    // Remove the task from the sibling and alive lists.
     list_remove(&task->siblings);
     list_remove_safe(&task->ptrace_siblings);
     struct pid *pid = pid_get(task->pid);
     pid->task = NULL;
     list_remove(&pid->alive);
-    
+}
+
+static void task_free_final(struct task *task) {
+    if (task != NULL && task_is_leader(task) && task->group != NULL) {
+        cond_destroy(&task->group->child_exit);
+        free(task->group);
+        task->group = NULL;
+    }
+    free(task);
+}
+
+void task_destroy_unlinked(struct task *task, int caller) {
+    task->exiting = true;
+
+    // We use a single loop to wait for the task to be ready to destroy.
+    // This loop replaces all the similar while-loops in the original code.
+    // Reap paths should not stall a waiting parent just to synchronously free
+    // the task object. If references are still draining, defer cleanup.
+    int count = caller == 2 ? 0 : -4000; // Counter to limit the number of times we check.
+    while (count < 0 && should_wait(task)) {
+        nanosleep(&lock_pause, NULL); // Sleep for a defined amount of time.
+        count++;
+    }
+
     if (task_ref_cnt_get(task, 1)) { // Check to see if another thread is accessing this process.  If yes, note that and defer freeing it
         struct task_pending_deletion *pd = malloc(sizeof(struct task_pending_deletion));
         if (pd) {
@@ -261,8 +328,15 @@ void task_destroy(struct task *task, int UNUSED(caller)) {
         cleanup_pending_deletions();
         return;
     } else {
-        free(task);
+        task_free_final(task);
     }
+}
+
+void task_destroy(struct task *task, int caller) {
+    task_unlink_locked(task);
+    unlock(&pids_lock);
+    task_destroy_unlinked(task, caller);
+    complex_lockt(&pids_lock, 0);
 }
 
 // Cleanup function to delete tasks after the grace period
@@ -272,7 +346,7 @@ void cleanup_pending_deletions(void) {
     list_for_each_entry_safe(&tasks_pending_deletion_queue, pd, tmp, list) {
         if ((difftime(time(NULL), pd->added_time) >= GRACE_PERIOD) && !! (!pd->task->reference.count)) { // Delete reaped tasks old and no longer referenced
             if (task_ref_cnt_get(pd->task, 0) == 0) {
-                free(pd->task);
+                task_free_final(pd->task);
                 list_remove(&pd->list);
                 free(pd);
             }
@@ -289,12 +363,44 @@ void run_at_boot(void) {  // Stuff we run only once, at boot time.
     lock_init(&pids_lock, "pids");
     lock_init(&block_lock, "block");
     lock_init(&atomic_l_lock, "run_at_boot");
-    printk("iSH-AOK %s booted on %d emulated %s CPU(s)\n",uts.release, ncpu, uts.arch);
+    printk("iSH-AOK %s built %s %s booted on %d emulated x86 CPU(s)\n",
+            uts.release, __DATE__, __TIME__, ncpu);
     // Get boot time
     extern time_t boot_time;
          
     boot_time = time(NULL);
     //printk("Seconds since January 1, 1970 = %ld\n", boot_time);
+}
+
+void task_poke_shared_mem(struct task *task, struct mem *mem) {
+    if (task == NULL || mem == NULL)
+        return;
+
+    if (trylock(&pids_lock) != 0)
+        return;
+    struct pid *pid_entry;
+    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
+        struct task *other = pid_entry->task;
+        if (other == NULL || other == task)
+            continue;
+        if (other->mem != mem)
+            continue;
+        if (other->zombie || other->exiting)
+            continue;
+        pthread_kill(other->thread, SIGUSR1);
+        if (other->cpu.poked_ptr == NULL)
+            continue;
+        cpu_poke(&other->cpu);
+    }
+    unlock(&pids_lock);
+}
+
+static void task_wait_for_mem_quiesce(struct task *task) {
+    struct mem *mem = task != NULL ? task->mem : NULL;
+    while (mem != NULL &&
+           atomic_load_explicit(&mem->quiesce_requested, memory_order_acquire) > 0) {
+        nanosleep(&lock_pause, NULL);
+    }
 }
 
 void task_run_current(void) {
@@ -304,11 +410,25 @@ void task_run_current(void) {
     tlb_refresh(&tlb, &save->mem->mmu);
     
     while (true) {
+        task_wait_for_mem_quiesce(save);
         read_lock(&save->mem->lock);
 
+        qword_t amd64_rip_before = cpu->amd64_rip;
         int interrupt = cpu_run_to_interrupt(cpu, &tlb);
+        if (save->abi == GUEST_ABI_AMD64 && strcmp(save->comm, "apk") == 0 &&
+                (amd64_rip_before == 0 || cpu->amd64_rip == 0)) {
+            printk("[amd64-jit] task loop apk int=%d rip=%#llx->%#llx eip=%#x rsp=%#llx rax=%#llx rcx=%#llx\n",
+                   interrupt,
+                   (unsigned long long) amd64_rip_before,
+                   (unsigned long long) cpu->amd64_rip,
+                   cpu->eip,
+                   (unsigned long long) cpu->amd64_regs[amd64_rsp],
+                   (unsigned long long) cpu->amd64_regs[amd64_rax],
+                   (unsigned long long) cpu->amd64_regs[amd64_rcx]);
+        }
 
         read_unlock(&save->mem->lock);
+        jit_cleanup_jetsam_after_interrupt(cpu);
  
         //struct timespec while_pause = {0 /*secs*/, WAIT_SLEEP /*nanosecs*/};
         if(save->parent != NULL) {
@@ -322,7 +442,11 @@ void task_run_current(void) {
 }
 
 static void *task_thread(void *task) {
-    
+    sigset_t sigusr1;
+    sigemptyset(&sigusr1);
+    sigaddset(&sigusr1, SIGUSR1);
+    pthread_sigmask(SIG_UNBLOCK, &sigusr1, NULL);
+
     current = task;
     
     update_thread_name();
@@ -374,21 +498,35 @@ void update_thread_name(void) {
 #endif
 }
 
-inline void modify_locks_held_count(struct task *task, int value) { // value Should only be -1 or 1.  -mke
+inline void modify_locks_held_count(struct task *task, int value) { // value should only be -1 or 1.
     if ((task == NULL) && (current != NULL)) {
         task = current;
     } else if (task == NULL) {
         return;
     }
-    
-    pthread_mutex_lock(&task->locks_held.lock);
-    if((task->locks_held.count + value < 0) && task->pid > 9) {
-        pthread_mutex_unlock(&task->locks_held.lock); // release before printk to avoid self-deadlock
-        printk("ERROR: Attempt to decrement locks_held count below zero, ignoring\n");
+
+    if (value != 1 && value != -1) {
+        printk("ERROR: invalid locks_held delta %d for %s:%d\n",
+               value, task->comm, task->pid);
         return;
     }
-    task->locks_held.count = task->locks_held.count + value;
-    pthread_mutex_unlock(&task->locks_held.lock);
+
+    int old_count;
+    int new_count;
+    do {
+        old_count = __atomic_load_n(&task->locks_held.count, __ATOMIC_RELAXED);
+        new_count = old_count + value;
+        if (new_count < 0 && task->pid > 9) {
+            printk("ERROR: Attempt to decrement locks_held count below zero, ignoring\n");
+            return;
+        }
+    } while (!__atomic_compare_exchange_n(&task->locks_held.count, &old_count, new_count,
+                                          true, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    if (new_count < 0) {
+        __atomic_store_n(&task->locks_held.count, 0, __ATOMIC_RELAXED);
+        printk("ERROR: Attempt to decrement locks_held count below zero, ignoring\n");
+    }
 }
 
 bool current_is_valid(void) {

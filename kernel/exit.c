@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <string.h>
+#include "emu/cpu.h"
 #include "kernel/calls.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
@@ -8,6 +9,7 @@
 #include "kernel/task.h"
 #include "util/sync.h"
 #include "fs/fd.h"
+#include "fs/devices.h"
 #include "fs/tty.h"
 
 extern bool doEnableExtraLocking;
@@ -15,16 +17,33 @@ extern pthread_mutex_t extra_lock;
 extern dword_t extra_lock_pid;
 extern const char extra_lock_comm;
 
-static void halt_system(void);
+static void halt_system_locked(void);
 
 static bool trace_session_exit_task(struct task *task) {
-    return strcmp(task->comm, "login") == 0 ||
-        strcmp(task->comm, "sshd") == 0 ||
-        strcmp(task->comm, "sh") == 0 ||
-        strcmp(task->comm, "bash") == 0 ||
-        strcmp(task->comm, "dash") == 0 ||
-        strcmp(task->comm, "getty") == 0 ||
-        strcmp(task->comm, "agetty") == 0;
+    return false;
+}
+
+static void amd64_decode_wait_status_exit(int status, char *buf, size_t size) {
+    if (size == 0)
+        return;
+    if ((status & 0xff) == 0x7f) {
+        snprintf(buf, size, "stopped sig=%d status=%#x", (status >> 8) & 0xff, status);
+        return;
+    }
+    if ((status & 0x7f) == 0) {
+        snprintf(buf, size, "exited code=%d status=%#x", (status >> 8) & 0xff, status);
+        return;
+    }
+    snprintf(buf, size, "signaled sig=%d core=%d status=%#x",
+             status & 0x7f, (status & 0x80) != 0, status);
+}
+
+static bool amd64_trace_task_or_parent_lineage(struct task *task) {
+    if (task == NULL)
+        return false;
+    if (amd64_trace_is_lineage_tgid(task->tgid))
+        return true;
+    return task->parent != NULL && amd64_trace_is_lineage_tgid(task->parent->tgid);
 }
 
 // Removes a task from its thread group. The caller is responsible for ensuring
@@ -108,34 +127,38 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
 // has a child shell running tears down the remote login immediately.
 static void exit_hangup_session_tty(struct task *leader) {
     struct tgroup *group = leader->group;
-    if (group->tty == NULL || group->sid != leader->pid)
+    lock(&group->lock, 0);
+    struct tty *tty = group->tty;
+    pid_t_ sid = group->sid;
+    unlock(&group->lock);
+    if (tty == NULL || sid != leader->pid)
         return;
 
-    struct pid *sid_pid = pid_get(group->sid);
+    struct pid *sid_pid = pid_get(sid);
     if (sid_pid == NULL)
         return;
     if (session_has_other_live_groups(sid_pid, group))
         return;
 
-    struct tty *tty = group->tty;
+    int tty_release_count = 0;
+    struct tgroup *session_group;
+    list_for_each_entry(&sid_pid->session, session_group, session) {
+        lock(&session_group->lock, 0);
+        if (session_group->tty == tty) {
+            session_group->tty = NULL;
+            tty_release_count++;
+        }
+        unlock(&session_group->lock);
+    }
+
     lock(&ttys_lock, 0);
     lock(&tty->lock, 0);
     tty->session = 0;
     tty->fg_group = 0;
     tty_hangup(tty);
     unlock(&tty->lock);
-
-    struct tgroup *session_group;
-    list_for_each_entry(&sid_pid->session, session_group, session) {
-        lock(&session_group->lock, 0);
-        if (session_group->tty == tty) {
-            session_group->tty = NULL;
-            unlock(&session_group->lock);
-            tty_release(tty);
-        } else {
-            unlock(&session_group->lock);
-        }
-    }
+    while (tty_release_count-- > 0)
+        tty_release(tty);
     unlock(&ttys_lock);
 }
 
@@ -147,6 +170,17 @@ noreturn void do_exit(struct task *task, int status) {
         goto EXIT;
     } else {
         task->exiting = true;
+    }
+
+    if (task == current && task->ptrace.traced &&
+            (task->ptrace.options & PTRACE_O_TRACEEXIT_)) {
+        struct siginfo_ info = {
+            .sig = SIGTRAP_,
+            .code = SI_USER_,
+            .kill.pid = task->pid,
+            .kill.uid = task->uid,
+        };
+        ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXIT_, (qword_t) (dword_t) status);
     }
 
     if (trace_session_exit_task(task)) {
@@ -161,7 +195,7 @@ noreturn void do_exit(struct task *task, int status) {
     while (exit_wait_needed(task)) { // Wait for other references and locks, but ignore extra pending signals while exiting.
         nanosleep(&lock_pause, NULL);
     }
-    addr_t clear_tid = task->clear_tid;
+    guest_addr_t clear_tid = task->clear_tid;
     if (clear_tid) {
         pid_t_ zero = 0;
         if (user_put(clear_tid, zero) == 0)
@@ -169,12 +203,17 @@ noreturn void do_exit(struct task *task, int status) {
     }
 
     // release all our resources
+    // mm_release can walk fd/inode teardown and therefore take inodes_lock.
+    // Do not hold pids_lock across it, because procfs open/stat takes
+    // inodes_lock before pids_lock and that lock ordering otherwise deadlocks.
     do {
         nanosleep(&lock_pause, NULL);
         nanosleep(&lock_pause, NULL);
     } while (exit_wait_needed(task)); // Wait for now, task is in one or more critical
     mm_release(task->mm);
     task->mm = NULL;
+    task->mem = NULL;
+    task->cpu.mmu = NULL;
     
     while (exit_wait_needed(task)) { // Wait for now, task is in one or more critical sections, and/or has locks.
         nanosleep(&lock_pause, NULL);
@@ -193,15 +232,12 @@ noreturn void do_exit(struct task *task, int status) {
     while (exit_wait_needed(task)) { // Wait for now, task is in one or more critical sections, and/or has locks.
         nanosleep(&lock_pause, NULL);
     }
-    // save things that our parent might be interested in
-    task->exit_code = status; // FIXME locking
     struct rusage_ rusage = rusage_get_current();
     lock(&task->group->lock, 0);
     rusage_add(&task->group->rusage, &rusage);
     struct rusage_ group_rusage = task->group->rusage;
     unlock(&task->group->lock);
 
-    // the actual freeing needs pids_lock
     // release the sighand
     while (exit_wait_needed(task)) { // We added one to the task reference count above, thus the check is 2, in case any other thread is accessing.
         nanosleep(&lock_pause, NULL);
@@ -210,19 +246,24 @@ noreturn void do_exit(struct task *task, int status) {
     struct task *signal_parent = NULL;
     struct siginfo_ signal_info = {};
     int signal_no = 0;
+    struct sighand *old_sighand = NULL;
+    bool destroy_unlinked_task = false;
 
-    // Only hold pids_lock for the process-tree and thread-group teardown below.
-    // Holding it across mm/files/fs release and the wait loops above wedges task
-    // creation and other global process operations behind a slow exit path.
     complex_lockt(&pids_lock, 0);
 
-    sighand_release(task->sighand);
-    task->sighand = NULL;
-    struct sigqueue *sigqueue, *sigqueue_tmp;
-    list_for_each_entry_safe(&task->queue, sigqueue, sigqueue_tmp, queue) {
-        list_remove(&sigqueue->queue);
-        free(sigqueue);
+    // save things that our parent might be interested in
+    task->exit_code = status;
+    if (amd64_trace_task_or_parent_lineage(task)) {
+        char decoded[64];
+        amd64_decode_wait_status_exit(status, decoded, sizeof(decoded));
+        printk("tracked exit: pid=%d tgid=%d abi=%d comm=%s parent=%d parent_tgid=%d did_exec=%d %s\n",
+               task->pid, task->tgid, task->abi, task->comm,
+               task->parent != NULL ? task->parent->pid : -1,
+               task->parent != NULL ? task->parent->tgid : -1,
+               task->did_exec, decoded);
     }
+    old_sighand = task->sighand;
+    task->sighand = NULL;
     
     struct task *leader = task->group->leader;
 
@@ -244,12 +285,11 @@ noreturn void do_exit(struct task *task, int status) {
         struct task *parent = leader->parent;
         if (parent == NULL) {
             // init died
-            halt_system();
+            halt_system_locked();
         } else {
             task_ref_cnt_mod(parent, 1);
             signal_parent = parent;
             signal_no = leader->exit_signal;
-            lock(&parent->general_lock, 0);
             leader->zombie = true;
             notify(&parent->group->child_exit);
             signal_info = (struct siginfo_) {
@@ -260,7 +300,6 @@ noreturn void do_exit(struct task *task, int status) {
                 .child.utime = clock_from_timeval(group_rusage.utime),
                 .child.stime = clock_from_timeval(group_rusage.stime),
             };
-            unlock(&parent->general_lock);
         }
 
         if (exit_hook != NULL)
@@ -268,20 +307,33 @@ noreturn void do_exit(struct task *task, int status) {
     }
 
     vfork_notify(task);
+
+    unlock(&task->general_lock);
     
     if(task != leader) {
-        task_destroy(task, 1);
-    } else {
-        unlock(&task->general_lock);
+        task_unlink_locked(task);
+        destroy_unlinked_task = true;
     }
     
     unlock(&pids_lock);
+
+    if (old_sighand != NULL)
+        sighand_release(old_sighand);
+
+    struct sigqueue *sigqueue, *sigqueue_tmp;
+    list_for_each_entry_safe(&task->queue, sigqueue, sigqueue_tmp, queue) {
+        list_remove(&sigqueue->queue);
+        free(sigqueue);
+    }
 
     if (signal_parent != NULL) {
         if (signal_no != 0)
             send_signal(signal_parent, signal_no, signal_info);
         task_ref_cnt_mod(signal_parent, -1);
     }
+
+    if (destroy_unlinked_task)
+        task_destroy_unlinked(task, 1);
     
 EXIT:pthread_exit(NULL);
 }
@@ -290,36 +342,88 @@ EXIT:pthread_exit(NULL);
 // the current task itself.
 noreturn void do_exit_group(int status) {
     struct tgroup *group = current->group;
-    complex_lockt(&pids_lock, 0);
-    lock(&group->lock, 0);
-    if (!group->doing_group_exit) {
-        group->doing_group_exit = true;
-        group->group_exit_code = status;
-    } else {
-        status = group->group_exit_code;
-    }
-
-    // kill everyone else in the group
     struct task *task;
-    int tmpvar = locks_held_count(current);
-    
-    if(tmpvar > 10000) { // If this happens, something has gone wrong  -mke
-        tmpvar *= -1; // Convert to negative integer.  -mke
-        modify_locks_held_count(current, tmpvar); // Reset to zero -mke
-    }
-    
-    task_ref_cnt_mod(current, 1);
-    list_for_each_entry(&group->threads, task, group_links) {
-        if (task != current) {
-            deliver_signal(task, SIGKILL_, SIGINFO_NIL);
-            task->group->stopped = false;
-            notify(&task->group->stopped_cond);
+    struct group_exit_target {
+        struct task *task;
+        struct sighand *sighand;
+    };
+    struct group_exit_target stack_targets[32];
+    struct group_exit_target *targets = stack_targets;
+    size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
+    size_t target_count = 0;
+
+    while (true) {
+        complex_lockt(&pids_lock, 0);
+        lock(&group->lock, 0);
+
+        if (amd64_trace_is_lineage_tgid(current->tgid)) {
+            printk("tracked exit_group begin: current=%d tgid=%d abi=%d status=%#x threads=%lu doing=%d\n",
+                   current->pid, current->tgid, current->abi, status,
+                   list_size(&group->threads), group->doing_group_exit);
         }
+        if (!group->doing_group_exit) {
+            group->doing_group_exit = true;
+            group->group_exit_code = status;
+        } else {
+            status = group->group_exit_code;
+        }
+
+        size_t needed = 0;
+        list_for_each_entry(&group->threads, task, group_links) {
+            if (task != current)
+                needed++;
+        }
+        if (needed > target_cap) {
+            unlock(&group->lock);
+            unlock(&pids_lock);
+
+            if (targets != stack_targets)
+                free(targets);
+            targets = malloc(sizeof(*targets) * needed);
+            if (targets == NULL)
+                die("out of memory collecting exit-group targets");
+            target_cap = needed;
+            continue;
+        }
+
+        target_count = 0;
+        task_ref_cnt_mod(current, 1);
+        list_for_each_entry(&group->threads, task, group_links) {
+            if (amd64_trace_is_lineage_tgid(current->tgid)) {
+                printk("tracked exit_group member: current=%d target=%d tgid=%d exiting=%d zombie=%d io_block=%d pending=%#llx blocked=%#llx self=%d\n",
+                       current->pid, task->pid, task->tgid, task->exiting, task->zombie,
+                       task->io_block,
+                       (unsigned long long) task->pending,
+                       (unsigned long long) task->blocked,
+                       task == current);
+            }
+            if (task == current)
+                continue;
+            task_ref_cnt_mod(task, 1);
+            targets[target_count].task = task;
+            targets[target_count].sighand = task->sighand;
+            if (targets[target_count].sighand != NULL)
+                sighand_retain(targets[target_count].sighand);
+            target_count++;
+        }
+        group->stopped = false;
+        unlock(&group->lock);
+        unlock(&pids_lock);
+        break;
     }
 
-    unlock(&pids_lock);
-    unlock(&group->lock);
-    if(current->pid <= MAX_PID) // abort if crazy.  -mke
+    notify(&group->stopped_cond);
+    for (size_t i = 0; i < target_count; i++) {
+        if (targets[i].sighand != NULL) {
+            deliver_signal_with_sighand(targets[i].task, targets[i].sighand, SIGKILL_, SIGINFO_NIL);
+            sighand_release(targets[i].sighand);
+        }
+        task_ref_cnt_mod(targets[i].task, -1);
+    }
+    if (targets != stack_targets)
+        free(targets);
+
+    if(current->pid <= MAX_PID)
         do_exit(current, status);
     
     task_ref_cnt_mod(current, -1);
@@ -328,7 +432,7 @@ noreturn void do_exit_group(int status) {
 }
 
 // always called from init process. Intended to be called when the init process exits.
-static void halt_system(void) {
+static void halt_system_locked(void) {
     // brutally murder everything
     // which will leave everything in an inconsistent state. I will solve this problem later.
     for (int i = 2; i < MAX_PID; i++) {
@@ -373,6 +477,14 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
         return false;
     lock(&task->group->lock, 0);
 
+    // A thread-group leader must remain until the rest of the group exits.
+    // Reaping it early leaves live threads pointing at freed group state and
+    // corrupts /proc consumers that still dereference task->group.
+    if (!list_empty(&task->group->threads)) {
+        unlock(&task->group->lock);
+        return false;
+    }
+
     dword_t exit_code = task->exit_code;
     if (task->group->doing_group_exit)
         exit_code = task->group->group_exit_code;
@@ -393,11 +505,14 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     if (options & WNOWAIT_)
         return true;
 
-    // tear down group
-    cond_destroy(&task->group->child_exit);
+    // Detach the group from global session/pgroup membership now so wait/reap
+    // semantics stay Linux-like, but defer freeing the group object itself
+    // until the task object is actually destroyed. Procfs and other refcounted
+    // task readers can still legitimately dereference task->group after this.
+    lock(&task->group->lock, 0);
     task_leave_session(task);
     list_remove(&task->group->pgroup);
-    free(task->group);
+    unlock(&task->group->lock);
 
     task_destroy(task, 2);
     return true;
@@ -407,11 +522,12 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
 static bool notify_if_stopped(struct task *task, struct siginfo_ *info_out) {
     complex_lockt(&task->group->lock, 0);
     bool stopped = task->group->stopped;
-    unlock(&task->group->lock);
-    if (!stopped || task->group->group_exit_code == 0)
-        return false;
     dword_t exit_code = task->group->group_exit_code;
-    task->group->group_exit_code = 0;
+    if (stopped && exit_code != 0)
+        task->group->group_exit_code = 0;
+    unlock(&task->group->lock);
+    if (!stopped || exit_code == 0)
+        return false;
     info_out->child.status = exit_code;
     return true;
 }
@@ -458,28 +574,33 @@ retry:
             bool no_children = true;
             struct task *parent;
             list_for_each_entry(&current->group->threads, parent, group_links) {
-            struct task *task;
-            list_for_each_entry(&current->children, task, siblings) {
-                if (!task_is_leader(task))
-                    continue;
-                if (idtype == P_PGID_ && task->group->pgid != id)
-                    continue;
-                no_children = false;
-                info->child.pid = task->pid;
-                if (reap_if_needed(task, info, rusage, options))
-                    goto found_something;
-            }
-            list_for_each_entry(&current->ptracees, task, ptrace_siblings) {
-                if (!task_is_leader(task))
-                    continue;
-                no_children = false;
-                info->child.pid = task->pid;
-                if (notify_if_ptrace_stopped(task, info)) {
-                    info->sig = SIGCHLD_;
-                    goto found_something;
+                struct task *task;
+                list_for_each_entry(&parent->children, task, siblings) {
+                    if (!task_is_leader(task))
+                        continue;
+                    if (idtype == P_PGID_) {
+                        lock(&task->group->lock, 0);
+                        bool pgid_match = task->group->pgid == id;
+                        unlock(&task->group->lock);
+                        if (!pgid_match)
+                            continue;
+                    }
+                    no_children = false;
+                    info->child.pid = task->pid;
+                    if (reap_if_needed(task, info, rusage, options))
+                        goto found_something;
+                }
+                list_for_each_entry(&parent->ptracees, task, ptrace_siblings) {
+                    if (!task_is_leader(task))
+                        continue;
+                    no_children = false;
+                    info->child.pid = task->pid;
+                    if (notify_if_ptrace_stopped(task, info)) {
+                        info->sig = SIGCHLD_;
+                        goto found_something;
+                    }
                 }
             }
-        }
         err = _ECHILD;
         if (no_children)
             goto error;
@@ -526,6 +647,13 @@ retry:
 
     info->sig = SIGCHLD_;
 found_something:
+    if (amd64_trace_is_lineage_tgid(current->tgid)) {
+        char decoded[64];
+        amd64_decode_wait_status_exit(info->child.status, decoded, sizeof(decoded));
+        printk("amd64 tracked reap: pid=%d tgid=%d abi=%d comm=%s child=%d %s options=%#x\n",
+               current->pid, current->tgid, current->abi, current->comm,
+               info->child.pid, decoded, options);
+    }
     unlock(&pids_lock);
     return 0;
 
@@ -535,20 +663,30 @@ error:
 }
 
 dword_t sys_waitid(int_t idtype, pid_t_ id, addr_t info_addr, int_t options) {
+    return sys_waitid_guest(idtype, id, info_addr, options);
+}
+
+dword_t sys_waitid_guest(int_t idtype, pid_t_ id, guest_addr_t info_addr, int_t options) {
     STRACE("waitid(%d, %d, %#x, %#x)", idtype, id, info_addr, options);
     struct siginfo_ info = {};
     int_t res = 0;
     TASK_MAY_BLOCK {
         res = do_wait(idtype, id, &info, NULL, options);
     }
+    if (res == _EINTR && signal_should_restart_syscall())
+        return _ERESTART;
     if (res < 0 || (res == 0 && info.child.pid == 0))
         return res;
-    if (info_addr != 0 && user_put(info_addr, info))
+    if (info_addr != 0 && siginfo_to_user(current, info_addr, &info))
         return _EFAULT;
     return 0;
 }
 
 dword_t sys_wait4(pid_t_ id, addr_t status_addr, dword_t options, addr_t rusage_addr) {
+    return sys_wait4_guest(id, status_addr, options, rusage_addr);
+}
+
+dword_t sys_wait4_guest(pid_t_ id, guest_addr_t status_addr, dword_t options, guest_addr_t rusage_addr) {
     STRACE("wait4(%d, %#x, %#x, %#x)", id, status_addr, options, rusage_addr);
     if (options & WNOWAIT_)
         return _EINVAL;
@@ -560,8 +698,11 @@ dword_t sys_wait4(pid_t_ id, addr_t status_addr, dword_t options, addr_t rusage_
         idtype = P_ALL_;
     else {
         idtype = P_PGID_;
-        if (id == 0)
+        if (id == 0) {
+            lock(&current->group->lock, 0);
             id = current->group->pgid;
+            unlock(&current->group->lock);
+        }
         else
             id = -id;
     }
@@ -572,11 +713,13 @@ dword_t sys_wait4(pid_t_ id, addr_t status_addr, dword_t options, addr_t rusage_
     TASK_MAY_BLOCK {
         res = do_wait(idtype, id, &info, &rusage, options | WEXITED_);
     }
+    if (res == _EINTR && signal_should_restart_syscall())
+        return _ERESTART;
     if (res < 0 || (res == 0 && info.child.pid == 0))
         return res;
     if (status_addr != 0 && user_put(status_addr, info.child.status))
         return _EFAULT;
-    if (rusage_addr != 0 && user_put(rusage_addr, rusage))
+    if (rusage_addr != 0 && write_guest_rusage_abi(current->abi, rusage_addr, &rusage))
         return _EFAULT;
     return info.child.pid;
 }

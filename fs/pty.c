@@ -114,11 +114,12 @@ DEFINE_TTY_DRIVER(pty_slave, &pty_slave_ops, TTY_PSEUDO_SLAVE_MAJOR, MAX_PTYS);
 static int pty_reserve_next() {
     int pty_num;
     lock(&ttys_lock, 0);
-    for (pty_num = 0; pty_num < MAX_PTYS; pty_num++) {
+    for (pty_num = 1; pty_num < MAX_PTYS; pty_num++) {
         if (pty_slave.ttys[pty_num] == NULL)
             break;
     }
-    pty_slave.ttys[pty_num] = (void *) 1; // anything non-null to reserve it
+    if (pty_num < MAX_PTYS)
+        pty_slave.ttys[pty_num] = (void *) 1; // anything non-null to reserve it
     unlock(&ttys_lock);
     return pty_num;
 }
@@ -202,7 +203,7 @@ static int devpts_getpath(struct fd *fd, char *buf) {
     if (fd->devpts.num == -1)
         memcpy(buf, "", 1);
     else
-        sprintf(buf, "/%d", fd->devpts.num);
+        snprintf(buf, MAX_PATH, "/%d", fd->devpts.num);
     return 0;
 }
 
@@ -222,6 +223,9 @@ static void devpts_stat_num(int pty_num, struct statbuf *stat) {
         stat->gid = tty->pty.gid;
         stat->inode = pty_num + 3;
         stat->rdev = dev_make(TTY_PSEUDO_SLAVE_MAJOR, pty_num);
+        stat->atime = tty->atime;
+        stat->mtime = tty->mtime;
+        stat->ctime = tty->ctime;
 
         unlock(&tty->lock);
         unlock(&ttys_lock);
@@ -291,8 +295,9 @@ static int devpts_readdir(struct fd *fd, struct dir_entry *entry) {
     if (pty_num >= MAX_PTYS)
         return 0;
     fd->offset = pty_num + 1;
-    sprintf(entry->name, "%d", pty_num);
+    snprintf(entry->name, sizeof(entry->name), "%d", pty_num);
     entry->inode = pty_num + 3;
+    entry->type = DT_CHR;
    // if (minor == DEV_PTMX_MINOR) 
        //ptmx_open(fd);
     return 1;

@@ -11,6 +11,7 @@
 #include "platform/platform.h"
 #include <sys/param.h> // for MIN and MAX
 #include "emu/cpuid.h"
+#include "kernel/abi.h"
 #include "kernel/init.h"
 #include "kernel/hostinfo.h"
 
@@ -26,22 +27,74 @@ static int proc_show_version(struct proc_entry *UNUSED(entry), struct proc_data 
     return 0;
 }
 
-void parse_edx_flags(dword_t edx, char *edx_flags) { /* Translate edx bit flags into text */
-    static const char *enumerated[] = {
-        "fpu ", "vme ", "de ", "pse ", "tsc ", "msr ", "pae ", "mce ", "cx8 ", "apic ", "Reserved ",
-        "sep ", "mtrr ", "pge ", "mca ", "cmov ", "", "pse-36 ", "psn ", "clfsh ", "Reserved ",
-        "ds ", "acpi ", "mmx ", "fxsr ", "sse ", "sse2 ", "ss ", "htt ", "tm ", "Reserved ", "pbe "
-    };
+static size_t append_flag(char *buf, size_t size, size_t offset, const char *flag) {
+    size_t len = strlen(flag);
+    if (offset + len + 1 >= size)
+        return offset;
+    memcpy(buf + offset, flag, len);
+    offset += len;
+    buf[offset++] = ' ';
+    buf[offset] = '\0';
+    return offset;
+}
 
-    size_t offset = 0;
+static void append_cpuid_leaf_flags(char *buf, size_t size, dword_t bits,
+                                    const char *const names[32]) {
+    size_t offset = strlen(buf);
     for (size_t i = 0; i < 32; i++) {
-        if (edx & (1 << i)) {
-            const size_t enum_len = strlen(enumerated[i]);
-            memcpy(edx_flags + offset, enumerated[i], enum_len);
-            offset += enum_len;
-        }
+        if (!(bits & (1u << i)) || names[i] == NULL || names[i][0] == '\0')
+            continue;
+        offset = append_flag(buf, size, offset, names[i]);
     }
-    edx_flags[offset] = '\0';
+}
+
+static void append_cpuid_flags(char *buf, size_t size, dword_t ecx, dword_t edx,
+                               const char *const ecx_names[32],
+                               const char *const edx_names[32]) {
+    append_cpuid_leaf_flags(buf, size, edx, edx_names);
+    append_cpuid_leaf_flags(buf, size, ecx, ecx_names);
+}
+
+static void format_cpuid_flags(char *buf, size_t size) {
+    static const char *const leaf1_edx_names[32] = {
+        "fpu", "vme", "de", "pse", "tsc", "msr", "pae", "mce",
+        "cx8", "apic", NULL, "sep", "mtrr", "pge", "mca", "cmov",
+        NULL, "pse36", "pn", "clflush", NULL, "dts", "acpi", "mmx",
+        "fxsr", "sse", "sse2", "ss", "ht", "tm", NULL, "pbe",
+    };
+    static const char *const leaf1_ecx_names[32] = {
+        "pni", "pclmulqdq", "dtes64", "monitor", "ds_cpl", "vmx", "smx",
+        "est", "tm2", "ssse3", "cid", "sdbg", "fma", "cx16", "xtpr",
+        "pdcm", NULL, "pcid", "dca", "sse4_1", "sse4_2", "x2apic",
+        "movbe", "popcnt", "tsc_deadline_timer", "aes", "xsave", "osxsave",
+        "avx", "f16c", "rdrand", "hypervisor",
+    };
+    static const char *const ext_edx_names[32] = {
+        "fpu", "vme", "de", "pse", "tsc", "msr", "pae", "mce",
+        "cx8", "apic", NULL, "syscall", "mtrr", "pge", "mca", "cmov",
+        "pat", "pse36", NULL, NULL, "nx", NULL, "mmxext", "mmx",
+        "fxsr", "fxsr_opt", "pdpe1gb", "rdtscp", NULL, "lm", "3dnowext", "3dnow",
+    };
+    static const char *const ext_ecx_names[32] = {
+        "lahf_lm", "cmp_legacy", "svm", "extapic", "cr8_legacy", "abm",
+        "sse4a", "misalignsse", "3dnowprefetch", "osvw", "ibs", "xop",
+        "skinit", "wdt", NULL, "lwp", "fma4", "tce", NULL, "nodeid_msr",
+        NULL, "tbm", "topoext", "perfctr_core", "perfctr_nb", NULL,
+        "bpext", "ptsc", "perfctr_llc", "mwaitx", NULL, NULL,
+    };
+    dword_t eax = 1, ebx = 0, ecx = 0, edx = 0;
+
+    buf[0] = '\0';
+    do_cpuid(&eax, &ebx, &ecx, &edx);
+    append_cpuid_flags(buf, size, ecx, edx, leaf1_ecx_names, leaf1_edx_names);
+
+    eax = 0x80000000u;
+    do_cpuid(&eax, &ebx, &ecx, &edx);
+    if (eax >= 0x80000001u) {
+        eax = 0x80000001u;
+        do_cpuid(&eax, &ebx, &ecx, &edx);
+        append_cpuid_flags(buf, size, ecx, edx, ext_ecx_names, ext_edx_names);
+    }
 }
 
 static void unpack32(dword_t src, void *dst) {
@@ -58,6 +111,8 @@ void translate_vendor_id(char *buf, dword_t *ebx, dword_t *ecx, dword_t *edx) {
 }
 
 static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    enum guest_abi abi = current != NULL ? current->abi : GUEST_ABI_I386;
+    struct guest_abi_desc abi_desc = guest_abi_desc(abi);
     dword_t eax = 0;
     dword_t ebx;
     dword_t ecx;
@@ -67,48 +122,54 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
 
     char vendor_id[13] = { 0 };
     translate_vendor_id(vendor_id, &ebx, &ecx, &edx);
+    dword_t cpuid_level = eax;
 
     eax = 1;
     do_cpuid(&eax, &ebx, &ecx, &edx);
 
-    char edx_flags[148] = { 0 };
-    parse_edx_flags(edx, edx_flags);
+    char cpu_flags[512] = { 0 };
+    format_cpuid_flags(cpu_flags, sizeof(cpu_flags));
     char *host_architecture = copyHostArchitecture();
     char *host_machine_identifier = copyHostMachineIdentifier();
     char *host_device_name = copyHostDeviceName();
     char *host_core_topology = copyHostCoreTopology();
 
     int cpu_count = get_cpu_count(); // One entry per device processor
+    int clflush_size = ((ebx >> 8) & 0xff) * 8;
+    if (clflush_size == 0)
+        clflush_size = 64;
     int i;
 
     for( i=0; i<cpu_count ; i++ ) {
         proc_printf(buf, "processor       : %d\n",i);
         proc_printf(buf, "vendor_id       : %s\n", vendor_id);
-        proc_printf(buf, "cpu family      : %d\n",1);
-        proc_printf(buf, "model           : %d\n",1);
-        proc_printf(buf, "model name      : iSH Virtual i686-compatible CPU @ 1.066GHz\n");
+        proc_printf(buf, "cpu family      : %d\n", guest_abi_is_64bit(abi) ? 6 : 1);
+        proc_printf(buf, "model           : %d\n", guest_abi_is_64bit(abi) ? 85 : 1);
+        proc_printf(buf, "model name      : iSH Virtual %s-compatible CPU @ 1.066GHz\n",
+                    abi_desc.uname_machine);
         proc_printf(buf, "stepping        : %d\n",1);
         proc_printf(buf, "CPU MHz         : 1066.00\n");
         proc_printf(buf, "cache size      : %d kb\n",0);
-        proc_printf(buf, "pysical id      : %d\n",0);
-        proc_printf(buf, "siblings        : %d\n",0);
-        proc_printf(buf, "core id         : %d\n",0);
+        proc_printf(buf, "physical id     : %d\n",0);
+        proc_printf(buf, "siblings        : %d\n",cpu_count);
+        proc_printf(buf, "core id         : %d\n",i);
         proc_printf(buf, "cpu cores       : %d\n",cpu_count);
-        proc_printf(buf, "apicid          : %d\n",0);
-        proc_printf(buf, "initial apicid  : %d\n",0);
+        proc_printf(buf, "apicid          : %d\n",i);
+        proc_printf(buf, "initial apicid  : %d\n",i);
         proc_printf(buf, "fpu             : yes\n");
         proc_printf(buf, "fpu_exception   : yes\n");
-        proc_printf(buf, "cpuid level     : %d\n",13);
+        proc_printf(buf, "cpuid level     : %u\n", cpuid_level);
         proc_printf(buf, "wp              : yes\n");
-        proc_printf(buf, "flags           : %s\n", edx_flags); // Pulled from do_cpuid
+        proc_printf(buf, "flags           : %s\n", cpu_flags);
         proc_printf(buf, "host arch       : %s\n", host_architecture);
         proc_printf(buf, "host machine    : %s\n", host_machine_identifier);
         proc_printf(buf, "host device     : %s\n", host_device_name);
         proc_printf(buf, "host cores      : %s\n", host_core_topology);
         proc_printf(buf, "bogomips        : 1066.00\n");
-        proc_printf(buf, "clflush size    : %d\n", ebx);
+        proc_printf(buf, "clflush size    : %d\n", clflush_size);
         proc_printf(buf, "cache_alignment : %d\n",64);
-        proc_printf(buf, "address sizes   : 36 bits physical, 32 bits virtual\n");
+        proc_printf(buf, "address sizes   : 36 bits physical, %d bits virtual\n",
+                    guest_abi_is_64bit(abi) ? 48 : 32);
         proc_printf(buf, "power management:\n");
         proc_printf(buf, "\n");
     }
@@ -291,7 +352,7 @@ static int proc_show_loadavg(struct proc_entry *UNUSED(entry), struct proc_data 
 }
 
 static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
-    sprintf(buf, "%d/", current->pid);
+    snprintf(buf, MAX_PATH, "%d/", current->pid);
     return 0;
 }
 
@@ -433,36 +494,33 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
         entry->child_names = NULL;
     }
 
-    unsigned count = 0;
+    unsigned cap = 0;
+    unsigned used = 0;
+    pid_t_ *pids = NULL;
     complex_lockt(&pids_lock, 0);
     struct pid *pid_entry;
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
         struct task *task = pid_entry->task;
-        if (task != NULL && !task->zombie)
-            count++;
-    }
-    unlock(&pids_lock);
-
-    char **names = calloc(count + 1, sizeof(*names));
-    if (names == NULL)
-        return;
-    pid_t_ *pids = count ? malloc(sizeof(*pids) * count) : NULL;
-    if (count != 0 && pids == NULL) {
-        free(names);
-        return;
-    }
-
-    unsigned used = 0;
-    complex_lockt(&pids_lock, 0);
-    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
         if (task == NULL || task->zombie)
             continue;
-        if (used >= count)
-            break;
+        if (used == cap) {
+            unsigned new_cap = cap ? cap * 2 : 64;
+            pid_t_ *new_pids = realloc(pids, sizeof(*new_pids) * new_cap);
+            if (new_pids == NULL) {
+                unlock(&pids_lock);
+                free(pids);
+                return;
+            }
+            pids = new_pids;
+            cap = new_cap;
+        }
         pids[used++] = pid_entry->id;
     }
     unlock(&pids_lock);
+
+    char **names = calloc(used + 1, sizeof(*names));
+    if (names == NULL)
+        return;
 
     qsort(pids, used, sizeof(*pids), proc_root_pid_compare);
     for (unsigned i = 0; i < used; i++) {
@@ -500,6 +558,16 @@ static bool proc_root_readdir(struct proc_entry *entry, unsigned long *index, st
 }
 
 struct proc_dir_entry proc_root = {NULL, S_IFDIR, .readdir = proc_root_readdir};
+
+void proc_root_init(void) {
+    proc_set_entries_parent(proc_root_entries, PROC_ROOT_LEN, &proc_root);
+    proc_pid.parent = &proc_root;
+
+    proc_ish_init(proc_find_entry(proc_root_entries, PROC_ROOT_LEN, "ish"));
+    proc_net_init(proc_find_entry(proc_root_entries, PROC_ROOT_LEN, "net"));
+    proc_sys_init(proc_find_entry(proc_root_entries, PROC_ROOT_LEN, "sys"));
+    proc_pid_init();
+}
 
 enum sysfs_node_kind {
     sysfs_root,
@@ -800,7 +868,7 @@ static int sysfs_getpath(struct fd *fd, char *buf) {
             strcpy(buf, "/devices/system/cpu/offline");
             break;
         case sysfs_cpu_dir:
-            sprintf(buf, "/devices/system/cpu/cpu%d", node.cpu);
+            snprintf(buf, MAX_PATH, "/devices/system/cpu/cpu%d", node.cpu);
             break;
     }
     return 0;
@@ -906,6 +974,7 @@ static int sysfs_readdir(struct fd *fd, struct dir_entry *entry) {
 
     sysfs_node_name(child, entry->name, sizeof(entry->name));
     entry->inode = sysfs_node_inode(child);
+    entry->type = dir_entry_type_for_mode(sysfs_node_mode(child));
     return 1;
 }
 

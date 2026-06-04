@@ -9,6 +9,7 @@
 #include "kernel/task.h"
 #include "kernel/vdso.h"
 #include "emu/interrupt.h"
+#include "emu/memory.h"
 #include "util/sync.h"
 
 #if is_gcc(9)
@@ -18,24 +19,237 @@
 int xsave_extra = 0;
 int fxsave_extra = 0;
 static void sigmask_set(sigset_t_ set);
-static void altstack_to_user(struct task *task, struct stack_t_ *user_stack);
-static bool is_on_altstack(dword_t sp, struct task *task);
+static bool is_on_altstack(guest_addr_t sp, struct task *task);
+static void restore_altstack(guest_addr_t sp, guest_addr_t stack, guest_addr_t size, dword_t flags);
+static dword_t current_altstack_flags(struct task *task);
+static void altstack_to_i386_user(struct task *task, struct stack_t_ *user_stack);
 static void signalfd_wakeup_task(struct task *task, int sig);
 static struct fd_ops signalfd_ops;
+static void send_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info);
 
-static void wake_waiting_task(struct task *task) {
-    if (pthread_mutex_trylock(&task->waiting_cond_lock.m) != 0)
-        return;
+static bool should_trace_signal_task(struct task *task) {
+    return false;
+}
+
+struct sigaction_i386_marshaled {
+    addr_t handler;
+    dword_t flags;
+    addr_t restorer;
+    sigset_t_ mask;
+} __attribute__((packed));
+
+struct sigaction_amd64_marshaled {
+    qword_t handler;
+    qword_t flags;
+    qword_t restorer;
+    sigset_t_ mask;
+} __attribute__((packed));
+
+struct amd64_siginfo_ {
+    int_t sig;
+    int_t sig_errno;
+    int_t code;
+    int_t __pad0;
+    union {
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+        } kill;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            union sigval_ value;
+        } rt;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            int_t status;
+            int_t __pad0;
+            qword_t utime;
+            qword_t stime;
+        } child;
+        struct {
+            guest_addr_t addr;
+            word_t addr_lsb;
+            byte_t __pad0[6];
+            guest_addr_t lower;
+            guest_addr_t upper;
+        } fault;
+        struct {
+            int_t timer;
+            int_t overrun;
+            union sigval_ value;
+            int_t _private;
+            int_t __pad0;
+        } timer;
+        struct {
+            guest_addr_t call_addr;
+            int_t syscall;
+            dword_t arch;
+        } sigsys;
+        byte_t __pad[112];
+    };
+} __attribute__((packed));
+
+static_assert(sizeof(struct amd64_siginfo_) == 128, "amd64 siginfo layout mismatch");
+
+enum amd64_greg_index {
+    AMD64_GREG_R8 = 0,
+    AMD64_GREG_R9,
+    AMD64_GREG_R10,
+    AMD64_GREG_R11,
+    AMD64_GREG_R12,
+    AMD64_GREG_R13,
+    AMD64_GREG_R14,
+    AMD64_GREG_R15,
+    AMD64_GREG_RDI,
+    AMD64_GREG_RSI,
+    AMD64_GREG_RBP,
+    AMD64_GREG_RBX,
+    AMD64_GREG_RDX,
+    AMD64_GREG_RAX,
+    AMD64_GREG_RCX,
+    AMD64_GREG_RSP,
+    AMD64_GREG_RIP,
+    AMD64_GREG_EFL,
+    AMD64_GREG_CSGSFS,
+    AMD64_GREG_ERR,
+    AMD64_GREG_TRAPNO,
+    AMD64_GREG_OLDMASK,
+    AMD64_GREG_CR2,
+    AMD64_GREG_COUNT,
+};
+
+enum {
+    AMD64_USER_CS = 0x33,
+    AMD64_UC_FP_XSTATE = 0x1,
+    AMD64_UC_SIGCONTEXT_SS = 0x2,
+    AMD64_UC_STRICT_RESTORE_SS = 0x4,
+};
+
+struct amd64_stack_t_marshaled {
+    qword_t stack;
+    dword_t flags;
+    dword_t pad;
+    qword_t size;
+};
+
+struct amd64_fpxreg_ {
+    word_t significand[4];
+    word_t exponent;
+    word_t padding[3];
+};
+
+struct amd64_xmmreg_ {
+    uint32_t element[4];
+};
+
+struct amd64_fpstate_ {
+    word_t cwd;
+    word_t swd;
+    word_t twd;
+    word_t fop;
+    qword_t rip;
+    qword_t rdp;
+    dword_t mxcsr;
+    dword_t mxcr_mask;
+    struct amd64_fpxreg_ st[8];
+    struct amd64_xmmreg_ xmm[16];
+    dword_t reserved1[24];
+};
+
+static_assert(sizeof(struct amd64_fpstate_) == 512, "amd64 fpstate layout mismatch");
+
+struct amd64_mcontext_ {
+    qword_t gregs[AMD64_GREG_COUNT];
+    guest_addr_t fpstate;
+    qword_t reserved1[8];
+};
+
+struct amd64_ucontext_ {
+    qword_t flags;
+    guest_addr_t link;
+    struct amd64_stack_t_marshaled stack;
+    struct amd64_mcontext_ mcontext;
+    sigset_t_ sigmask;
+    struct amd64_fpstate_ fpregs_mem;
+    qword_t ssp[4];
+};
+
+struct rt_sigframe_amd64 {
+    guest_addr_t pretcode;
+    struct amd64_ucontext_ uc;
+    struct amd64_siginfo_ info;
+    char retcode[8];
+};
+
+static int sigaction_from_user(struct task *task, guest_addr_t user_addr, struct sigaction_ *action) {
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct sigaction_amd64_marshaled user_action;
+        if (user_get(user_addr, user_action))
+            return _EFAULT;
+        *action = (struct sigaction_) {
+            .handler = user_action.handler,
+            .flags = user_action.flags,
+            .restorer = user_action.restorer,
+            .mask = user_action.mask,
+        };
+    } else {
+        struct sigaction_i386_marshaled user_action;
+        if (user_get(user_addr, user_action))
+            return _EFAULT;
+        *action = (struct sigaction_) {
+            .handler = user_action.handler,
+            .flags = user_action.flags,
+            .restorer = user_action.restorer,
+            .mask = user_action.mask,
+        };
+    }
+    return 0;
+}
+
+static int sigaction_to_user(struct task *task, guest_addr_t user_addr, const struct sigaction_ *action) {
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct sigaction_amd64_marshaled user_action = {
+            .handler = action->handler,
+            .flags = action->flags,
+            .restorer = action->restorer,
+            .mask = action->mask,
+        };
+        if (user_put(user_addr, user_action))
+            return _EFAULT;
+    } else {
+        struct sigaction_i386_marshaled user_action = {
+            .handler = (addr_t) action->handler,
+            .flags = (dword_t) action->flags,
+            .restorer = (addr_t) action->restorer,
+            .mask = action->mask,
+        };
+        if (user_put(user_addr, user_action))
+            return _EFAULT;
+    }
+    return 0;
+}
+
+static bool wake_waiting_task(struct task *task) {
+    pthread_mutex_lock(&task->waiting_cond_lock.m);
     task->waiting_cond_lock.owner = pthread_self();
 
     cond_t *waiting_cond = task->waiting_cond;
     lock_t *waiting_lock = task->waiting_lock;
+    bool *waiting_interrupt_flag = task->waiting_interrupt_flag;
+    bool interrupted_wait = waiting_interrupt_flag != NULL ||
+        (waiting_cond != NULL && waiting_lock != NULL);
+    if (waiting_interrupt_flag != NULL)
+        __atomic_store_n(waiting_interrupt_flag, true, __ATOMIC_RELEASE);
     if (waiting_cond != NULL && waiting_lock != NULL) {
         bool have_wait_lock = false;
+        bool acquired_wait_lock = false;
         bool using_existing_wait_lock = false;
         int wait_lock_status = pthread_mutex_trylock(&waiting_lock->m);
         if (wait_lock_status == 0) {
             have_wait_lock = true;
+            acquired_wait_lock = true;
         } else if (wait_lock_status == EBUSY &&
                    pthread_equal(waiting_lock->owner, pthread_self())) {
             // The signal sender may already hold the mutex associated with the
@@ -44,30 +258,45 @@ static void wake_waiting_task(struct task *task) {
             // existing lock ownership.
             have_wait_lock = true;
             using_existing_wait_lock = true;
-        } else if (wait_lock_status == EBUSY &&
-                   pthread_equal(waiting_lock->owner, task->thread)) {
-            for (int attempt = 0; attempt < 64; attempt++) {
-                sched_yield();
-                wait_lock_status = pthread_mutex_trylock(&waiting_lock->m);
-                if (wait_lock_status == 0) {
-                    have_wait_lock = true;
-                    break;
-                }
-                if (wait_lock_status != EBUSY ||
-                    !pthread_equal(waiting_lock->owner, task->thread))
-                    break;
-            }
+        } else if (wait_lock_status == EBUSY) {
+            // Do not block on waiting_lock while holding waiting_cond_lock.
+            // The waiter clears waiting_cond/waiting_lock after
+            // pthread_cond_wait() returns, while still holding waiting_lock and
+            // then taking waiting_cond_lock. Holding waiting_cond_lock here and
+            // then blocking on waiting_lock deadlocks with that path.
+            memset(&task->waiting_cond_lock.owner, 0, sizeof(task->waiting_cond_lock.owner));
+            pthread_mutex_unlock(&task->waiting_cond_lock.m);
+
+            // Wait until the waiter either reaches pthread_cond_wait() and
+            // releases waiting_lock, or finishes the wait path entirely.
+            pthread_mutex_lock(&waiting_lock->m);
+            have_wait_lock = true;
+            acquired_wait_lock = true;
+
+            pthread_mutex_lock(&task->waiting_cond_lock.m);
+            task->waiting_cond_lock.owner = pthread_self();
+            if (task->waiting_cond != waiting_cond || task->waiting_lock != waiting_lock)
+                have_wait_lock = false;
         }
 
         if (have_wait_lock) {
             notify(waiting_cond);
             if (!using_existing_wait_lock)
                 pthread_mutex_unlock(&waiting_lock->m);
+        } else if (acquired_wait_lock && !using_existing_wait_lock) {
+            pthread_mutex_unlock(&waiting_lock->m);
         }
     }
 
     memset(&task->waiting_cond_lock.owner, 0, sizeof(task->waiting_cond_lock.owner));
     pthread_mutex_unlock(&task->waiting_cond_lock.m);
+    return interrupted_wait;
+}
+
+static guest_addr_t current_user_sp(struct task *task) {
+    if (task->abi == GUEST_ABI_AMD64)
+        return task->cpu.amd64_regs[amd64_rsp];
+    return task->cpu.esp;
 }
 
 struct signalfd_state {
@@ -105,7 +334,25 @@ static int signal_is_blockable(int sig) {
     return sig != SIGKILL_ && sig != SIGSTOP_;
 }
 
+static bool signal_is_realtime(int sig) {
+    return sig > SIGSYS_ && sig < NUM_SIGS;
+}
+
 #define UNBLOCKABLE_MASK (sig_mask(SIGKILL_) | sig_mask(SIGSTOP_))
+
+static bool signal_is_synchronous_trap(int sig) {
+    switch (sig) {
+        case SIGILL_:
+        case SIGTRAP_:
+        case SIGBUS_:
+        case SIGFPE_:
+        case SIGSEGV_:
+        case SIGSYS_:
+            return true;
+        default:
+            return false;
+    }
+}
 
 #define SIGNAL_IGNORE 0
 #define SIGNAL_KILL 1
@@ -115,9 +362,8 @@ static int signal_is_blockable(int sig) {
 static int signal_action(struct sighand *sighand, int sig) {
     if (signal_is_blockable(sig)) {
         struct sigaction_ *action = &sighand->action[sig];
-        if(sig > 63) // Bogus -mke
-            //return SIGNAL_IGNORE;
-            return 0;
+        if(sig > 63)
+            return SIGNAL_IGNORE;
         
         if (action->handler == SIG_IGN_)
             return SIGNAL_IGNORE;
@@ -126,7 +372,7 @@ static int signal_action(struct sighand *sighand, int sig) {
     }
 
     switch (sig) {
-        case SIGURG_: case SIGCONT_: case SIGCHLD_:
+        case SIGCONT_: case SIGCHLD_:
         case SIGIO_: case SIGWINCH_:
             return SIGNAL_IGNORE;
 
@@ -138,8 +384,8 @@ static int signal_action(struct sighand *sighand, int sig) {
     }
 }
 
-static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ info) {
-    if (sigset_has(task->pending, sig))
+static void deliver_signal_unlocked_locked(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info) {
+    if (!signal_is_realtime(sig) && sigset_has(task->pending, sig))
         return;
 
     if (task->exiting)
@@ -152,11 +398,27 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
     list_add_tail(&task->queue, &sigqueue->queue);
     signalfd_wakeup_task(task, sig);
 
-    if (sigset_has(task->blocked & ~task->waiting, sig) && signal_is_blockable(sig))
+    // Synchronous fault signals must be delivered even when the task has them
+    // masked. libc abort paths rely on this by blocking signals before
+    // executing a crash instruction like `hlt`.
+    if (sigset_has(task->blocked & ~task->waiting, sig) && signal_is_blockable(sig) &&
+            !signal_is_synchronous_trap(sig))
         return;
 
+    bool interrupted_wait = false;
     if (task != current) {
-        pthread_kill(task->thread, SIGUSR1);
+        int wake_err = pthread_kill(task->thread, SIGUSR1);
+        if ((sig == SIGKILL_ || sig == SIGABRT_) &&
+                (amd64_trace_is_lineage_tgid(task->tgid) ||
+                 (current != NULL && amd64_trace_is_lineage_tgid(current->tgid)))) {
+            printk("tracked signal wake: sender=%d sender_tgid=%d sig=%d target=%d target_tgid=%d abi=%d wake_err=%d exiting=%d io_block=%d pending=%#llx blocked=%#llx\n",
+                   current != NULL ? current->pid : -1,
+                   current != NULL ? current->tgid : -1,
+                   sig, task->pid, task->tgid, task->abi, wake_err,
+                   task->exiting, task->io_block,
+                   (unsigned long long) task->pending,
+                   (unsigned long long) task->blocked);
+        }
         if (task->cpu.poked_ptr)
             cpu_poke(&task->cpu);
 
@@ -164,32 +426,232 @@ static void deliver_signal_unlocked(struct task *task, int sig, struct siginfo_ 
         // If the waiter is between publishing waiting_cond and entering
         // pthread_cond_wait(), retry briefly for its lock handoff so the wake
         // is not lost. This avoids global timed polling in wait_for().
-        memset(&task->sighand->lock.owner, 0, sizeof(task->sighand->lock.owner));
-        pthread_mutex_unlock(&task->sighand->lock.m);
-        wake_waiting_task(task);
-        pthread_mutex_lock(&task->sighand->lock.m);
-        task->sighand->lock.owner = pthread_self();
+        memset(&sighand->lock.owner, 0, sizeof(sighand->lock.owner));
+        pthread_mutex_unlock(&sighand->lock.m);
+        interrupted_wait = wake_waiting_task(task);
+        pthread_mutex_lock(&sighand->lock.m);
+        sighand->lock.owner = pthread_self();
+    } else {
+        interrupted_wait = wake_waiting_task(task);
+    }
+    if (interrupted_wait) {
+        bool restart = signal_action(sighand, sig) == SIGNAL_CALL_HANDLER &&
+            !!(sighand->action[sig].flags & SA_RESTART_);
+        __atomic_store_n(&task->restart_interrupted_syscall, restart, __ATOMIC_RELEASE);
+        __atomic_store_n(&task->wait_interrupted, true, __ATOMIC_RELEASE);
     }
 }
 
-void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
-    lock(&task->sighand->lock, 0);
-    deliver_signal_unlocked(task, sig, info);
-    unlock(&task->sighand->lock);
+void deliver_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info) {
+    lock(&sighand->lock, 0);
+    deliver_signal_unlocked_locked(task, sighand, sig, info);
+    unlock(&sighand->lock);
 }
 
-static bool signalfd_take_next_locked(struct task *task, sigset_t_ mask, struct siginfo_ *info_out) {
+void deliver_signal(struct task *task, int sig, struct siginfo_ info) {
+    struct sighand *sighand = task->sighand;
+    if (sighand == NULL)
+        return;
+    deliver_signal_with_sighand(task, sighand, sig, info);
+}
+
+static bool signal_still_pending_locked(struct task *task, int sig) {
+    struct sigqueue *sigqueue;
+    list_for_each_entry(&task->queue, sigqueue, queue) {
+        if (sigqueue->info.sig == sig)
+            return true;
+    }
+    return false;
+}
+
+static bool signal_take_next_locked(struct task *task, sigset_t_ mask, struct siginfo_ *info_out) {
     struct sigqueue *sigqueue;
     list_for_each_entry(&task->queue, sigqueue, queue) {
         if (!sigset_has(mask, sigqueue->info.sig))
             continue;
         *info_out = sigqueue->info;
+        int sig = sigqueue->info.sig;
         list_remove(&sigqueue->queue);
-        sigset_del(&task->pending, sigqueue->info.sig);
+        if (!signal_still_pending_locked(task, sig))
+            sigset_del(&task->pending, sig);
         free(sigqueue);
         return true;
     }
     return false;
+}
+
+static void siginfo_to_i386_user(struct i386_siginfo_ *out, const struct siginfo_ *info) {
+    memset(out, 0, sizeof(*out));
+    out->sig = info->sig;
+    out->sig_errno = info->sig_errno;
+    out->code = info->code;
+    switch (info->sig) {
+        case SIGCHLD_:
+            out->child.pid = info->child.pid;
+            out->child.uid = info->child.uid;
+            out->child.status = info->child.status;
+            out->child.utime = info->child.utime;
+            out->child.stime = info->child.stime;
+            break;
+        case SIGILL_:
+        case SIGBUS_:
+        case SIGFPE_:
+        case SIGSEGV_:
+            out->fault.addr = (addr_t) info->fault.addr;
+            break;
+        case SIGTRAP_:
+            if (info->code == SIGTRAP_ || info->code == (SIGTRAP_ | 0x80)) {
+                // Ptrace syscall-stop: Linux reports only si_signo/si_code.
+            } else if ((info->code >> 8) != 0) {
+                // Ptrace event-stop: Linux populates si_pid/si_uid, not si_addr.
+                out->kill.pid = info->kill.pid;
+                out->kill.uid = info->kill.uid;
+            } else if (info->code <= 0 || info->code == SI_KERNEL_) {
+                out->kill.pid = info->kill.pid;
+                out->kill.uid = info->kill.uid;
+            } else {
+                out->fault.addr = (addr_t) info->fault.addr;
+            }
+            break;
+        case SIGSYS_:
+            out->sigsys.addr = (addr_t) info->sigsys.addr;
+            out->sigsys.syscall = info->sigsys.syscall;
+            break;
+        default:
+            if (info->code == SI_TIMER_) {
+                out->timer.timer = info->timer.timer;
+                out->timer.overrun = info->timer.overrun;
+                memcpy(&out->timer.value, &info->timer.value, sizeof(out->timer.value));
+                out->timer._private = info->timer._private;
+            } else {
+                if (info->code == SI_QUEUE_) {
+                    out->rt.pid = info->rt.pid;
+                    out->rt.uid = info->rt.uid;
+                    memcpy(&out->rt.value, &info->rt.value, sizeof(out->rt.value));
+                } else {
+                    out->kill.pid = info->kill.pid;
+                    out->kill.uid = info->kill.uid;
+                }
+            }
+            break;
+    }
+}
+
+static void siginfo_to_amd64_user(struct amd64_siginfo_ *out, const struct siginfo_ *info) {
+    memset(out, 0, sizeof(*out));
+    out->sig = info->sig;
+    out->sig_errno = info->sig_errno;
+    out->code = info->code;
+    switch (info->sig) {
+        case SIGCHLD_:
+            out->child.pid = info->child.pid;
+            out->child.uid = info->child.uid;
+            out->child.status = info->child.status;
+            out->child.utime = info->child.utime;
+            out->child.stime = info->child.stime;
+            break;
+        case SIGILL_:
+        case SIGBUS_:
+        case SIGFPE_:
+        case SIGSEGV_:
+            out->fault.addr = info->fault.addr;
+            break;
+        case SIGTRAP_:
+            if (info->code == SIGTRAP_ || info->code == (SIGTRAP_ | 0x80)) {
+                // Ptrace syscall-stop: Linux reports only si_signo/si_code.
+            } else if ((info->code >> 8) != 0) {
+                out->kill.pid = info->kill.pid;
+                out->kill.uid = info->kill.uid;
+            } else if (info->code <= 0 || info->code == SI_KERNEL_) {
+                out->kill.pid = info->kill.pid;
+                out->kill.uid = info->kill.uid;
+            } else {
+                out->fault.addr = info->fault.addr;
+            }
+            break;
+        case SIGSYS_:
+            out->sigsys.call_addr = info->sigsys.addr;
+            out->sigsys.syscall = info->sigsys.syscall;
+            break;
+        default:
+            if (info->code == SI_TIMER_) {
+                out->timer.timer = info->timer.timer;
+                out->timer.overrun = info->timer.overrun;
+                out->timer.value = info->timer.value;
+                out->timer._private = info->timer._private;
+            } else {
+                if (info->code == SI_QUEUE_) {
+                    out->rt.pid = info->rt.pid;
+                    out->rt.uid = info->rt.uid;
+                    out->rt.value = info->rt.value;
+                } else {
+                    out->kill.pid = info->kill.pid;
+                    out->kill.uid = info->kill.uid;
+                }
+            }
+            break;
+    }
+}
+
+static int siginfo_from_user(struct task *task, guest_addr_t user_addr, struct siginfo_ *info) {
+    memset(info, 0, sizeof(*info));
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct amd64_siginfo_ user_info;
+        if (user_get(user_addr, user_info))
+            return _EFAULT;
+        info->sig = user_info.sig;
+        info->sig_errno = user_info.sig_errno;
+        info->code = user_info.code;
+        if (info->code == SI_TIMER_) {
+            info->timer.timer = user_info.timer.timer;
+            info->timer.overrun = user_info.timer.overrun;
+            info->timer.value = user_info.timer.value;
+            info->timer._private = user_info.timer._private;
+        } else if (info->code == SI_QUEUE_) {
+            info->rt.pid = user_info.rt.pid;
+            info->rt.uid = user_info.rt.uid;
+            info->rt.value = user_info.rt.value;
+        } else {
+            info->kill.pid = user_info.kill.pid;
+            info->kill.uid = user_info.kill.uid;
+        }
+    } else {
+        struct i386_siginfo_ user_info;
+        if (user_get(user_addr, user_info))
+            return _EFAULT;
+        info->sig = user_info.sig;
+        info->sig_errno = user_info.sig_errno;
+        info->code = user_info.code;
+        if (info->code == SI_TIMER_) {
+            info->timer.timer = user_info.timer.timer;
+            info->timer.overrun = user_info.timer.overrun;
+            memcpy(&info->timer.value, &user_info.timer.value, sizeof(info->timer.value));
+            info->timer._private = user_info.timer._private;
+        } else if (info->code == SI_QUEUE_) {
+            info->rt.pid = user_info.rt.pid;
+            info->rt.uid = user_info.rt.uid;
+            memcpy(&info->rt.value, &user_info.rt.value, sizeof(info->rt.value));
+        } else {
+            info->kill.pid = user_info.kill.pid;
+            info->kill.uid = user_info.kill.uid;
+        }
+    }
+    return 0;
+}
+
+int siginfo_to_user(struct task *task, guest_addr_t user_addr, const struct siginfo_ *info) {
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct amd64_siginfo_ user_info;
+        siginfo_to_amd64_user(&user_info, info);
+        if (user_put(user_addr, user_info))
+            return _EFAULT;
+    } else {
+        struct i386_siginfo_ user_info;
+        siginfo_to_i386_user(&user_info, info);
+        if (user_put(user_addr, user_info))
+            return _EFAULT;
+    }
+    return 0;
 }
 
 static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct siginfo_ *info) {
@@ -197,11 +659,11 @@ static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct sig
     out->signo = info->sig;
     out->sig_errno = info->sig_errno;
     out->code = info->code;
-    out->pid = info->kill.pid;
-    out->uid = info->kill.uid;
+    out->pid = info->code == SI_QUEUE_ ? info->rt.pid : info->kill.pid;
+    out->uid = info->code == SI_QUEUE_ ? info->rt.uid : info->kill.uid;
     out->status = info->child.status;
-    out->sig_int = info->timer.value.sv_int;
-    out->sig_ptr = info->timer.value.sv_ptr;
+    out->sig_int = info->code == SI_QUEUE_ ? info->rt.value.sv_int : info->timer.value.sv_int;
+    out->sig_ptr = info->code == SI_QUEUE_ ? info->rt.value.sv_ptr : info->timer.value.sv_ptr;
     out->utime = info->child.utime;
     out->stime = info->child.stime;
     out->addr = info->fault.addr;
@@ -212,8 +674,21 @@ static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct sig
     out->call_addr = info->sigsys.addr;
 }
 
+static struct fdtable *signalfd_task_files_retain(struct task *task) {
+    struct fdtable *files = NULL;
+    lock(&task->general_lock, 0);
+    if (!task->exiting && task->files != NULL)
+        files = fdtable_retain(task->files);
+    unlock(&task->general_lock);
+    return files;
+}
+
 static void signalfd_wakeup_task(struct task *task, int sig) {
-    if (task == NULL || task->files == NULL)
+    if (task == NULL)
+        return;
+
+    struct fdtable *files = signalfd_task_files_retain(task);
+    if (files == NULL)
         return;
 
     // Use trylock to avoid a deadlock: this function is called while
@@ -222,10 +697,12 @@ static void signalfd_wakeup_task(struct task *task, int sig) {
     // pids.  If the files table is currently locked, skip the wakeup — the
     // signal is already pending in task->pending, so the task will find it
     // when it next checks for signals.
-    if (trylock(&task->files->lock) != 0)
+    if (trylock(&files->lock) != 0) {
+        fdtable_release(files);
         return;
-    for (fd_t fd_no = 0; (unsigned) fd_no < task->files->size; fd_no++) {
-        struct fd *fd = fdtable_get(task->files, fd_no);
+    }
+    for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
+        struct fd *fd = fdtable_get(files, fd_no);
         if (fd == NULL || fd->ops != &signalfd_ops || fd->data == NULL)
             continue;
         struct signalfd_state *state = fd->data;
@@ -234,7 +711,8 @@ static void signalfd_wakeup_task(struct task *task, int sig) {
         notify(&fd->cond);
         poll_wakeup(fd, POLL_READ);
     }
-    unlock(&task->files->lock);
+    unlock(&files->lock);
+    fdtable_release(files);
 }
 
 static int signalfd_poll(struct fd *fd) {
@@ -263,28 +741,30 @@ static ssize_t signalfd_read(struct fd *fd, void *buf, size_t bufsize) {
 
     size_t max_infos = bufsize / sizeof(struct signalfd_siginfo_);
     size_t count = 0;
-    lock(&current->sighand->lock, 0);
+    lock(&fd->lock, 0);
     while (count == 0) {
+        lock(&current->sighand->lock, 0);
         while (count < max_infos) {
             struct siginfo_ info;
-            if (!signalfd_take_next_locked(current, state->mask, &info))
+            if (!signal_take_next_locked(current, state->mask, &info))
                 break;
             signalfd_info_from_siginfo(&((struct signalfd_siginfo_ *) buf)[count], &info);
             count++;
         }
+        unlock(&current->sighand->lock);
         if (count != 0)
             break;
         if (fd->flags & O_NONBLOCK_) {
-            unlock(&current->sighand->lock);
+            unlock(&fd->lock);
             return _EAGAIN;
         }
-        int err = wait_for(&current->pause, &current->sighand->lock, NULL);
+        int err = wait_for(&fd->cond, &fd->lock, NULL);
         if (err != 0) {
-            unlock(&current->sighand->lock);
+            unlock(&fd->lock);
             return err;
         }
     }
-    unlock(&current->sighand->lock);
+    unlock(&fd->lock);
     return count * sizeof(struct signalfd_siginfo_);
 }
 
@@ -301,6 +781,10 @@ static struct fd_ops signalfd_ops = {
 };
 
 int_t sys_signalfd4(int_t fd_no, addr_t mask_addr, dword_t sigsetsize, int_t flags) {
+    return sys_signalfd4_guest(fd_no, mask_addr, sigsetsize, flags);
+}
+
+int_t sys_signalfd4_guest(int_t fd_no, guest_addr_t mask_addr, dword_t sigsetsize, int_t flags) {
     if (sigsetsize != sizeof(sigset_t_))
         return _EINVAL;
     if (flags & ~(O_CLOEXEC_ | O_NONBLOCK_))
@@ -333,20 +817,37 @@ int_t sys_signalfd4(int_t fd_no, addr_t mask_addr, dword_t sigsetsize, int_t fla
 }
 
 int_t sys_signalfd(int_t fd, addr_t mask_addr, dword_t sigsetsize) {
-    return sys_signalfd4(fd, mask_addr, sigsetsize, 0);
+    return sys_signalfd4_guest(fd, mask_addr, sigsetsize, 0);
+}
+
+int_t sys_signalfd_guest(int_t fd, guest_addr_t mask_addr, dword_t sigsetsize) {
+    return sys_signalfd4_guest(fd, mask_addr, sigsetsize, 0);
 }
 
 void send_signal(struct task *task, int sig, struct siginfo_ info) {
+    struct sighand *sighand = task->sighand;
+    if (sighand == NULL)
+        return;
+    send_signal_with_sighand(task, sighand, sig, info);
+}
+
+static void send_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info) {
     // signal zero is for testing whether a process exists
     if (sig == 0)
         return;
     if (task->zombie || task->exiting)
         return;
-
-    struct sighand *sighand = task->sighand;
     lock(&sighand->lock, 0);
-    if ((signal_action(sighand, sig) != SIGNAL_IGNORE) && (task->pid <= MAX_PID)) { // Deal with normal and crazy.  -mke
-        deliver_signal_unlocked(task, sig, info);
+    bool ignored = signal_action(sighand, sig) == SIGNAL_IGNORE;
+    bool synchronously_consumed = sigset_has(task->blocked | task->waiting, sig);
+    if (should_trace_signal_task(task)) {
+        printk("tracked signal send: target=%d tgid=%d comm=%s sig=%d ignored=%d sync=%d blocked=%#x waiting=%#x pending=%#x sender=%d/%s\n",
+               task->pid, task->tgid, task->comm, sig, ignored, synchronously_consumed,
+               task->blocked, task->waiting, task->pending,
+               current != NULL ? current->pid : 0, current != NULL ? current->comm : "?");
+    }
+    if ((!ignored || synchronously_consumed) && (task->pid <= MAX_PID)) {
+        deliver_signal_unlocked_locked(task, sighand, sig, info);
     }
     unlock(&sighand->lock);
 
@@ -358,6 +859,32 @@ void send_signal(struct task *task, int sig, struct siginfo_ info) {
     }
 }
 
+bool signal_should_restart_syscall(void) {
+    if (current == NULL)
+        return false;
+
+    if (__atomic_exchange_n(&current->restart_interrupted_syscall, false, __ATOMIC_ACQ_REL))
+        return true;
+
+    struct sighand *sighand = current->sighand;
+    lock(&sighand->lock, 0);
+    struct sigqueue *sigqueue;
+    list_for_each_entry(&current->queue, sigqueue, queue) {
+        int sig = sigqueue->info.sig;
+        if (sigset_has(current->blocked, sig))
+            continue;
+        if (signal_action(sighand, sig) != SIGNAL_CALL_HANDLER) {
+            unlock(&sighand->lock);
+            return false;
+        }
+        bool restart = !!(sighand->action[sig].flags & SA_RESTART_);
+        unlock(&sighand->lock);
+        return restart;
+    }
+    unlock(&sighand->lock);
+    return false;
+}
+
 bool try_self_signal(int sig) {
     assert(sig == SIGTTIN_ || sig == SIGTTOU_);
 
@@ -366,27 +893,72 @@ bool try_self_signal(int sig) {
     bool can_send = signal_action(sighand, sig) != SIGNAL_IGNORE &&
         !sigset_has(current->blocked, sig);
     if (can_send)
-        deliver_signal_unlocked(current, sig, SIGINFO_NIL);
+        deliver_signal_unlocked_locked(current, current->sighand, sig, SIGINFO_NIL);
     unlock(&sighand->lock);
     return can_send;
 }
 
 int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
+    struct group_signal_target {
+        struct task *task;
+        struct sighand *sighand;
+    };
+    struct group_signal_target stack_targets[32];
+    struct group_signal_target *targets = stack_targets;
+    size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
+    size_t target_count = 0;
+
     complex_lockt(&pids_lock, 0);
     struct pid *pid = pid_get(pgid);
     if (pid == NULL) {
         unlock(&pids_lock);
         return _ESRCH;
     }
+
+    size_t needed = 0;
     struct tgroup *tgroup;
+    list_for_each_entry(&pid->pgroup, tgroup, pgroup)
+        needed++;
+    if (needed > target_cap) {
+        unlock(&pids_lock);
+        targets = malloc(sizeof(*targets) * needed);
+        if (targets == NULL)
+            return _ENOMEM;
+        target_cap = needed;
+
+        complex_lockt(&pids_lock, 0);
+        pid = pid_get(pgid);
+        if (pid == NULL) {
+            unlock(&pids_lock);
+            free(targets);
+            return _ESRCH;
+        }
+    }
+
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-        send_signal(tgroup->leader, sig, info);
+        struct task *task = tgroup->leader;
+        if (task == NULL || task->zombie || task->exiting || task->sighand == NULL)
+            continue;
+        task_ref_cnt_mod(task, 1);
+        sighand_retain(task->sighand);
+        targets[target_count++] = (struct group_signal_target) {
+            .task = task,
+            .sighand = task->sighand,
+        };
     }
     unlock(&pids_lock);
+
+    for (size_t i = 0; i < target_count; i++) {
+        send_signal_with_sighand(targets[i].task, targets[i].sighand, sig, info);
+        sighand_release(targets[i].sighand);
+        task_ref_cnt_mod(targets[i].task, -1);
+    }
+    if (targets != stack_targets)
+        free(targets);
     return 0;
 }
 
-static addr_t sigreturn_trampoline(const char *name) {
+static guest_addr_t sigreturn_trampoline(const char *name) {
     addr_t sigreturn_addr = vdso_symbol(name);
     if (sigreturn_addr == 0) {
         die("sigreturn not found in vdso, this should never happen");
@@ -394,7 +966,34 @@ static addr_t sigreturn_trampoline(const char *name) {
     return current->mm->vdso + sigreturn_addr;
 }
 
-static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
+static guest_addr_t signal_restorer(const struct sigaction_ *action, bool rt) {
+    if (current->abi == GUEST_ABI_AMD64)
+        return action->restorer;
+    return sigreturn_trampoline(rt ? "__kernel_rt_sigreturn" : "__kernel_sigreturn");
+}
+
+static bool signal_should_capture_trap_state(int sig) {
+    return signal_is_synchronous_trap(sig);
+}
+
+static qword_t signal_trap_error(struct cpu_state *cpu) {
+    switch (cpu->trapno) {
+        case INT_PF: {
+            qword_t err = 0x4; // user-mode fault
+            if (cpu->segfault_was_write)
+                err |= 0x2;
+            mem_read_lock_quiesce_aware(current->mem);
+            if (mem_segv_reason(current->mem, cpu->segfault_addr) == SEGV_ACCERR_)
+                err |= 0x1;
+            mem_read_unlock_quiesce_aware(current->mem);
+            return err;
+        }
+        default:
+            return 0;
+    }
+}
+
+static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu, int sig) {
     sc->ax = cpu->eax;
     sc->bx = cpu->ebx;
     sc->cx = cpu->ecx;
@@ -406,17 +1005,20 @@ static void setup_sigcontext(struct sigcontext_ *sc, struct cpu_state *cpu) {
     sc->ip = cpu->eip;
     collapse_flags(cpu);
     sc->flags = cpu->eflags;
-    sc->trapno = cpu->trapno;
-    if (cpu->trapno == INT_GPF)
+    sc->trapno = signal_should_capture_trap_state(sig) ? cpu->trapno : 0;
+    sc->err = signal_should_capture_trap_state(sig) ? (dword_t) signal_trap_error(cpu) : 0;
+    if (sc->trapno == INT_PF)
         sc->cr2 = cpu->segfault_addr;
+    else
+        sc->cr2 = 0;
     // TODO more shit
     sc->oldmask = current->blocked & 0xffffffff;
 }
 
 static void setup_sigframe(struct siginfo_ *info, struct sigframe_ *frame) {
-    frame->restorer = sigreturn_trampoline("__kernel_sigreturn");
+    frame->restorer = (addr_t) signal_restorer(&current->sighand->action[info->sig], false);
     frame->sig = info->sig;
-    setup_sigcontext(&frame->sc, &current->cpu);
+    setup_sigcontext(&frame->sc, &current->cpu, info->sig);
     frame->extramask = current->blocked >> 32;
 
     static const struct {
@@ -432,13 +1034,13 @@ static void setup_sigframe(struct siginfo_ *info, struct sigframe_ *frame) {
 }
 
 static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame) {
-    frame->restorer = sigreturn_trampoline("__kernel_rt_sigreturn");
+    frame->restorer = (addr_t) signal_restorer(&current->sighand->action[info->sig], true);
     frame->sig = info->sig;
-    frame->info = *info;
+    siginfo_to_i386_user(&frame->info, info);
     frame->uc.flags = 0;
     frame->uc.link = 0;
-    altstack_to_user(current, &frame->uc.stack);
-    setup_sigcontext(&frame->uc.mcontext, &current->cpu);
+    altstack_to_i386_user(current, &frame->uc.stack);
+    setup_sigcontext(&frame->uc.mcontext, &current->cpu, info->sig);
     frame->uc.sigmask = current->blocked;
 
     static const struct {
@@ -454,9 +1056,93 @@ static void setup_rt_sigframe(struct siginfo_ *info, struct rt_sigframe_ *frame)
     memcpy(frame->retcode, &rt_retcode, sizeof(rt_retcode));
 }
 
+static void setup_amd64_mcontext(struct amd64_mcontext_ *mcontext, struct cpu_state *cpu) {
+    memset(mcontext, 0, sizeof(*mcontext));
+    mcontext->gregs[AMD64_GREG_R8] = cpu->amd64_regs[amd64_r8];
+    mcontext->gregs[AMD64_GREG_R9] = cpu->amd64_regs[amd64_r9];
+    mcontext->gregs[AMD64_GREG_R10] = cpu->amd64_regs[amd64_r10];
+    mcontext->gregs[AMD64_GREG_R11] = cpu->amd64_regs[amd64_r11];
+    mcontext->gregs[AMD64_GREG_R12] = cpu->amd64_regs[amd64_r12];
+    mcontext->gregs[AMD64_GREG_R13] = cpu->amd64_regs[amd64_r13];
+    mcontext->gregs[AMD64_GREG_R14] = cpu->amd64_regs[amd64_r14];
+    mcontext->gregs[AMD64_GREG_R15] = cpu->amd64_regs[amd64_r15];
+    mcontext->gregs[AMD64_GREG_RDI] = cpu->amd64_regs[amd64_rdi];
+    mcontext->gregs[AMD64_GREG_RSI] = cpu->amd64_regs[amd64_rsi];
+    mcontext->gregs[AMD64_GREG_RBP] = cpu->amd64_regs[amd64_rbp];
+    mcontext->gregs[AMD64_GREG_RBX] = cpu->amd64_regs[amd64_rbx];
+    mcontext->gregs[AMD64_GREG_RDX] = cpu->amd64_regs[amd64_rdx];
+    mcontext->gregs[AMD64_GREG_RAX] = cpu->amd64_regs[amd64_rax];
+    mcontext->gregs[AMD64_GREG_RCX] = cpu->amd64_regs[amd64_rcx];
+    mcontext->gregs[AMD64_GREG_RSP] = cpu->amd64_regs[amd64_rsp];
+    mcontext->gregs[AMD64_GREG_RIP] = cpu->amd64_rip;
+    collapse_flags(cpu);
+    mcontext->gregs[AMD64_GREG_EFL] = cpu->eflags;
+    // Linux x86_64 REG_CSGSFS packs CS, GS, FS, and a zero pad word.
+    mcontext->gregs[AMD64_GREG_CSGSFS] =
+        AMD64_USER_CS |
+        ((qword_t) cpu->gs << 16);
+    mcontext->gregs[AMD64_GREG_ERR] = signal_trap_error(cpu);
+    mcontext->gregs[AMD64_GREG_TRAPNO] = 0;
+    mcontext->gregs[AMD64_GREG_OLDMASK] = current->blocked;
+}
+
+static void setup_amd64_fpstate(struct amd64_fpstate_ *fpstate, struct cpu_state *cpu) {
+    memset(fpstate, 0, sizeof(*fpstate));
+    fpstate->cwd = cpu->fcw;
+    fpstate->swd = cpu->fsw;
+    fpstate->mxcsr = 0x1f80;
+
+    for (int i = 0; i < 8; i++) {
+        const float80 value = cpu->fp[i];
+        for (int j = 0; j < 4; j++)
+            fpstate->st[i].significand[j] = (word_t) (value.signif >> (j * 16));
+        fpstate->st[i].exponent = value.signExp;
+    }
+
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 4; j++)
+            fpstate->xmm[i].element[j] = cpu->xmm[i].u32[j];
+}
+
+static void setup_rt_sigframe_amd64(struct siginfo_ *info, struct rt_sigframe_amd64 *frame) {
+    memset(frame, 0, sizeof(*frame));
+    frame->uc.flags = AMD64_UC_FP_XSTATE;
+    frame->uc.link = 0;
+    frame->uc.stack = (struct amd64_stack_t_marshaled) {
+        .stack = current->altstack,
+        .flags = current_altstack_flags(current),
+        .size = current->altstack_size,
+    };
+    setup_amd64_mcontext(&frame->uc.mcontext, &current->cpu);
+    setup_amd64_fpstate(&frame->uc.fpregs_mem, &current->cpu);
+    if (signal_should_capture_trap_state(info->sig)) {
+        frame->uc.mcontext.gregs[AMD64_GREG_TRAPNO] = current->cpu.trapno;
+        if (current->cpu.trapno == INT_PF)
+            frame->uc.mcontext.gregs[AMD64_GREG_CR2] = current->cpu.segfault_addr;
+    }
+    frame->uc.sigmask = current->blocked;
+    siginfo_to_amd64_user(&frame->info, info);
+
+    static const struct {
+        uint8_t mov_rax_imm32;
+        uint32_t nr_rt_sigreturn;
+        uint16_t syscall;
+    } __attribute__((packed)) rt_retcode = {
+        .mov_rax_imm32 = 0xb8,
+        .nr_rt_sigreturn = 15,
+        .syscall = 0x050f,
+    };
+    memcpy(frame->retcode, &rt_retcode, sizeof(rt_retcode));
+}
+
 static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     int sig = info->sig;
     STRACE("%d receiving signal %d\n", current->pid, sig);
+    if (should_trace_signal_task(current)) {
+        printk("tracked signal receive: pid=%d tgid=%d comm=%s sig=%d action=%d blocked=%#x pending=%#x waiting=%#x\n",
+               current->pid, current->tgid, current->comm, sig,
+               signal_action(sighand, sig), current->blocked, current->pending, current->waiting);
+    }
 
     switch (signal_action(sighand, sig)) {
         case SIGNAL_IGNORE:
@@ -477,6 +1163,65 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
     struct sigaction_ *action = &sighand->action[info->sig];
     bool need_siginfo = action->flags & SA_SIGINFO_;
 
+    guest_addr_t sp = current_user_sp(current);
+    if (current->abi == GUEST_ABI_AMD64) {
+        if ((action->flags & SA_ONSTACK_) && current->altstack && !is_on_altstack(sp, current))
+            sp = current->altstack + current->altstack_size;
+    } else {
+        // Preserve longstanding i386 behavior. Existing 32-bit userspace in
+        // this tree has historically run all handlers on the altstack when
+        // one is configured, regardless of SA_ONSTACK.
+        if (current->altstack && !is_on_altstack(sp, current))
+            sp = current->altstack + current->altstack_size;
+    }
+
+    if (current->abi == GUEST_ABI_AMD64) {
+        struct rt_sigframe_amd64 frame;
+        size_t frame_size = sizeof(frame);
+        setup_rt_sigframe_amd64(info, &frame);
+
+        if (sp > 128)
+            sp -= 128;
+        if (xsave_extra) {
+            sp -= xsave_extra;
+            sp &= ~0x3full;
+            sp -= fxsave_extra;
+        }
+        sp -= frame_size;
+        sp = (sp & ~0xfull) - 8;
+
+        guest_addr_t restorer = action->restorer;
+        if (restorer == 0)
+            restorer = sp + offsetof(struct rt_sigframe_amd64, retcode);
+        frame.pretcode = restorer;
+        frame.uc.mcontext.fpstate = sp + offsetof(struct rt_sigframe_amd64, uc.fpregs_mem);
+
+        current->cpu.amd64_regs[amd64_rsp] = sp;
+        current->cpu.esp = (dword_t) sp;
+        current->cpu.amd64_rip = action->handler;
+        current->cpu.eip = (dword_t) action->handler;
+        current->cpu.amd64_regs[amd64_rdi] = info->sig;
+        current->cpu.amd64_regs[amd64_rsi] = need_siginfo ? sp + offsetof(struct rt_sigframe_amd64, info) : 0;
+        current->cpu.amd64_regs[amd64_rdx] = need_siginfo ? sp + offsetof(struct rt_sigframe_amd64, uc) : 0;
+        current->cpu.edi = (dword_t) current->cpu.amd64_regs[amd64_rdi];
+        current->cpu.esi = (dword_t) current->cpu.amd64_regs[amd64_rsi];
+        current->cpu.edx = (dword_t) current->cpu.amd64_regs[amd64_rdx];
+
+        if (!(action->flags & SA_NODEFER_))
+            sigset_add(&current->blocked, info->sig);
+        current->blocked |= action->mask;
+
+        if (user_write(sp, &frame, frame_size)) {
+            printk("WARNING: failed to install amd64 frame for %d at %#llx\n",
+                   info->sig, (unsigned long long) sp);
+            deliver_signal(current, SIGSEGV_, SIGINFO_NIL);
+        }
+
+        if (action->flags & SA_RESETHAND_)
+            *action = (struct sigaction_) {.handler = SIG_DFL_};
+        return;
+    }
+
     // setup the frame
     union {
         struct sigframe_ sigframe;
@@ -493,12 +1238,8 @@ static void receive_signal(struct sighand *sighand, struct siginfo_ *info) {
 
     // set up registers for signal handler
     current->cpu.eax = info->sig;
-    current->cpu.eip = sighand->action[info->sig].handler;
+    current->cpu.eip = action->handler;
 
-    dword_t sp = current->cpu.esp;
-    if (current->altstack && !is_on_altstack(sp, current)) {
-        sp = current->altstack + current->altstack_size;
-    }
     if (xsave_extra) {
         // do as the kernel does
         // this is superhypermega condensed version of fpu__alloc_mathframe in
@@ -567,7 +1308,8 @@ void receive_signals(void) {
         if (sigset_has(blocked, sig))
             continue;
         list_remove(&sigqueue->queue);
-        sigset_del(&current->pending, sig);
+        if (!signal_still_pending_locked(current, sig))
+            sigset_del(&current->pending, sig);
 
         if (current->ptrace.traced && sig != SIGKILL_) {
             // This notifies the parent, goes to sleep, and waits for the
@@ -623,10 +1365,74 @@ static void restore_sigcontext(struct sigcontext_ *context, struct cpu_state *cp
     // Use AC, RF, OF, DF, TF, SF, ZF, AF, PF, CF
 #define USE_FLAGS 0b1010000110111010101
     cpu->eflags = (context->flags & USE_FLAGS) | (cpu->eflags & ~USE_FLAGS);
+    expand_flags(cpu);
+    cpu->df_offset = cpu->df ? -1 : 1;
+}
+
+static void sync_i386_shadows_from_amd64(struct cpu_state *cpu) {
+    cpu->eax = (dword_t) cpu->amd64_regs[amd64_rax];
+    cpu->ebx = (dword_t) cpu->amd64_regs[amd64_rbx];
+    cpu->ecx = (dword_t) cpu->amd64_regs[amd64_rcx];
+    cpu->edx = (dword_t) cpu->amd64_regs[amd64_rdx];
+    cpu->esi = (dword_t) cpu->amd64_regs[amd64_rsi];
+    cpu->edi = (dword_t) cpu->amd64_regs[amd64_rdi];
+    cpu->ebp = (dword_t) cpu->amd64_regs[amd64_rbp];
+    cpu->esp = (dword_t) cpu->amd64_regs[amd64_rsp];
+    cpu->eip = (dword_t) cpu->amd64_rip;
+}
+
+static void restore_amd64_fpstate(struct amd64_fpstate_ *fpstate, struct cpu_state *cpu) {
+    cpu->fcw = fpstate->cwd;
+    cpu->fsw = fpstate->swd;
+
+    for (int i = 0; i < 8; i++) {
+        uint64_t significand = 0;
+        for (int j = 0; j < 4; j++)
+            significand |= (uint64_t) fpstate->st[i].significand[j] << (j * 16);
+        cpu->fp[i] = (float80) {
+            .signif = significand,
+            .signExp = fpstate->st[i].exponent,
+        };
+    }
+
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 4; j++)
+            cpu->xmm[i].u32[j] = fpstate->xmm[i].element[j];
+}
+
+static void restore_amd64_mcontext(struct amd64_mcontext_ *mcontext, struct cpu_state *cpu) {
+    cpu->amd64_regs[amd64_r8] = mcontext->gregs[AMD64_GREG_R8];
+    cpu->amd64_regs[amd64_r9] = mcontext->gregs[AMD64_GREG_R9];
+    cpu->amd64_regs[amd64_r10] = mcontext->gregs[AMD64_GREG_R10];
+    cpu->amd64_regs[amd64_r11] = mcontext->gregs[AMD64_GREG_R11];
+    cpu->amd64_regs[amd64_r12] = mcontext->gregs[AMD64_GREG_R12];
+    cpu->amd64_regs[amd64_r13] = mcontext->gregs[AMD64_GREG_R13];
+    cpu->amd64_regs[amd64_r14] = mcontext->gregs[AMD64_GREG_R14];
+    cpu->amd64_regs[amd64_r15] = mcontext->gregs[AMD64_GREG_R15];
+    cpu->amd64_regs[amd64_rdi] = mcontext->gregs[AMD64_GREG_RDI];
+    cpu->amd64_regs[amd64_rsi] = mcontext->gregs[AMD64_GREG_RSI];
+    cpu->amd64_regs[amd64_rbp] = mcontext->gregs[AMD64_GREG_RBP];
+    cpu->amd64_regs[amd64_rbx] = mcontext->gregs[AMD64_GREG_RBX];
+    cpu->amd64_regs[amd64_rdx] = mcontext->gregs[AMD64_GREG_RDX];
+    cpu->amd64_regs[amd64_rax] = mcontext->gregs[AMD64_GREG_RAX];
+    cpu->amd64_regs[amd64_rcx] = mcontext->gregs[AMD64_GREG_RCX];
+    cpu->amd64_regs[amd64_rsp] = mcontext->gregs[AMD64_GREG_RSP];
+    cpu->amd64_rip = mcontext->gregs[AMD64_GREG_RIP];
+    cpu->trapno = (dword_t) mcontext->gregs[AMD64_GREG_TRAPNO];
+    cpu->segfault_addr = mcontext->gregs[AMD64_GREG_CR2];
+
+    cpu->eflags = (dword_t) mcontext->gregs[AMD64_GREG_EFL];
+    expand_flags(cpu);
+    cpu->df_offset = cpu->df ? -1 : 1;
+
+    sync_i386_shadows_from_amd64(cpu);
 }
 
 dword_t sys_rt_sigreturn(void) {
     struct cpu_state *cpu = &current->cpu;
+    if (current->abi == GUEST_ABI_AMD64)
+        return (dword_t) sys_rt_sigreturn_amd64();
+
     struct rt_sigframe_ frame;
     // esp points past the first field of the frame
     if (user_get(cpu->esp - offsetof(struct rt_sigframe_, sig), frame)) {
@@ -636,15 +1442,37 @@ dword_t sys_rt_sigreturn(void) {
     restore_sigcontext(&frame.uc.mcontext, cpu);
 
     lock(&current->sighand->lock, 0);
-    // FIXME this duplicates logic from sys_sigaltstack
-    if (!is_on_altstack(cpu->esp, current) &&
-            frame.uc.stack.size >= MINSIGSTKSZ_) {
-        current->altstack = frame.uc.stack.stack;
-        current->altstack_size = frame.uc.stack.size;
-    }
+    restore_altstack(cpu->esp, frame.uc.stack.stack, frame.uc.stack.size, frame.uc.stack.flags);
     sigmask_set(frame.uc.sigmask);
     unlock(&current->sighand->lock);
     return cpu->eax;
+}
+
+qword_t sys_rt_sigreturn_amd64(void) {
+    struct cpu_state *cpu = &current->cpu;
+    struct rt_sigframe_amd64 frame;
+    struct amd64_fpstate_ fpstate;
+    guest_addr_t frame_addr = cpu->amd64_regs[amd64_rsp] - offsetof(struct rt_sigframe_amd64, uc);
+    if (user_get(frame_addr, frame)) {
+        deliver_signal(current, SIGSEGV_, SIGINFO_NIL);
+        return _EFAULT;
+    }
+
+    restore_amd64_mcontext(&frame.uc.mcontext, cpu);
+    if (frame.uc.mcontext.fpstate != 0) {
+        if (user_get(frame.uc.mcontext.fpstate, fpstate)) {
+            deliver_signal(current, SIGSEGV_, SIGINFO_NIL);
+            return _EFAULT;
+        }
+        restore_amd64_fpstate(&fpstate, cpu);
+    }
+
+    lock(&current->sighand->lock, 0);
+    restore_altstack(cpu->amd64_regs[amd64_rsp], frame.uc.stack.stack,
+            frame.uc.stack.size, frame.uc.stack.flags);
+    sigmask_set(frame.uc.sigmask);
+    unlock(&current->sighand->lock);
+    return cpu->amd64_regs[amd64_rax];
 }
 
 dword_t sys_sigreturn(void) {
@@ -682,11 +1510,12 @@ struct sighand *sighand_copy(struct sighand *sighand) {
     return new_sighand;
 }
 
+void sighand_retain(struct sighand *sighand) {
+    atomic_fetch_add_explicit(&sighand->refcount, 1, memory_order_relaxed);
+}
+
 void sighand_release(struct sighand *sighand) {
-   // while(task_ref_cnt_get(current, 0) > 1) { // Wait for now, task is in one or more critical sections
-   //     nanosleep(&lock_pause, NULL);
-   // }
-    if (--sighand->refcount == 0) {
+    if (atomic_fetch_sub_explicit(&sighand->refcount, 1, memory_order_acq_rel) == 1) {
         free(sighand);
     }
 }
@@ -709,15 +1538,26 @@ static int do_sigaction(int sig, const struct sigaction_ *action, struct sigacti
 }
 
 dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr, dword_t sigset_size) {
+    return sys_rt_sigaction_guest(signum, action_addr, oldaction_addr, sigset_size);
+}
+
+dword_t sys_rt_sigaction_guest(dword_t signum, guest_addr_t action_addr, guest_addr_t oldaction_addr, dword_t sigset_size) {
     if (sigset_size != sizeof(sigset_t_))
         return _EINVAL;
-    struct sigaction_ action, oldaction;
-    if (action_addr != 0)
-        if (user_get(action_addr, action))
-            return _EFAULT;
-    STRACE("rt_sigaction(%d, %#x {handler=%#x, flags=%#x, restorer=%#x, mask=%#llx}, 0x%x, %d)", signum,
-            action_addr, action.handler, action.flags, action.restorer,
-            (unsigned long long) action.mask, oldaction_addr, sigset_size);
+    struct sigaction_ action = {};
+    struct sigaction_ oldaction = {};
+    if (action_addr != 0) {
+        int err = sigaction_from_user(current, action_addr, &action);
+        if (err < 0)
+            return err;
+    }
+    STRACE("rt_sigaction(%d, %#llx {handler=%#llx, flags=%#llx, restorer=%#llx, mask=%#llx}, %#llx, %d)", signum,
+            (unsigned long long) action_addr,
+            (unsigned long long) action.handler,
+            (unsigned long long) action.flags,
+            (unsigned long long) action.restorer,
+            (unsigned long long) action.mask,
+            (unsigned long long) oldaction_addr, sigset_size);
 
     int err = do_sigaction(signum,
             action_addr ? &action : NULL,
@@ -725,9 +1565,11 @@ dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_ad
     if (err < 0)
         return err;
 
-    if (oldaction_addr != 0)
-        if (user_put(oldaction_addr, oldaction))
-            return _EFAULT;
+    if (oldaction_addr != 0) {
+        err = sigaction_to_user(current, oldaction_addr, &oldaction);
+        if (err < 0)
+            return err;
+    }
     return err;
 }
 
@@ -772,7 +1614,40 @@ static int do_sigprocmask(dword_t how, sigset_t_ set) {
     return 0;
 }
 
-dword_t sys_rt_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr, dword_t size) {
+dword_t sys_sigprocmask_guest(dword_t how, guest_addr_t set_addr, guest_addr_t oldset_addr) {
+    dword_t set32 = 0;
+    if (set_addr != 0)
+        if (user_get(set_addr, set32))
+            return _EFAULT;
+
+    STRACE("sigprocmask(%s, %#llx, %#x)",
+            how == SIG_BLOCK_ ? "SIG_BLOCK" :
+            how == SIG_UNBLOCK_ ? "SIG_UNBLOCK" :
+            how == SIG_SETMASK_ ? "SIG_SETMASK" : "??",
+            set_addr != 0 ? (unsigned long long) set32 : ~0ull,
+            oldset_addr);
+
+    if (oldset_addr != 0) {
+        dword_t oldset32 = (dword_t) current->blocked;
+        if (user_put(oldset_addr, oldset32))
+            return _EFAULT;
+    }
+    if (set_addr != 0) {
+        struct sighand *sighand = current->sighand;
+        lock(&sighand->lock, 0);
+        int err = do_sigprocmask(how, (sigset_t_) set32);
+        unlock(&sighand->lock);
+        if (err < 0)
+            return err;
+    }
+    return 0;
+}
+
+dword_t sys_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr) {
+    return sys_sigprocmask_guest(how, set_addr, oldset_addr);
+}
+
+dword_t sys_rt_sigprocmask_guest(dword_t how, guest_addr_t set_addr, guest_addr_t oldset_addr, dword_t size) {
     if (size != sizeof(sigset_t_))
         return _EINVAL;
 
@@ -800,8 +1675,16 @@ dword_t sys_rt_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr, dwo
     return 0;
 }
 
+dword_t sys_rt_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr, dword_t size) {
+    return sys_rt_sigprocmask_guest(how, set_addr, oldset_addr, size);
+}
+
 int_t sys_rt_sigpending(addr_t set_addr) {
-    STRACE("rt_sigpending(%#x)");
+    return sys_rt_sigpending_guest(set_addr);
+}
+
+int_t sys_rt_sigpending_guest(guest_addr_t set_addr) {
+    STRACE("rt_sigpending(%#llx)", (unsigned long long) set_addr);
     // as defined by the standard
     sigset_t_ pending = current->pending & current->blocked;
     if (user_put(set_addr, pending))
@@ -809,56 +1692,128 @@ int_t sys_rt_sigpending(addr_t set_addr) {
     return 0;
 }
 
-static bool is_on_altstack(dword_t sp, struct task *task) {
+static bool is_on_altstack(guest_addr_t sp, struct task *task) {
     return sp > task->altstack && sp <= task->altstack + task->altstack_size;
 }
 
-static void altstack_to_user(struct task *task, struct stack_t_ *user_stack) {
-    user_stack->stack = task->altstack;
-    user_stack->size = task->altstack_size;
-    user_stack->flags = 0;
-    if (task->altstack == 0)
-        user_stack->flags |= SS_DISABLE_;
-    if (is_on_altstack(task->cpu.esp, task))
-        user_stack->flags |= SS_ONSTACK_;
+static void restore_altstack(guest_addr_t sp, guest_addr_t stack, guest_addr_t size, dword_t flags) {
+    if (is_on_altstack(sp, current))
+        return;
+    if (flags & SS_DISABLE_) {
+        current->altstack = 0;
+        current->altstack_size = 0;
+        return;
+    }
+    if (size >= MINSIGSTKSZ_) {
+        current->altstack = stack;
+        current->altstack_size = size;
+    }
 }
 
-dword_t sys_sigaltstack(addr_t ss_addr, addr_t old_ss_addr) {
-    STRACE("sigaltstack(0x%x, 0x%x)", ss_addr, old_ss_addr);
+static dword_t current_altstack_flags(struct task *task) {
+    dword_t flags = 0;
+    if (task->altstack == 0)
+        flags |= SS_DISABLE_;
+    if (is_on_altstack(current_user_sp(task), task))
+        flags |= SS_ONSTACK_;
+    return flags;
+}
+
+static void altstack_to_i386_user(struct task *task, struct stack_t_ *user_stack) {
+    user_stack->stack = task->altstack;
+    user_stack->flags = current_altstack_flags(task);
+    user_stack->size = (dword_t) task->altstack_size;
+}
+
+static int altstack_to_user(struct task *task, guest_addr_t user_addr) {
+    dword_t flags = current_altstack_flags(task);
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct amd64_stack_t_marshaled user_stack = {
+            .stack = task->altstack,
+            .flags = flags,
+            .size = task->altstack_size,
+        };
+        if (user_put(user_addr, user_stack))
+            return _EFAULT;
+    } else {
+        struct stack_t_ user_stack = {
+            .stack = task->altstack,
+            .flags = flags,
+            .size = (dword_t) task->altstack_size,
+        };
+        if (user_put(user_addr, user_stack))
+            return _EFAULT;
+    }
+    return 0;
+}
+
+static int altstack_from_user(struct task *task, guest_addr_t user_addr, guest_addr_t *stack_out, guest_addr_t *size_out, dword_t *flags_out) {
+    if (task->abi == GUEST_ABI_AMD64) {
+        struct amd64_stack_t_marshaled user_stack;
+        if (user_get(user_addr, user_stack))
+            return _EFAULT;
+        *stack_out = user_stack.stack;
+        *size_out = user_stack.size;
+        *flags_out = user_stack.flags;
+    } else {
+        struct stack_t_ user_stack;
+        if (user_get(user_addr, user_stack))
+            return _EFAULT;
+        *stack_out = user_stack.stack;
+        *size_out = user_stack.size;
+        *flags_out = user_stack.flags;
+    }
+    return 0;
+}
+
+dword_t sys_sigaltstack(guest_addr_t ss_addr, guest_addr_t old_ss_addr) {
+    STRACE("sigaltstack(%#llx, %#llx)", (unsigned long long) ss_addr, (unsigned long long) old_ss_addr);
     struct sighand *sighand = current->sighand;
     lock(&sighand->lock, 0);
     if (old_ss_addr != 0) {
-        struct stack_t_ old_ss;
-        altstack_to_user(current, &old_ss);
-        if (user_put(old_ss_addr, old_ss)) {
+        if (altstack_to_user(current, old_ss_addr)) {
             unlock(&sighand->lock);
             return _EFAULT;
         }
     }
     if (ss_addr != 0) {
-        if (is_on_altstack(current->cpu.esp, current)) {
+        if (is_on_altstack(current_user_sp(current), current)) {
             unlock(&sighand->lock);
             return _EPERM;
         }
-        struct stack_t_ ss;
-        if (user_get(ss_addr, ss)) {
+        guest_addr_t stack;
+        guest_addr_t size;
+        dword_t flags;
+        int err = altstack_from_user(current, ss_addr, &stack, &size, &flags);
+        if (err < 0) {
             unlock(&sighand->lock);
-            return _EFAULT;
+            return err;
         }
-        if (ss.flags & SS_DISABLE_) {
+        if (flags & SS_DISABLE_) {
             current->altstack = 0;
+            current->altstack_size = 0;
         } else {
-            if (ss.size < MINSIGSTKSZ_)
+            if (size < MINSIGSTKSZ_) {
+                unlock(&sighand->lock);
                 return _ENOMEM;
-            current->altstack = ss.stack;
-            current->altstack_size = ss.size;
+            }
+            current->altstack = stack;
+            current->altstack_size = size;
         }
     }
     unlock(&sighand->lock);
     return 0;
 }
 
+dword_t sys_sigaltstack_guest(guest_addr_t ss_addr, guest_addr_t old_ss_addr) {
+    return sys_sigaltstack(ss_addr, old_ss_addr);
+}
+
 int_t sys_rt_sigsuspend(addr_t mask_addr, uint_t size) {
+    return sys_rt_sigsuspend_guest(mask_addr, size);
+}
+
+int_t sys_rt_sigsuspend_guest(guest_addr_t mask_addr, uint_t size) {
     if (size != sizeof(sigset_t_))
         return _EINVAL;
     sigset_t_ mask;
@@ -886,7 +1841,7 @@ int_t sys_pause(void) {
     return _EINTR;
 }
 
-static int_t sys_rt_sigtimedwait_common(addr_t set_addr, addr_t info_addr, addr_t timeout_addr, uint_t set_size,
+static int_t sys_rt_sigtimedwait_common(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size,
         bool timeout_time64) {
     if (set_size != sizeof(sigset_t_))
         return _EINVAL;
@@ -914,6 +1869,15 @@ static int_t sys_rt_sigtimedwait_common(addr_t set_addr, addr_t info_addr, addr_
     STRACE("sigtimedwait(%#llx, %#x, %#x) = ...\n", (long long) set, info_addr, timeout_addr);
 
     lock(&current->sighand->lock, 0);
+    struct siginfo_ info;
+    if (signal_take_next_locked(current, set, &info)) {
+        unlock(&current->sighand->lock);
+        if (info_addr != 0)
+            if (siginfo_to_user(current, info_addr, &info))
+                return _EFAULT;
+        STRACE("done sigtimedwait immediate = %d\n", info.sig);
+        return info.sig;
+    }
     assert(current->waiting == 0);
     current->waiting = set;
     int err = 0;
@@ -929,22 +1893,12 @@ static int_t sys_rt_sigtimedwait_common(addr_t set_addr, addr_t info_addr, addr_
         return _EAGAIN;
     }
 
-    struct sigqueue *sigqueue;
-    bool found = false;
-    list_for_each_entry(&current->queue, sigqueue, queue) {
-        if (sigset_has(set, sigqueue->info.sig)) {
-            found = true;
-            list_remove(&sigqueue->queue);
-            break;
-        }
-    }
+    bool found = signal_take_next_locked(current, set, &info);
     unlock(&current->sighand->lock);
     if (!found)
         return _EINTR;
-    struct siginfo_ info = sigqueue->info;
-    free(sigqueue);
     if (info_addr != 0)
-        if (user_put(info_addr, info))
+        if (siginfo_to_user(current, info_addr, &info))
             return _EFAULT;
     STRACE("done sigtimedwait = %d\n", info.sig);
     return info.sig;
@@ -954,7 +1908,15 @@ int_t sys_rt_sigtimedwait(addr_t set_addr, addr_t info_addr, addr_t timeout_addr
     return sys_rt_sigtimedwait_common(set_addr, info_addr, timeout_addr, set_size, false);
 }
 
+int_t sys_rt_sigtimedwait_guest(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size) {
+    return sys_rt_sigtimedwait_common(set_addr, info_addr, timeout_addr, set_size, false);
+}
+
 int_t sys_rt_sigtimedwait_time64(addr_t set_addr, addr_t info_addr, addr_t timeout_addr, uint_t set_size) {
+    return sys_rt_sigtimedwait_common(set_addr, info_addr, timeout_addr, set_size, true);
+}
+
+int_t sys_rt_sigtimedwait_time64_guest(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size) {
     return sys_rt_sigtimedwait_common(set_addr, info_addr, timeout_addr, set_size, true);
 }
 
@@ -977,36 +1939,130 @@ static int kill_task(struct task *task, dword_t sig) {
     return 0;
 }
 
+static int queue_signal_task(struct task *task, dword_t sig, struct siginfo_ info) {
+    if (!superuser() &&
+            current->uid != task->uid &&
+            current->uid != task->suid &&
+            current->euid != task->uid &&
+            current->euid != task->suid) {
+        return _EPERM;
+    }
+
+    send_signal(task, sig, info);
+    return 0;
+}
+
+struct kill_target {
+    struct task *task;
+};
+
 static int kill_group(pid_t_ pgid, dword_t sig) {
+    struct kill_target stack_targets[32];
+    struct kill_target *targets = stack_targets;
+    size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
+    size_t target_count = 0;
     struct pid *pid = pid_get(pgid);
     if (pid == NULL) {
         unlock(&pids_lock);
         return _ESRCH;
     }
-    struct tgroup *tgroup;
-    int err = _EPERM;
     while((task_ref_cnt_get(current, 0) > 1) || (locks_held_count(current))) { // Wait for now, task is in one or more critical sections, and/or has locks
         nanosleep(&lock_pause, NULL);
     }
+
+retry:
+    target_count = 0;
+    size_t needed = 0;
+    struct tgroup *tgroup;
+    list_for_each_entry(&pid->pgroup, tgroup, pgroup)
+        needed++;
+    if (needed > target_cap) {
+        unlock(&pids_lock);
+        if (targets != stack_targets)
+            free(targets);
+        targets = malloc(sizeof(*targets) * needed);
+        if (targets == NULL)
+            return _ENOMEM;
+        target_cap = needed;
+
+        complex_lockt(&pids_lock, 0);
+        pid = pid_get(pgid);
+        if (pid == NULL) {
+            unlock(&pids_lock);
+            free(targets);
+            return _ESRCH;
+        }
+        goto retry;
+    }
+
     list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-        int kill_err = kill_task(tgroup->leader, sig);
-        // killing a group should return an error only if no process can be signaled
+        struct task *task = tgroup->leader;
+        if (task == NULL || task->zombie || task->exiting)
+            continue;
+        task_ref_cnt_mod(task, 1);
+        targets[target_count++] = (struct kill_target) {.task = task};
+    }
+    unlock(&pids_lock);
+
+    int err = _EPERM;
+    for (size_t i = 0; i < target_count; i++) {
+        int kill_err = kill_task(targets[i].task, sig);
+        task_ref_cnt_mod(targets[i].task, -1);
         if (err == _EPERM)
             err = kill_err;
     }
+    if (targets != stack_targets)
+        free(targets);
     return err;
 }
 
 static int kill_everything(dword_t sig) {
-    int err = _EPERM;
+    struct kill_target stack_targets[64];
+    struct kill_target *targets = stack_targets;
+    size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
+    size_t target_count = 0;
+
+retry:
+    target_count = 0;
+    if (targets == NULL)
+        return _ENOMEM;
+
     for (int i = 2; i < MAX_PID; i++) {
         struct task *task = pid_get_task(i);
         if (task == NULL || task == current || !task_is_leader(task))
             continue;
-        int kill_err = kill_task(task, sig);
+        if (target_count == target_cap) {
+            unlock(&pids_lock);
+            size_t new_cap = target_cap * 2;
+            struct kill_target *new_targets = targets == stack_targets
+                ? malloc(sizeof(*new_targets) * new_cap)
+                : realloc(targets, sizeof(*new_targets) * new_cap);
+            if (new_targets == NULL) {
+                if (targets != stack_targets)
+                    free(targets);
+                return _ENOMEM;
+            }
+            if (targets == stack_targets)
+                memcpy(new_targets, stack_targets, sizeof(stack_targets));
+            targets = new_targets;
+            target_cap = new_cap;
+            complex_lockt(&pids_lock, 0);
+            goto retry;
+        }
+        task_ref_cnt_mod(task, 1);
+        targets[target_count++] = (struct kill_target) {.task = task};
+    }
+    unlock(&pids_lock);
+
+    int err = _EPERM;
+    for (size_t i = 0; i < target_count; i++) {
+        int kill_err = kill_task(targets[i].task, sig);
+        task_ref_cnt_mod(targets[i].task, -1);
         if (err == _EPERM)
             err = kill_err;
     }
+    if (targets != stack_targets)
+        free(targets);
     return err;
 }
 
@@ -1014,33 +2070,34 @@ static int do_kill(pid_t_ pid, dword_t sig, pid_t_ tgid) {
     STRACE("kill(%d, %d)", pid, sig);
     if (sig >= NUM_SIGS)
         return _EINVAL;
-    if (pid == 0)
+    if (pid == 0) {
+        lock(&current->group->lock, 0);
         pid = -current->group->pgid;
+        unlock(&current->group->lock);
+    }
 
     int err;
-    complex_lockt(&pids_lock, 0);
-
     if (pid == -1) {
+        complex_lockt(&pids_lock, 0);
         err = kill_everything(sig);
     } else if (pid < 0) {
+        complex_lockt(&pids_lock, 0);
         err = kill_group(-pid, sig);
     } else {
-        struct task *task = pid_get_task(pid);
+        struct task *task = pid_get_task_ref(pid);
         if (task == NULL) {
-            unlock(&pids_lock);
             return _ESRCH;
         }
 
         // If tgid is nonzero, it must be correct
         if (tgid != 0 && task->tgid != tgid) {
-            unlock(&pids_lock);
+            task_ref_cnt_mod(task, -1);
             return _ESRCH;
         }
 
         err = kill_task(task, sig);
+        task_ref_cnt_mod(task, -1);
     }
-
-    unlock(&pids_lock);
     return err;
 }
 
@@ -1056,4 +2113,63 @@ dword_t sys_tkill(pid_t_ tid, dword_t sig) {
     if (tid <= 0)
         return _EINVAL;
     return do_kill(tid, sig, 0);
+}
+
+dword_t sys_rt_sigqueueinfo(pid_t_ pid, dword_t sig, addr_t uinfo_addr) {
+    return sys_rt_sigqueueinfo_guest(pid, sig, uinfo_addr);
+}
+
+dword_t sys_rt_sigqueueinfo_guest(pid_t_ pid, dword_t sig, guest_addr_t uinfo_addr) {
+    if (pid <= 0 || sig <= 0 || sig >= NUM_SIGS)
+        return _EINVAL;
+
+    struct siginfo_ info;
+    int err = siginfo_from_user(current, uinfo_addr, &info);
+    if (err < 0)
+        return err;
+
+    info.sig = sig;
+    info.sig_errno = 0;
+    info.code = SI_QUEUE_;
+    info.rt.pid = current->pid;
+    info.rt.uid = current->uid;
+
+    struct task *task = pid_get_task_ref(pid);
+    if (task == NULL) {
+        return _ESRCH;
+    }
+
+    err = queue_signal_task(task, sig, info);
+    task_ref_cnt_mod(task, -1);
+    return err;
+}
+
+dword_t sys_rt_tgsigqueueinfo_guest(pid_t_ tgid, pid_t_ tid, dword_t sig, guest_addr_t uinfo_addr) {
+    if (tgid <= 0 || tid <= 0 || sig <= 0 || sig >= NUM_SIGS)
+        return _EINVAL;
+
+    struct siginfo_ info;
+    int err = siginfo_from_user(current, uinfo_addr, &info);
+    if (err < 0)
+        return err;
+
+    info.sig = sig;
+    info.sig_errno = 0;
+
+    struct task *task = pid_get_task_ref(tid);
+    if (task == NULL) {
+        return _ESRCH;
+    }
+    if (task->tgid != tgid) {
+        task_ref_cnt_mod(task, -1);
+        return _ESRCH;
+    }
+
+    err = queue_signal_task(task, sig, info);
+    task_ref_cnt_mod(task, -1);
+    return err;
+}
+
+dword_t sys_rt_tgsigqueueinfo(pid_t_ tgid, pid_t_ tid, dword_t sig, addr_t uinfo_addr) {
+    return sys_rt_tgsigqueueinfo_guest(tgid, tid, sig, uinfo_addr);
 }

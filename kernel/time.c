@@ -124,8 +124,80 @@ static struct timespec64_ timespec_to_guest64(struct timespec ts) {
     };
 }
 
+size_t guest_timeval_size(enum guest_abi abi) {
+    return abi == GUEST_ABI_AMD64 ? sizeof(struct amd64_timeval_) : sizeof(struct timeval_);
+}
+
+size_t guest_timespec_size(enum guest_abi abi) {
+    return abi == GUEST_ABI_AMD64 ? sizeof(struct timespec64_) : sizeof(struct timespec_);
+}
+
+int read_guest_timeval_abi(enum guest_abi abi, guest_addr_t addr, struct timeval *out) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_timeval_ guest;
+        if (user_get(addr, guest))
+            return _EFAULT;
+        out->tv_sec = guest.sec;
+        out->tv_usec = guest.usec;
+    } else {
+        struct timeval_ guest;
+        if (user_get(addr, guest))
+            return _EFAULT;
+        out->tv_sec = guest.sec;
+        out->tv_usec = guest.usec;
+    }
+    return 0;
+}
+
+int write_guest_timeval_abi(enum guest_abi abi, guest_addr_t addr, const struct timeval *in) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_timeval_ guest = {
+            .sec = in->tv_sec,
+            .usec = in->tv_usec,
+        };
+        if (user_put(addr, guest))
+            return _EFAULT;
+    } else {
+        struct timeval_ guest = {
+            .sec = (dword_t) in->tv_sec,
+            .usec = (dword_t) in->tv_usec,
+        };
+        if (user_put(addr, guest))
+            return _EFAULT;
+    }
+    return 0;
+}
+
+int read_guest_timespec_abi(enum guest_abi abi, guest_addr_t addr, struct timespec *out) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct timespec64_ guest;
+        if (user_get(addr, guest))
+            return _EFAULT;
+        *out = timespec_from_guest64(guest);
+    } else {
+        struct timespec_ guest;
+        if (user_get(addr, guest))
+            return _EFAULT;
+        *out = timespec_from_guest(guest);
+    }
+    return 0;
+}
+
+int write_guest_timespec_abi(enum guest_abi abi, guest_addr_t addr, const struct timespec *in) {
+    if (abi == GUEST_ABI_AMD64) {
+        struct timespec64_ guest = timespec_to_guest64(*in);
+        if (user_put(addr, guest))
+            return _EFAULT;
+    } else {
+        struct timespec_ guest = timespec_to_guest(*in);
+        if (user_put(addr, guest))
+            return _EFAULT;
+    }
+    return 0;
+}
+
 static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespec req,
-        addr_t rem_addr, bool rem_time64) {
+        guest_addr_t rem_addr, bool rem_time64) {
     clockid_t clock_id;
     if (clockid_to_real(clock, &clock_id))
         return _EINVAL;
@@ -141,9 +213,23 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
             return 0;
     }
 
+    bool trace_short_sleep = req.tv_sec >= 0 && req.tv_sec <= 2;
+    if (trace_short_sleep) {
+        printk("INFO: wait clock_nanosleep enter pid=%d comm=%s clock=%u flags=%#x req=%llds.%09ld rem=%#x\n",
+               current != NULL ? current->pid : -1,
+               current != NULL ? current->comm : "?",
+               clock, flags, (long long) req.tv_sec, req.tv_nsec, rem_addr);
+    }
+
     int res;
     TASK_MAY_BLOCK {
         res = nanosleep(&req, &rem);
+    }
+    if (trace_short_sleep) {
+        printk("INFO: wait clock_nanosleep exit pid=%d comm=%s res=%d rem=%llds.%09ld\n",
+               current != NULL ? current->pid : -1,
+               current != NULL ? current->comm : "?",
+               res, (long long) rem.tv_sec, rem.tv_nsec);
     }
     if (res < 0)
         return errno_map();
@@ -163,14 +249,36 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
 }
 
 dword_t sys_clock_nanosleep(dword_t clock_id, int_t flags, addr_t req_addr, addr_t rem_addr) {
-    struct timespec_ req_ts;
-    if (user_get(req_addr, req_ts))
+    return sys_clock_nanosleep_guest(clock_id, flags, req_addr, rem_addr);
+}
+
+static dword_t sys_clock_nanosleep_guest_abi(dword_t clock_id, int_t flags, guest_addr_t req_addr,
+        guest_addr_t rem_addr, enum guest_abi abi) {
+    struct timespec req_ts;
+    if (read_guest_timespec_abi(abi, req_addr, &req_ts))
         return _EFAULT;
-    STRACE("clock_nanosleep(%d, %#x, {%u, %u}, %#x)", clock_id, flags, req_ts.sec, req_ts.nsec, rem_addr);
-    return clock_nanosleep_common(clock_id, flags, timespec_from_guest(req_ts), rem_addr, false);
+    STRACE("clock_nanosleep(%d, %#x, {%lld, %ld}, %#x)", clock_id, flags,
+            (long long) req_ts.tv_sec, req_ts.tv_nsec, rem_addr);
+    return clock_nanosleep_common(clock_id, flags, req_ts, rem_addr, abi == GUEST_ABI_AMD64);
+}
+
+dword_t sys_clock_nanosleep_guest(dword_t clock_id, int_t flags, guest_addr_t req_addr, guest_addr_t rem_addr) {
+    return sys_clock_nanosleep_guest_abi(clock_id, flags, req_addr, rem_addr, GUEST_ABI_I386);
+}
+
+dword_t sys_clock_nanosleep_amd64(dword_t clock_id, int_t flags, addr_t req_addr, addr_t rem_addr) {
+    return sys_clock_nanosleep_guest_abi(clock_id, flags, req_addr, rem_addr, GUEST_ABI_AMD64);
+}
+
+dword_t sys_clock_nanosleep_amd64_guest(dword_t clock_id, int_t flags, guest_addr_t req_addr, guest_addr_t rem_addr) {
+    return sys_clock_nanosleep_guest_abi(clock_id, flags, req_addr, rem_addr, GUEST_ABI_AMD64);
 }
 
 dword_t sys_clock_nanosleep_time64(dword_t clock_id, int_t flags, addr_t req_addr, addr_t rem_addr) {
+    return sys_clock_nanosleep_time64_guest(clock_id, flags, req_addr, rem_addr);
+}
+
+dword_t sys_clock_nanosleep_time64_guest(dword_t clock_id, int_t flags, guest_addr_t req_addr, guest_addr_t rem_addr) {
     struct timespec64_ req_ts;
     if (user_get(req_addr, req_ts))
         return _EFAULT;
@@ -180,7 +288,9 @@ dword_t sys_clock_nanosleep_time64(dword_t clock_id, int_t flags, addr_t req_add
 }
 
 dword_t sys_ppoll_time64(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t sigmask_addr, dword_t sigsetsize) {
-    int timeout = -1;
+    struct timespec timeout_ts = {};
+    const struct timespec *timeout_ptr = NULL;
+    int timeout_ms = -1;
     if (timeout_addr != 0) {
         struct timespec64_ timeout_timespec;
         if (user_get(timeout_addr, timeout_timespec))
@@ -188,8 +298,11 @@ dword_t sys_ppoll_time64(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t s
         if (timeout_timespec.sec < 0 || timeout_timespec.nsec < 0 || timeout_timespec.nsec >= 1000000000)
             return _EINVAL;
 
-        int64_t timeout_ms = timeout_timespec.sec * 1000 + timeout_timespec.nsec / 1000000;
-        timeout = timeout_ms > INT_MAX ? INT_MAX : (int) timeout_ms;
+        int64_t timeout_ms64 = timeout_timespec.sec * 1000 + timeout_timespec.nsec / 1000000;
+        timeout_ms = timeout_ms64 > INT_MAX ? INT_MAX : (int) timeout_ms64;
+        timeout_ts.tv_sec = timeout_timespec.sec;
+        timeout_ts.tv_nsec = timeout_timespec.nsec;
+        timeout_ptr = &timeout_ts;
     }
 
     sigset_t_ mask;
@@ -201,15 +314,37 @@ dword_t sys_ppoll_time64(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t s
         sigmask_set_temp(mask);
     }
 
-    return sys_poll(fds, nfds, timeout);
+    return sys_poll_common(fds, nfds, timeout_ptr, timeout_ms);
 }
 
 dword_t sys_time(addr_t time_out) {
-    dword_t now = (dword_t)time(NULL);
-    if (time_out != 0)
-        if (user_put(time_out, now))
-            return _EFAULT;
+    qword_t now = sys_time_guest(time_out);
+    if ((dword_t) now != now)
+        return _EOVERFLOW;
+    return (dword_t) now;
+}
+
+qword_t sys_time_guest(guest_addr_t time_out) {
+    qword_t now = (qword_t) time(NULL);
+    if (time_out != 0) {
+        dword_t now32 = (dword_t) now;
+        if (user_put(time_out, now32))
+            return (qword_t) (sqword_t) _EFAULT;
+    }
     return now;
+}
+
+qword_t sys_time_amd64_guest(guest_addr_t time_out) {
+    qword_t now = (qword_t) time(NULL);
+    if (time_out != 0) {
+        if (user_put(time_out, now))
+            return (qword_t) (sqword_t) _EFAULT;
+    }
+    return now;
+}
+
+qword_t sys_time_amd64(addr_t time_out) {
+    return sys_time_amd64_guest(time_out);
 }
 
 dword_t sys_stime(addr_t UNUSED(time)) {
@@ -217,6 +352,10 @@ dword_t sys_stime(addr_t UNUSED(time)) {
 }
 
 dword_t sys_clock_gettime(dword_t clock, addr_t tp) {
+    return sys_clock_gettime_guest(clock, tp);
+}
+
+static dword_t sys_clock_gettime_guest_abi(dword_t clock, guest_addr_t tp, enum guest_abi abi) {
     STRACE("clock_gettime(%d, 0x%x)", clock, tp);
 
     struct timespec ts;
@@ -232,15 +371,28 @@ dword_t sys_clock_gettime(dword_t clock, addr_t tp) {
         if (err < 0)
             return errno_map();
     }
-    struct timespec_ t = timespec_to_guest(ts);
-    
-    if (user_put(tp, t))
+    if (write_guest_timespec_abi(abi, tp, &ts))
         return _EFAULT;
-    STRACE(" {%lds %ldns}", t.sec, t.nsec);
     return 0;
 }
 
+dword_t sys_clock_gettime_guest(dword_t clock, guest_addr_t tp) {
+    return sys_clock_gettime_guest_abi(clock, tp, GUEST_ABI_I386);
+}
+
+dword_t sys_clock_gettime_amd64(dword_t clock, addr_t tp) {
+    return sys_clock_gettime_guest_abi(clock, tp, GUEST_ABI_AMD64);
+}
+
+dword_t sys_clock_gettime_amd64_guest(dword_t clock, guest_addr_t tp) {
+    return sys_clock_gettime_guest_abi(clock, tp, GUEST_ABI_AMD64);
+}
+
 dword_t sys_clock_gettime64(dword_t clock, addr_t tp) {
+    return sys_clock_gettime64_guest(clock, tp);
+}
+
+dword_t sys_clock_gettime64_guest(dword_t clock, guest_addr_t tp) {
     STRACE("clock_gettime64(%d, 0x%x)", clock, tp);
 
     struct timespec ts;
@@ -266,6 +418,10 @@ dword_t sys_clock_gettime64(dword_t clock, addr_t tp) {
 
 
 dword_t sys_clock_getres(dword_t clock, addr_t res_addr) {
+    return sys_clock_getres_guest(clock, res_addr);
+}
+
+static dword_t sys_clock_getres_guest_abi(dword_t clock, guest_addr_t res_addr, enum guest_abi abi) {
     STRACE("clock_getres(%d, %#x)", clock, res_addr);
     clockid_t clock_id;
     if (clockid_to_real(clock, &clock_id)) return _EINVAL;
@@ -274,13 +430,28 @@ dword_t sys_clock_getres(dword_t clock, addr_t res_addr) {
     int err = clock_getres(clock_id, &res);
     if (err < 0)
         return errno_map();
-    struct timespec_ t = timespec_to_guest(res);
-    if (user_put(res_addr, t))
+    if (write_guest_timespec_abi(abi, res_addr, &res))
         return _EFAULT;
     return 0;
 }
 
+dword_t sys_clock_getres_guest(dword_t clock, guest_addr_t res_addr) {
+    return sys_clock_getres_guest_abi(clock, res_addr, GUEST_ABI_I386);
+}
+
+dword_t sys_clock_getres_amd64(dword_t clock, addr_t res_addr) {
+    return sys_clock_getres_guest_abi(clock, res_addr, GUEST_ABI_AMD64);
+}
+
+dword_t sys_clock_getres_amd64_guest(dword_t clock, guest_addr_t res_addr) {
+    return sys_clock_getres_guest_abi(clock, res_addr, GUEST_ABI_AMD64);
+}
+
 dword_t sys_clock_getres_time64(dword_t clock, addr_t res_addr) {
+    return sys_clock_getres_time64_guest(clock, res_addr);
+}
+
+dword_t sys_clock_getres_time64_guest(dword_t clock, guest_addr_t res_addr) {
     STRACE("clock_getres_time64(%d, %#x)", clock, res_addr);
     clockid_t clock_id;
     if (clockid_to_real(clock, &clock_id))
@@ -346,18 +517,46 @@ static long itimer_set(struct tgroup *group, int which, struct timer_spec spec, 
     return timer_set(group->itimer, spec, old_spec);
 }
 
-long sys_setitimer(int_t which, addr_t new_val_addr, addr_t old_val_addr) {
-    struct itimerval_ val;
-    if (user_get(new_val_addr, val))
-        return _EFAULT;
-    STRACE("setitimer(%d, {%ds %dus, %ds %dus}, 0x%x)", which, val.value.sec, val.value.usec, val.interval.sec, val.interval.usec, old_val_addr);
+struct amd64_itimerval_ {
+    struct amd64_timeval_ interval;
+    struct amd64_timeval_ value;
+};
 
-    struct timer_spec spec = {
-        .interval.tv_sec = val.interval.sec,
-        .interval.tv_nsec = val.interval.usec * 1000,
-        .value.tv_sec = val.value.sec,
-        .value.tv_nsec = val.value.usec * 1000,
-    };
+long sys_setitimer(int_t which, addr_t new_val_addr, addr_t old_val_addr) {
+    return sys_setitimer_guest(which, new_val_addr, old_val_addr);
+}
+
+static long sys_setitimer_guest_abi(int_t which, guest_addr_t new_val_addr, guest_addr_t old_val_addr,
+        enum guest_abi abi) {
+    struct timer_spec spec = {};
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_itimerval_ val;
+        if (user_get(new_val_addr, val))
+            return _EFAULT;
+        STRACE("setitimer(%d, {%llds %lldus, %llds %lldus}, %#llx)", which,
+                (long long) val.value.sec, (long long) val.value.usec,
+                (long long) val.interval.sec, (long long) val.interval.usec,
+                (unsigned long long) old_val_addr);
+        spec = (struct timer_spec) {
+            .interval.tv_sec = val.interval.sec,
+            .interval.tv_nsec = val.interval.usec * 1000,
+            .value.tv_sec = val.value.sec,
+            .value.tv_nsec = val.value.usec * 1000,
+        };
+    } else {
+        struct itimerval_ val;
+        if (user_get(new_val_addr, val))
+            return _EFAULT;
+        STRACE("setitimer(%d, {%ds %dus, %ds %dus}, %#llx)", which,
+                val.value.sec, val.value.usec, val.interval.sec, val.interval.usec,
+                (unsigned long long) old_val_addr);
+        spec = (struct timer_spec) {
+            .interval.tv_sec = val.interval.sec,
+            .interval.tv_nsec = val.interval.usec * 1000,
+            .value.tv_sec = val.value.sec,
+            .value.tv_nsec = val.value.usec * 1000,
+        };
+    }
     struct timer_spec old_spec;
 
     struct tgroup *group = current->group;
@@ -368,16 +567,40 @@ long sys_setitimer(int_t which, addr_t new_val_addr, addr_t old_val_addr) {
         return err;
 
     if (old_val_addr != 0) {
-        struct itimerval_ old_val;
-        old_val.interval.sec = (dword_t)old_spec.interval.tv_sec;
-        old_val.interval.usec = (dword_t)old_spec.interval.tv_nsec / 1000;
-        old_val.value.sec = (dword_t)old_spec.value.tv_sec;
-        old_val.value.usec = (dword_t)old_spec.value.tv_nsec / 1000;
-        if (user_put(old_val_addr, old_val))
-            return _EFAULT;
+        if (abi == GUEST_ABI_AMD64) {
+            struct amd64_itimerval_ old_val = {
+                .interval.sec = old_spec.interval.tv_sec,
+                .interval.usec = old_spec.interval.tv_nsec / 1000,
+                .value.sec = old_spec.value.tv_sec,
+                .value.usec = old_spec.value.tv_nsec / 1000,
+            };
+            if (user_put(old_val_addr, old_val))
+                return _EFAULT;
+        } else {
+            struct itimerval_ old_val = {
+                .interval.sec = (dword_t) old_spec.interval.tv_sec,
+                .interval.usec = (dword_t) old_spec.interval.tv_nsec / 1000,
+                .value.sec = (dword_t) old_spec.value.tv_sec,
+                .value.usec = (dword_t) old_spec.value.tv_nsec / 1000,
+            };
+            if (user_put(old_val_addr, old_val))
+                return _EFAULT;
+        }
     }
 
     return 0;
+}
+
+long sys_setitimer_guest(int_t which, guest_addr_t new_val_addr, guest_addr_t old_val_addr) {
+    return sys_setitimer_guest_abi(which, new_val_addr, old_val_addr, GUEST_ABI_I386);
+}
+
+long sys_setitimer_amd64(int_t which, addr_t new_val_addr, addr_t old_val_addr) {
+    return sys_setitimer_guest_abi(which, new_val_addr, old_val_addr, GUEST_ABI_AMD64);
+}
+
+long sys_setitimer_amd64_guest(int_t which, guest_addr_t new_val_addr, guest_addr_t old_val_addr) {
+    return sys_setitimer_guest_abi(which, new_val_addr, old_val_addr, GUEST_ABI_AMD64);
 }
 
 long sys_alarm(uint_t seconds) {
@@ -407,30 +630,51 @@ long sys_alarm(uint_t seconds) {
 }
 
 dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
-    struct timespec_ req_ts;
-    if (user_get(req_addr, req_ts))
+    return sys_nanosleep_guest(req_addr, rem_addr);
+}
+
+static dword_t sys_nanosleep_guest_abi(guest_addr_t req_addr, guest_addr_t rem_addr, enum guest_abi abi) {
+    struct timespec req_ts;
+    if (read_guest_timespec_abi(abi, req_addr, &req_ts))
         return _EFAULT;
-    STRACE("nanosleep({%d, %d}, 0x%x", req_ts.sec, req_ts.nsec, rem_addr);
-    struct timespec req;
-    req.tv_sec = req_ts.sec;
-    req.tv_nsec = req_ts.nsec;
+    STRACE("nanosleep({%lld, %ld}, 0x%x", (long long) req_ts.tv_sec, req_ts.tv_nsec, rem_addr);
+    bool trace_short_sleep = req_ts.tv_sec >= 0 && req_ts.tv_sec <= 2;
+    if (trace_short_sleep) {
+        printk("INFO: wait nanosleep enter pid=%d comm=%s req=%llds.%09ld rem=%#x\n",
+               current != NULL ? current->pid : -1,
+               current != NULL ? current->comm : "?",
+               (long long) req_ts.tv_sec, req_ts.tv_nsec, rem_addr);
+    }
     struct timespec rem;
-   // rem.tv_sec = 0; // Be anal and set both to zero.  -mke
+   // rem.tv_sec = 0;
     //rem.tv_nsec = 0;
     int res = 0;
     TASK_MAY_BLOCK {
-        res = nanosleep(&req, &rem);
+        res = nanosleep(&req_ts, &rem);
+    }
+    if (trace_short_sleep) {
+        printk("INFO: wait nanosleep exit pid=%d comm=%s res=%d rem=%llds.%09ld\n",
+               current != NULL ? current->pid : -1,
+               current != NULL ? current->comm : "?",
+               res, (long long) rem.tv_sec, rem.tv_nsec);
     }
     if (res < 0)
         return errno_map();
-    if (rem_addr != 0) {
-        struct timespec_ rem_ts;
-        rem_ts.sec = (dword_t)rem.tv_sec;
-        rem_ts.nsec = (dword_t)rem.tv_nsec;
-        if (user_put(rem_addr, rem_ts))
-            return _EFAULT;
-    }
+    if (rem_addr != 0 && write_guest_timespec_abi(abi, rem_addr, &rem))
+        return _EFAULT;
     return 0;
+}
+
+dword_t sys_nanosleep_guest(guest_addr_t req_addr, guest_addr_t rem_addr) {
+    return sys_nanosleep_guest_abi(req_addr, rem_addr, GUEST_ABI_I386);
+}
+
+dword_t sys_nanosleep_amd64(addr_t req_addr, addr_t rem_addr) {
+    return sys_nanosleep_guest_abi(req_addr, rem_addr, GUEST_ABI_AMD64);
+}
+
+dword_t sys_nanosleep_amd64_guest(guest_addr_t req_addr, guest_addr_t rem_addr) {
+    return sys_nanosleep_guest_abi(req_addr, rem_addr, GUEST_ABI_AMD64);
 }
 
 dword_t sys_times(addr_t tbuf) {
@@ -448,6 +692,10 @@ dword_t sys_times(addr_t tbuf) {
     return 0;
 }
 
+dword_t sys_times_guest(guest_addr_t tbuf) {
+    return sys_times(tbuf);
+}
+
 dword_t sys_gettimeofday(addr_t tv, addr_t tz) {
     STRACE("gettimeofday(0x%x, 0x%x)", tv, tz);
     struct timeval timeval;
@@ -455,16 +703,37 @@ dword_t sys_gettimeofday(addr_t tv, addr_t tz) {
     if (gettimeofday(&timeval, &timezone) < 0) {
         return errno_map();
     }
-    struct timeval_ tv_;
     struct timezone_ tz_;
-    tv_.sec = (dword_t)timeval.tv_sec;
-    tv_.usec = (dword_t)timeval.tv_usec;
     tz_.minuteswest = timezone.tz_minuteswest;
     tz_.dsttime = timezone.tz_dsttime;
-    if ((tv && user_put(tv, tv_)) || (tz && user_put(tz, tz_))) {
+    if ((tv && write_guest_timeval_abi(GUEST_ABI_I386, tv, &timeval)) || (tz && user_put(tz, tz_))) {
         return _EFAULT;
     }
     return 0;
+}
+
+dword_t sys_gettimeofday_guest(guest_addr_t tv, guest_addr_t tz) {
+    return sys_gettimeofday(tv, tz);
+}
+
+dword_t sys_gettimeofday_amd64(addr_t tv, addr_t tz) {
+    STRACE("gettimeofday(0x%x, 0x%x)", tv, tz);
+    struct timeval timeval;
+    struct timezone timezone;
+    if (gettimeofday(&timeval, &timezone) < 0) {
+        return errno_map();
+    }
+    struct timezone_ tz_;
+    tz_.minuteswest = timezone.tz_minuteswest;
+    tz_.dsttime = timezone.tz_dsttime;
+    if ((tv && write_guest_timeval_abi(GUEST_ABI_AMD64, tv, &timeval)) || (tz && user_put(tz, tz_))) {
+        return _EFAULT;
+    }
+    return 0;
+}
+
+dword_t sys_gettimeofday_amd64_guest(guest_addr_t tv, guest_addr_t tz) {
+    return sys_gettimeofday_amd64(tv, tz);
 }
 
 dword_t sys_settimeofday(addr_t UNUSED(tv), addr_t UNUSED(tz)) {
@@ -480,29 +749,50 @@ static void posix_timer_callback(struct posix_timer *timer) {
         .timer.overrun = 0,
         .timer.value = timer->sig_value,
     };
-    lock(&pids_lock,0);
     struct task *thread = NULL;
     if (timer->thread_pid != 0) {
-        thread = pid_get_task(timer->thread_pid);
+        thread = pid_get_task_ref(timer->thread_pid);
     } else if (timer->tgroup->leader != NULL) {
         // SIGEV_SIGNAL targets the process, so fall back to the thread-group leader.
         thread = timer->tgroup->leader;
+        task_ref_cnt_mod(thread, 1);
     }
     if (time_warning_trace_enabled())
         printk("WARNING: posix_timer_callback timer_id=%d signal=%d thread_pid=%d target_pid=%d found=%d\n",
                timer->timer_id, timer->signal, timer->thread_pid,
                thread != NULL ? thread->pid : 0, thread != NULL);
     // TODO: solve pid reuse. currently we have two ways of referring to a task: pid_t_ and struct task *. pids get reused. task struct pointers get freed on exit or reap. need a third option for cases like this, like a refcount layer.
-    if (thread != NULL)
+    if (thread != NULL) {
         send_signal(thread, timer->signal, info);
-    unlock(&pids_lock);
+        task_ref_cnt_mod(thread, -1);
+    }
 }
 
 #define SIGEV_SIGNAL_ 0
 #define SIGEV_NONE_ 1
 #define SIGEV_THREAD_ID_ 4
 
+struct i386_sigevent_marshaled {
+    union i386_sigval_ value;
+    int_t signo;
+    int_t method;
+    pid_t_ tid;
+};
+
+struct amd64_sigevent_marshaled {
+    union sigval_ value;
+    int_t signo;
+    int_t method;
+    pid_t_ tid;
+    dword_t __pad;
+};
+
 int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
+    return sys_timer_create_guest(clock, sigevent_addr, timer_addr);
+}
+
+static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_addr, guest_addr_t timer_addr,
+        enum guest_abi abi) {
     STRACE("timer_create(%d, %#x, %#x)", clock, sigevent_addr, timer_addr);
     if (time_warning_trace_enabled())
         printk("WARNING: timer_create pid=%d tgid=%d comm=%s clock=%u sigevent=%#x timer_addr=%#x\n",
@@ -510,19 +800,39 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
     clockid_t real_clockid;
     if (clockid_to_real(clock, &real_clockid))
         return _EINVAL;
-    struct sigevent_ sigev;
-    if (user_get(sigevent_addr, sigev))
-        return _EFAULT;
+    struct sigevent_ sigev = {};
+    if (abi == GUEST_ABI_AMD64) {
+        struct amd64_sigevent_marshaled user_sigev;
+        if (user_get(sigevent_addr, user_sigev))
+            return _EFAULT;
+        sigev = (struct sigevent_) {
+            .value = user_sigev.value,
+            .signo = user_sigev.signo,
+            .method = user_sigev.method,
+            .tid = user_sigev.tid,
+        };
+    } else {
+        struct i386_sigevent_marshaled user_sigev;
+        if (user_get(sigevent_addr, user_sigev))
+            return _EFAULT;
+        dword_t raw_value = 0;
+        memcpy(&raw_value, &user_sigev.value, sizeof(raw_value));
+        sigev = (struct sigevent_) {
+            .value.sv_ptr = raw_value,
+            .signo = user_sigev.signo,
+            .method = user_sigev.method,
+            .tid = user_sigev.tid,
+        };
+    }
     if (sigev.method != SIGEV_SIGNAL_ && sigev.method != SIGEV_NONE_ && sigev.method != SIGEV_THREAD_ID_)
         return _EINVAL;
 
     if (sigev.method == SIGEV_THREAD_ID_) {
-        lock(&pids_lock,0);
-        if (pid_get_task(sigev.tid) == NULL) {
-            unlock(&pids_lock);
+        struct task *target = pid_get_task_ref(sigev.tid);
+        if (target == NULL) {
             return _EINVAL;
         }
-        unlock(&pids_lock);
+        task_ref_cnt_mod(target, -1);
     }
 
     struct tgroup *group = current->group;
@@ -558,7 +868,19 @@ int_t sys_timer_create(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
     return 0;
 }
 
-static int_t sys_timer_gettime_common(dword_t timer_id, addr_t curr_value_addr, bool time64) {
+int_t sys_timer_create_guest(dword_t clock, guest_addr_t sigevent_addr, guest_addr_t timer_addr) {
+    return sys_timer_create_guest_abi(clock, sigevent_addr, timer_addr, GUEST_ABI_I386);
+}
+
+int_t sys_timer_create_amd64(dword_t clock, addr_t sigevent_addr, addr_t timer_addr) {
+    return sys_timer_create_guest_abi(clock, sigevent_addr, timer_addr, GUEST_ABI_AMD64);
+}
+
+int_t sys_timer_create_amd64_guest(dword_t clock, guest_addr_t sigevent_addr, guest_addr_t timer_addr) {
+    return sys_timer_create_guest_abi(clock, sigevent_addr, timer_addr, GUEST_ABI_AMD64);
+}
+
+static int_t sys_timer_gettime_common(dword_t timer_id, guest_addr_t curr_value_addr, bool time64) {
     STRACE("timer_gettime(%d, %#x)", timer_id, curr_value_addr);
     if (timer_id >= TIMERS_MAX)
         return _EINVAL;
@@ -595,6 +917,10 @@ static int_t sys_timer_gettime_common(dword_t timer_id, addr_t curr_value_addr, 
 }
 
 int_t sys_timer_gettime(dword_t timer_id, addr_t curr_value_addr) {
+    return sys_timer_gettime_guest(timer_id, curr_value_addr);
+}
+
+int_t sys_timer_gettime_guest(dword_t timer_id, guest_addr_t curr_value_addr) {
     return sys_timer_gettime_common(timer_id, curr_value_addr, false);
 }
 
@@ -611,7 +937,8 @@ int_t sys_timer_getoverrun(dword_t timer_id) {
     return 0;
 }
 
-static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, addr_t new_value_addr, addr_t old_value_addr,
+static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, guest_addr_t new_value_addr,
+        guest_addr_t old_value_addr,
         bool time64) {
     STRACE("timer_settime(%d, %d, %#x, %#x)", timer_id, flags, new_value_addr, old_value_addr);
     if (time_warning_trace_enabled())
@@ -664,14 +991,26 @@ static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, addr_t new_
 }
 
 int_t sys_timer_settime(dword_t timer_id, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
+    return sys_timer_settime_guest(timer_id, flags, new_value_addr, old_value_addr);
+}
+
+int_t sys_timer_settime_guest(dword_t timer_id, int_t flags, guest_addr_t new_value_addr, guest_addr_t old_value_addr) {
     return sys_timer_settime_common(timer_id, flags, new_value_addr, old_value_addr, false);
 }
 
 int_t sys_timer_settime64(dword_t timer_id, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
+    return sys_timer_settime64_guest(timer_id, flags, new_value_addr, old_value_addr);
+}
+
+int_t sys_timer_settime64_guest(dword_t timer_id, int_t flags, guest_addr_t new_value_addr, guest_addr_t old_value_addr) {
     return sys_timer_settime_common(timer_id, flags, new_value_addr, old_value_addr, true);
 }
 
 int_t sys_timer_gettime64(dword_t timer_id, addr_t curr_value_addr) {
+    return sys_timer_gettime64_guest(timer_id, curr_value_addr);
+}
+
+int_t sys_timer_gettime64_guest(dword_t timer_id, guest_addr_t curr_value_addr) {
     return sys_timer_gettime_common(timer_id, curr_value_addr, true);
 }
 
@@ -739,7 +1078,8 @@ static struct timer_spec timerfd_current_spec(struct fd *fd) {
     return spec;
 }
 
-static int_t sys_timerfd_settime_common(fd_t f, int_t flags, addr_t new_value_addr, addr_t old_value_addr,
+static int_t sys_timerfd_settime_common(fd_t f, int_t flags, guest_addr_t new_value_addr,
+        guest_addr_t old_value_addr,
         bool time64) {
     STRACE("timerfd_settime(%d, %d, %#x, %#x)", f, flags, new_value_addr, old_value_addr);
     if (time_warning_trace_enabled())
@@ -791,14 +1131,22 @@ static int_t sys_timerfd_settime_common(fd_t f, int_t flags, addr_t new_value_ad
 }
 
 int_t sys_timerfd_settime(fd_t f, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
+    return sys_timerfd_settime_guest(f, flags, new_value_addr, old_value_addr);
+}
+
+int_t sys_timerfd_settime_guest(fd_t f, int_t flags, guest_addr_t new_value_addr, guest_addr_t old_value_addr) {
     return sys_timerfd_settime_common(f, flags, new_value_addr, old_value_addr, false);
 }
 
 int_t sys_timerfd_settime64(fd_t f, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
+    return sys_timerfd_settime64_guest(f, flags, new_value_addr, old_value_addr);
+}
+
+int_t sys_timerfd_settime64_guest(fd_t f, int_t flags, guest_addr_t new_value_addr, guest_addr_t old_value_addr) {
     return sys_timerfd_settime_common(f, flags, new_value_addr, old_value_addr, true);
 }
 
-static int_t sys_timerfd_gettime_common(fd_t f, addr_t curr_value_addr, bool time64) {
+static int_t sys_timerfd_gettime_common(fd_t f, guest_addr_t curr_value_addr, bool time64) {
     STRACE("timerfd_gettime(%d, %#x)", f, curr_value_addr);
     struct fd *fd;
     int err = timerfd_lookup(f, &fd);
@@ -818,10 +1166,18 @@ static int_t sys_timerfd_gettime_common(fd_t f, addr_t curr_value_addr, bool tim
 }
 
 int_t sys_timerfd_gettime(fd_t f, addr_t curr_value_addr) {
+    return sys_timerfd_gettime_guest(f, curr_value_addr);
+}
+
+int_t sys_timerfd_gettime_guest(fd_t f, guest_addr_t curr_value_addr) {
     return sys_timerfd_gettime_common(f, curr_value_addr, false);
 }
 
 int_t sys_timerfd_gettime64(fd_t f, addr_t curr_value_addr) {
+    return sys_timerfd_gettime64_guest(f, curr_value_addr);
+}
+
+int_t sys_timerfd_gettime64_guest(fd_t f, guest_addr_t curr_value_addr) {
     return sys_timerfd_gettime_common(f, curr_value_addr, true);
 }
 

@@ -19,27 +19,117 @@ extern dword_t extra_lock_pid;
 extern const char extra_lock_comm;
 
 static void proc_pid_getname(struct proc_entry *entry, char *buf) {
-    sprintf(buf, "%d", entry->pid);
+    snprintf(buf, 256, "%d", entry->pid);
 }
 
-static char proc_task_state_char(struct task *task) {
-    return (task->zombie ? 'Z' :
-            task->group->stopped ? 'T' :
-            task->io_block && task->pid != current->pid ? 'S' :
+static char proc_task_state_char_from_snapshot(pid_t_ pid, bool zombie, bool io_block, bool stopped) {
+    return (zombie ? 'Z' :
+            stopped ? 'T' :
+            io_block && pid != current->pid ? 'S' :
             'R');
 }
 
 static struct task *proc_get_task(struct proc_entry *entry) {
-    complex_lockt(&pids_lock, 1);
-    struct task *task = pid_get_task(entry->pid);
-    if (task != NULL)
-        task_ref_cnt_mod(task, 1);
-    unlock(&pids_lock);
-    return task;
+    return pid_get_task_ref(entry->pid);
 }
 static void proc_put_task(struct task *task) {
     if (task != NULL)
         task_ref_cnt_mod(task, -1);
+}
+
+static struct mm *proc_task_mm_retain(struct task *task) {
+    struct mm *mm = NULL;
+    lock(&task->general_lock, 0);
+    if (task->mm != NULL) {
+        mm = task->mm;
+        mm_retain(mm);
+    }
+    unlock(&task->general_lock);
+    return mm;
+}
+
+static struct fdtable *proc_task_files_retain(struct task *task) {
+    struct fdtable *files = NULL;
+    lock(&task->general_lock, 0);
+    if (task->files != NULL)
+        files = fdtable_retain(task->files);
+    unlock(&task->general_lock);
+    return files;
+}
+
+static struct fs_info *proc_task_fs_retain(struct task *task) {
+    struct fs_info *fs = NULL;
+    lock(&task->general_lock, 0);
+    if (task->fs != NULL)
+        fs = fs_info_retain(task->fs);
+    unlock(&task->general_lock);
+    return fs;
+}
+
+static int proc_pid_copy_user_range(struct task *task, struct mem *mem, addr_t start,
+                                    size_t size, struct proc_data *buf) {
+    if (mem == NULL || size == 0)
+        return 0;
+
+    char *data = malloc(size);
+    if (data == NULL)
+        return _ENOMEM;
+
+    if (user_read_task_mem(task, mem, start, data, size) == 0)
+        proc_buf_append(buf, data, size);
+    free(data);
+    return 0;
+}
+
+static int proc_pid_copy_cmdline_range(struct task *task, struct mem *mem, addr_t start,
+                                       size_t size, addr_t env_start, addr_t env_end,
+                                       struct proc_data *buf) {
+    if (mem == NULL || size == 0)
+        return 0;
+
+    char *data = malloc(size);
+    if (data == NULL)
+        return _ENOMEM;
+    if (user_read_task_mem(task, mem, start, data, size) == 0) {
+        char *first_nul = memchr(data, '\0', size);
+        if (first_nul != NULL && first_nul > data) {
+            size_t title_len = first_nul - data;
+            bool has_tail = false;
+            for (char *p = first_nul + 1; p < data + size; p++) {
+                if (*p != '\0') {
+                    has_tail = true;
+                    break;
+                }
+            }
+            if (has_tail && memchr(data, ':', title_len) != NULL) {
+                proc_buf_append(buf, data, title_len);
+                proc_buf_append(buf, "\0", 1);
+                free(data);
+                return 0;
+            }
+        }
+
+        size_t visible = size;
+        if (data[size - 1] != '\0' && env_end > env_start) {
+            visible = strnlen(data, size);
+            if (visible == size) {
+                size_t env_size = env_end - env_start;
+                char *expanded = realloc(data, size + env_size);
+                if (expanded == NULL) {
+                    free(data);
+                    return _ENOMEM;
+                }
+                data = expanded;
+                if (user_read_task_mem(task, mem, env_start, data + size, env_size) == 0)
+                    visible = strnlen(data, size + env_size);
+                else
+                    visible = size;
+            }
+        }
+        proc_buf_append(buf, data, visible);
+    }
+    free(data);
+    return 0;
 }
 
 // Get user and system CPU time for a task's thread, in jiffies (USER_HZ = 100).
@@ -66,22 +156,10 @@ static void proc_task_cpu_time(struct task *task, unsigned long *out_utime, unsi
 }
 
 // Count the number of mapped pages in a mem.
-// Intentionally lock-free: second-level pgdir tables are never freed until
-// mem_destroy (impossible while caller holds a task ref), so the worst case is
-// a slightly stale count, which is fine for monitoring via /proc.
+// Intentionally lock-free: the count is only used for /proc reporting, so a
+// slightly stale snapshot is acceptable.
 static size_t proc_mem_count_pages(struct mem *mem) {
-    if (mem == NULL)
-        return 0;
-    size_t count = 0;
-    for (int i = 0; i < MEM_PGDIR_SIZE; i++) {
-        struct pt_entry *pgdir = mem->pgdir[i];
-        if (pgdir == NULL) continue;
-        for (int j = 0; j < MEM_PGDIR_SIZE; j++) {
-            if (pgdir[j].data != NULL)
-                count++;
-        }
-    }
-    return count;
+    return mem_mapped_page_count(mem);
 }
 
 static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
@@ -95,26 +173,84 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     unsigned long utime_jiffies, stime_jiffies;
     proc_task_cpu_time(task, &utime_jiffies, &stime_jiffies);
 
-    size_t page_count = proc_mem_count_pages(task->mem);
+    struct mm *mm = proc_task_mm_retain(task);
+    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
+    pid_t_ pid = 0;
+    char comm[sizeof(task->comm) + 1];
+    char proc_state = 'R';
+    pid_t_ parent_pid = 0;
+    pid_t_ pgid = 0;
+    pid_t_ sid = 0;
+    dword_t tty_dev = 0;
+    int tty_fg_group = 0;
+    long thread_count = 0;
+    addr_t stack_start = 0;
+    addr_t start_brk = 0;
+    addr_t argv_start = 0;
+    addr_t argv_end = 0;
+    addr_t env_start = 0;
+    addr_t env_end = 0;
+    sigset_t_ pending = 0;
+    sigset_t_ blocked = 0;
+    int exit_signal = 0;
+    bool zombie = false;
+    bool io_block = false;
 
     lock(&task->general_lock, 0);
+    if (mm != NULL) {
+        stack_start = (addr_t)mm->stack_start;
+        start_brk = (addr_t)mm->start_brk;
+        argv_start = (addr_t)mm->argv_start;
+        argv_end = (addr_t)mm->argv_end;
+        env_start = (addr_t)mm->env_start;
+        env_end = (addr_t)mm->env_end;
+    }
+    pid = task->pid;
+    strncpy(comm, task->comm, sizeof(task->comm));
+    comm[sizeof(task->comm)] = '\0';
+    unlock(&task->general_lock);
+
+    complex_lockt(&pids_lock, 1);
     lock(&task->group->lock, 0);
-    // lock(&task->sighand->lock); //mkemke.  Evil, but I'm tired of trying to track down why this is getting munged for now.
+    bool stopped = task->group->stopped;
+    pgid = task->group->pgid;
+    sid = task->group->sid;
+    struct tty *tty = task->group->tty;
+    if (tty != NULL) {
+        lock(&tty->lock, 0);
+        tty_dev = dev_make(tty->driver->major, tty->num);
+        tty_fg_group = tty->fg_group;
+        unlock(&tty->lock);
+    } else {
+        tty_dev = 0;
+        tty_fg_group = 0;
+    }
+    unlock(&task->group->lock);
 
     // program reads this using read-like syscall, so we are in blocking area,
     // which means its io_block is set to true. When a proc reads an
     // information about itself, but it shouldn't be marked as blocked.
-    char proc_state = proc_task_state_char(task);
-    
-    proc_printf(buf, "%d ", task->pid);
-    proc_printf(buf, "(%.16s) ", task->comm);
+    parent_pid = task->parent ? task->parent->pid : 0;
+    thread_count = list_size(&task->group->threads);
+    pending = task->pending;
+    blocked = task->blocked;
+    exit_signal = task->exit_signal;
+    zombie = task->zombie;
+    io_block = task->io_block;
+    unlock(&pids_lock);
+    if (mm != NULL)
+        mm_release(mm);
+
+    proc_state = proc_task_state_char_from_snapshot(pid, zombie, io_block, stopped);
+
+    proc_printf(buf, "%d ", pid);
+    proc_printf(buf, "(%.16s) ", comm);
     proc_printf(buf, "%c ", proc_state);
-    proc_printf(buf, "%d ", task->parent ? task->parent->pid : 0);
-    proc_printf(buf, "%d ", task->group->pgid);
-    proc_printf(buf, "%d ", task->group->sid);
-    struct tty *tty = task->group->tty;
-    proc_printf(buf, "%d ", tty ? dev_make(tty->driver->major, tty->num) : 0);
-    proc_printf(buf, "%d ", tty ? tty->fg_group : 0);
+    proc_printf(buf, "%d ", parent_pid);
+    proc_printf(buf, "%d ", pgid);
+    proc_printf(buf, "%d ", sid);
+    proc_printf(buf, "%d ", tty_dev);
+    proc_printf(buf, "%d ", tty_fg_group);
     proc_printf(buf, "%u ", 0); // flags
 
     // page faults (no data available)
@@ -131,7 +267,7 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
 
     proc_printf(buf, "%ld ", 20l); // priority (not adjustable)
     proc_printf(buf, "%ld ", 0l); // nice (also not adjustable)
-    proc_printf(buf, "%ld ", list_size(&task->group->threads));
+    proc_printf(buf, "%ld ", thread_count);
     proc_printf(buf, "%ld ", 0l); // itimer value (deprecated, always 0)
     proc_printf(buf, "%lld ", 0ll); // jiffies on process start
 
@@ -142,13 +278,13 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     // bunch of shit that can only be accessed by a debugger
     proc_printf(buf, "%lu ", 0l); // startcode
     proc_printf(buf, "%lu ", 0l); // endcode
-    proc_printf(buf, "%lu ", task->mm ? task->mm->stack_start : 0);
+    proc_printf(buf, "%lu ", stack_start);
     proc_printf(buf, "%lu ", 0l); // kstkesp
     proc_printf(buf, "%lu ", 0l); // kstkeip
 
-    proc_printf(buf, "%lu ", (unsigned long) task->pending & 0xffffffff);
-    proc_printf(buf, "%lu ", (unsigned long) task->blocked & 0xffffffff);
-    /* uint32_t ignored = 0; // MKEMKEMKE try enabling this at some point
+    proc_printf(buf, "%lu ", (unsigned long) pending & 0xffffffff);
+    proc_printf(buf, "%lu ", (unsigned long) blocked & 0xffffffff);
+    /* uint32_t ignored = 0; // Try enabling this at some point.
     uint32_t caught = 0;
     for (int i = 0; i < 32; i++) {
         if (task->sighand->action[i].handler == SIG_IGN_)
@@ -164,7 +300,7 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%lu ", 0l); // wchan (wtf)
     proc_printf(buf, "%lu ", 0l); // nswap
     proc_printf(buf, "%lu ", 0l); // cnswap
-    proc_printf(buf, "%d ", task->exit_signal);
+    proc_printf(buf, "%d ", exit_signal);
     proc_printf(buf, "%d ", 0); // processor
 
     // htop and similar procfs consumers expect the modern trailing fields too.
@@ -177,17 +313,14 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%ld ", 0l); // cguest_time
     proc_printf(buf, "%lu ", 0ul); // start_data
     proc_printf(buf, "%lu ", 0ul); // end_data
-    proc_printf(buf, "%lu ", task->mm ? task->mm->start_brk : 0); // start_brk
-    proc_printf(buf, "%lu ", task->mm ? task->mm->argv_start : 0); // arg_start
-    proc_printf(buf, "%lu ", task->mm ? task->mm->argv_end : 0); // arg_end
-    proc_printf(buf, "%lu ", task->mm ? task->mm->env_start : 0); // env_start
-    proc_printf(buf, "%lu ", task->mm ? task->mm->env_end : 0); // env_end
+    proc_printf(buf, "%lu ", start_brk); // start_brk
+    proc_printf(buf, "%lu ", argv_start); // arg_start
+    proc_printf(buf, "%lu ", argv_end); // arg_end
+    proc_printf(buf, "%lu ", env_start); // env_start
+    proc_printf(buf, "%lu ", env_end); // env_end
     proc_printf(buf, "%d", 0); // exit_code
     proc_printf(buf, "\n");
-    
-    //unlock(&task->sighand->lock);
-    unlock(&task->group->lock);
-    unlock(&task->general_lock);
+
     proc_put_task(task);
     return 0;
 }
@@ -198,7 +331,10 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
         proc_put_task(task);
         return _ESRCH;
     }
-    size_t page_count = proc_mem_count_pages(task->mem);
+    struct mm *mm = proc_task_mm_retain(task);
+    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
+    if (mm != NULL)
+        mm_release(mm);
     proc_put_task(task);
     proc_printf(buf, "%lu ", (unsigned long)page_count); // size (total pages)
     proc_printf(buf, "%lu ", (unsigned long)page_count); // resident (same, no swap)
@@ -218,19 +354,24 @@ static int proc_pid_auxv_show(struct proc_entry *entry, struct proc_data *buf) {
     }
     // FIXME: Increment task->reference.count
     int err = 0;
+    struct mm *mm = NULL;
+    addr_t start = 0;
+    size_t size = 0;
     lock(&task->general_lock, 0);
     if (task->mm == NULL)
         goto out_free_task;
 
-    size_t size = task->mm->auxv_end - task->mm->auxv_start;
-    char *data = malloc(size);
-    if (data == NULL) {
-        err = _ENOMEM;
-        goto out_free_task;
-    }
-    if (user_read_task(task, task->mm->auxv_start, data, size) == 0)
-        proc_buf_append(buf, data, size);
-    free(data);
+    start = task->mm->auxv_start;
+    size = task->mm->auxv_end - start;
+    mm = task->mm;
+    mm_retain(mm);
+    unlock(&task->general_lock);
+
+    err = proc_pid_copy_user_range(task, &mm->mem, start, size, buf);
+    mm_release(mm);
+    proc_put_task(task);
+    // FIXME: Decrement task->reference.count
+    return err;
 
 out_free_task:
     unlock(&task->general_lock);
@@ -247,25 +388,51 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     }
     
     int err = 0;
+    struct mm *mm = NULL;
+    addr_t start = 0;
+    addr_t env_start = 0;
+    addr_t env_end = 0;
+    size_t size = 0;
     lock(&task->general_lock, 0);
     
     if (task->mm == NULL)
         goto out_free_task;
 
-    size_t size = task->mm->argv_end - task->mm->argv_start;
-    char *data = malloc(size);
-    if (data == NULL) {
-        err = _ENOMEM;
-        goto out_free_task;
-    }
-    if (user_read_task(task, task->mm->argv_start, data, size) == 0) // Crashed here on Saturday May 28th -mke
-        proc_buf_append(buf, data, size);  //mkemke crashed here Monday May 9th 2022 -mke
-    free(data);
+    start = task->mm->argv_start;
+    size = task->mm->argv_end - start;
+    env_start = task->mm->env_start;
+    env_end = task->mm->env_end;
+    mm = task->mm;
+    mm_retain(mm);
+    unlock(&task->general_lock);
+
+    err = proc_pid_copy_cmdline_range(task, &mm->mem, start, size, env_start, env_end, buf);
+    mm_release(mm);
+    proc_put_task(task);
+    return err;
     
 out_free_task:
     unlock(&task->general_lock);
     proc_put_task(task);
     return err;
+}
+
+static int proc_pid_comm_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct task *task = proc_get_task(entry);
+    if ((task == NULL) || (task->exiting == true)) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+
+    char name[sizeof(task->comm) + 1];
+    lock(&task->general_lock, 0);
+    strncpy(name, task->comm, sizeof(task->comm));
+    name[sizeof(task->comm)] = '\0';
+    unlock(&task->general_lock);
+
+    proc_printf(buf, "%s\n", name);
+    proc_put_task(task);
+    return 0;
 }
 
 static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf) {
@@ -276,19 +443,23 @@ static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf
     }
 
     int err = 0;
+    struct mm *mm = NULL;
+    addr_t start = 0;
+    size_t size = 0;
     lock(&task->general_lock, 0);
     if (task->mm == NULL)
         goto out_free_task;
 
-    size_t size = task->mm->env_end - task->mm->env_start;
-    char *data = malloc(size);
-    if (data == NULL) {
-        err = _ENOMEM;
-        goto out_free_task;
-    }
-    if (user_read_task(task, task->mm->env_start, data, size) == 0)
-        proc_buf_append(buf, data, size);
-    free(data);
+    start = task->mm->env_start;
+    size = task->mm->env_end - start;
+    mm = task->mm;
+    mm_retain(mm);
+    unlock(&task->general_lock);
+
+    err = proc_pid_copy_user_range(task, &mm->mem, start, size, buf);
+    mm_release(mm);
+    proc_put_task(task);
+    return err;
 
 out_free_task:
     unlock(&task->general_lock);
@@ -304,22 +475,44 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     }
 
     pid_t_ ppid = 0;
+    bool zombie = false;
+    bool io_block = false;
+    sigset_t_ pending = 0;
+    sigset_t_ blocked = 0;
+    unsigned long thread_count = 0;
     complex_lockt(&pids_lock, 0);
     if (task->parent != NULL)
         ppid = task->parent->pid;
+    zombie = task->zombie;
+    io_block = task->io_block;
+    pending = task->pending;
+    blocked = task->blocked;
+    thread_count = list_size(&task->group->threads);
     unlock(&pids_lock);
 
-    size_t page_count = proc_mem_count_pages(task->mem);
+    struct mm *mm = proc_task_mm_retain(task);
+    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
+    if (mm != NULL)
+        mm_release(mm);
+    struct fdtable *files = proc_task_files_retain(task);
+    unsigned fd_size = 0;
+    if (files != NULL) {
+        lock(&files->lock, 0);
+        fd_size = files->size;
+        unlock(&files->lock);
+        fdtable_release(files);
+    }
     unsigned long vm_kb = (unsigned long)(page_count * (PAGE_SIZE / 1024));
 
     lock(&task->general_lock, 0);
     lock(&task->group->lock, 0);
+    bool stopped = task->group->stopped;
 
     unsigned cpu_count = get_cpu_count();
     unsigned allowed_mask = cpu_count >= 31 ? 0x7fffffffU : ((1U << cpu_count) - 1U);
 
     proc_printf(buf, "Name:\t%s\n", task->comm);
-    proc_printf(buf, "State:\t%c\n", proc_task_state_char(task));
+    proc_printf(buf, "State:\t%c\n", proc_task_state_char_from_snapshot(task->pid, zombie, io_block, stopped));
     proc_printf(buf, "Tgid:\t%d\n", task->tgid);
     proc_printf(buf, "Ngid:\t0\n");
     proc_printf(buf, "Pid:\t%d\n", task->pid);
@@ -327,7 +520,7 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     proc_printf(buf, "TracerPid:\t0\n");
     proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", task->uid, task->euid, task->suid, task->fsuid);
     proc_printf(buf, "Gid:\t%u\t%u\t%u\t%u\n", task->gid, task->egid, task->sgid, task->fsgid);
-    proc_printf(buf, "FDSize:\t%u\n", task->files ? task->files->size : 0);
+    proc_printf(buf, "FDSize:\t%u\n", fd_size);
     proc_printf(buf, "Groups:\t");
     for (unsigned i = 0; i < task->ngroups; i++)
         proc_printf(buf, "%s%u", i == 0 ? "" : " ", task->groups[i]);
@@ -338,11 +531,11 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     proc_printf(buf, "VmPin:\t0 kB\n");
     proc_printf(buf, "VmHWM:\t%lu kB\n", vm_kb);
     proc_printf(buf, "VmRSS:\t%lu kB\n", vm_kb);
-    proc_printf(buf, "Threads:\t%lu\n", list_size(&task->group->threads));
+    proc_printf(buf, "Threads:\t%lu\n", thread_count);
     proc_printf(buf, "SigQ:\t0/0\n");
-    proc_printf(buf, "SigPnd:\t%08x\n", task->pending);
+    proc_printf(buf, "SigPnd:\t%08x\n", pending);
     proc_printf(buf, "ShdPnd:\t00000000\n");
-    proc_printf(buf, "SigBlk:\t%08x\n", task->blocked);
+    proc_printf(buf, "SigBlk:\t%08x\n", blocked);
     proc_printf(buf, "SigIgn:\t00000000\n");
     proc_printf(buf, "SigCgt:\t00000000\n");
     proc_printf(buf, "CapInh:\t%08x%08x\n", task->cap_inheritable[1], task->cap_inheritable[0]);
@@ -375,8 +568,12 @@ static int proc_pid_sched_show(struct proc_entry *entry, struct proc_data *buf) 
         return _ESRCH;
     }
 
-    lock(&task->group->lock, 0);
-    proc_printf(buf, "%s (%d, #threads: %lu)\n", task->comm, task->pid, list_size(&task->group->threads));
+    unsigned long thread_count = 0;
+    complex_lockt(&pids_lock, 0);
+    thread_count = list_size(&task->group->threads);
+    unlock(&pids_lock);
+
+    proc_printf(buf, "%s (%d, #threads: %lu)\n", task->comm, task->pid, thread_count);
     proc_printf(buf, "---------------------------------------------------------\n");
     proc_printf(buf, "se.exec_start                                : 0.000000\n");
     proc_printf(buf, "se.vruntime                                  : 0.000000\n");
@@ -384,31 +581,31 @@ static int proc_pid_sched_show(struct proc_entry *entry, struct proc_data *buf) 
     proc_printf(buf, "nr_switches                                  : 0\n");
     proc_printf(buf, "nr_voluntary_switches                        : 0\n");
     proc_printf(buf, "nr_involuntary_switches                      : 0\n");
-    unlock(&task->group->lock);
     proc_put_task(task);
     return 0;
 }
 
 void proc_maps_dump(struct task *task, struct proc_data *buf) {
-    struct mem *mem = task->mem;
+    struct mm *mm = proc_task_mm_retain(task);
+    struct mem *mem = mm ? &mm->mem : NULL;
     if (mem == NULL)
         return;
 
-    read_lock(&mem->lock);
+    mem_read_lock_quiesce_aware(mem);
     page_t page = 0;
-    while (page < MEM_PAGES) {
+    while (page < mem->page_limit) {
         // find a region
-        while (page < MEM_PAGES && mem_pt(mem, page) == NULL) {
+        while (page < mem->page_limit && mem_pt(mem, page) == NULL) {
             mem_next_page(mem, &page);
         }
-        if (page >= MEM_PAGES)
+        if (page >= mem->page_limit)
             break;
         page_t start = page;
         struct pt_entry *start_pt = mem_pt(mem, start);
         struct data *data = start_pt->data;
 
         // find the end of said region
-        while (page < MEM_PAGES) {
+        while (page < mem->page_limit) {
             struct pt_entry *pt = mem_pt(mem, page);
             if (pt == NULL)
                 break;
@@ -431,8 +628,8 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
         } else if (data->fd != NULL) {
             generic_getpath(start_pt->data->fd, path);
         }
-        proc_printf(buf, "%08x-%08x %c%c%c%c %08lx 00:00 %-10d %s\n",
-                start << PAGE_BITS, end << PAGE_BITS,
+        proc_printf(buf, "%08llx-%08llx %c%c%c%c %08lx 00:00 %-10d %s\n",
+                (unsigned long long) (start << PAGE_BITS), (unsigned long long) (end << PAGE_BITS),
                 start_pt->flags & P_READ ? 'r' : '-',
                 start_pt->flags & P_WRITE ? 'w' : '-',
                 start_pt->flags & P_EXEC ? 'x' : '-',
@@ -441,7 +638,8 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
                 0, // inode
                 path);
     }
-    read_unlock(&mem->lock);
+    mem_read_unlock_quiesce_aware(mem);
+    mm_release(mm);
 }
 
 static int proc_pid_maps_show(struct proc_entry *entry, struct proc_data *buf) {
@@ -459,11 +657,13 @@ static ssize_t proc_pid_mem_pread(struct proc_entry *entry, struct proc_data *bu
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
-    if (task->mem == NULL) {
+    struct mm *mm = proc_task_mm_retain(task);
+    if (mm == NULL) {
         proc_put_task(task);
         return _ESRCH;
     }
-    int result = user_read_task(task, (addr_t)offset, buf->data, buf->size);
+    int result = user_read_task_mem(task, &mm->mem, (addr_t)offset, buf->data, buf->size);
+    mm_release(mm);
     proc_put_task(task);
     return result ? -1 : buf->size;
 }
@@ -472,11 +672,13 @@ static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *b
     struct task *task = proc_get_task(entry);
     if (task == NULL)
         return _ESRCH;
-    if (task->mem == NULL) {
+    struct mm *mm = proc_task_mm_retain(task);
+    if (mm == NULL) {
         proc_put_task(task);
         return _ESRCH;
     }
-    int result = user_write_task_ptrace(task, (addr_t)offset, buf->data, buf->size);
+    int result = user_write_task_ptrace_mem(task, &mm->mem, (addr_t)offset, buf->data, buf->size);
+    mm_release(mm);
     proc_put_task(task);
     return result ? -1 : buf->size;
 }
@@ -487,37 +689,49 @@ static struct proc_dir_entry proc_pid_fdinfo_entry;
 
 static bool proc_pid_fd_readdir(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry) {
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true) || task->files == NULL) {
+    if ((task == NULL) || (task->exiting == true)) {
         proc_put_task(task);
         return _ESRCH;
     }
-    lock(&task->files->lock, 0);
-    while (*index < task->files->size && task->files->files[*index] == NULL)
+    struct fdtable *files = proc_task_files_retain(task);
+    if (files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    lock(&files->lock, 0);
+    while (*index < files->size && files->files[*index] == NULL)
         (*index)++;
     fd_t f = (*index)++;
-    bool any_left = (unsigned) f < task->files->size;
-    unlock(&task->files->lock);
+    bool any_left = (unsigned) f < files->size;
+    unlock(&files->lock);
+    fdtable_release(files);
     proc_put_task(task);
     *next_entry = (struct proc_entry) {&proc_pid_fd, .pid = entry->pid, .fd = f};
     return any_left;
 }
 
 static void proc_pid_fd_getname(struct proc_entry *entry, char *buf) {
-    sprintf(buf, "%d", entry->fd);
+    snprintf(buf, 256, "%d", entry->fd);
 }
 
 static bool proc_pid_fdinfo_readdir(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry) {
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true) || task->files == NULL) {
+    if ((task == NULL) || (task->exiting == true)) {
         proc_put_task(task);
         return _ESRCH;
     }
-    lock(&task->files->lock, 0);
-    while (*index < task->files->size && task->files->files[*index] == NULL)
+    struct fdtable *files = proc_task_files_retain(task);
+    if (files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    lock(&files->lock, 0);
+    while (*index < files->size && files->files[*index] == NULL)
         (*index)++;
     fd_t f = (*index)++;
-    bool any_left = (unsigned) f < task->files->size;
-    unlock(&task->files->lock);
+    bool any_left = (unsigned) f < files->size;
+    unlock(&files->lock);
+    fdtable_release(files);
     proc_put_task(task);
     *next_entry = (struct proc_entry) {&proc_pid_fdinfo_entry, .pid = entry->pid, .fd = f};
     return any_left;
@@ -525,61 +739,81 @@ static bool proc_pid_fdinfo_readdir(struct proc_entry *entry, unsigned long *ind
 
 static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true) || task->files == NULL) {
+    if ((task == NULL) || (task->exiting == true)) {
         proc_put_task(task);
         return _ESRCH;
     }
-    lock(&task->files->lock, 0);
-    struct fd *fd = fdtable_get(task->files, entry->fd);
+    struct fdtable *files = proc_task_files_retain(task);
+    if (files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    lock(&files->lock, 0);
+    struct fd *fd = fdtable_get(files, entry->fd);
+    if (fd != NULL)
+        fd = fd_retain(fd);
+    unlock(&files->lock);
+    fdtable_release(files);
     int err = fd == NULL ? _ENOENT : generic_getpath(fd, buf);
-    unlock(&task->files->lock);
+    if (fd != NULL)
+        fd_close(fd);
     proc_put_task(task);
     return err;
 }
 
 static int proc_pid_fdinfo_show(struct proc_entry *entry, struct proc_data *buf) {
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true) || task->files == NULL) {
+    if ((task == NULL) || (task->exiting == true)) {
         proc_put_task(task);
         return _ESRCH;
     }
-    lock(&task->files->lock, 0);
-    struct fd *fd = fdtable_get(task->files, entry->fd);
+    struct fdtable *files = proc_task_files_retain(task);
+    if (files == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    lock(&files->lock, 0);
+    struct fd *fd = fdtable_get(files, entry->fd);
     if (fd == NULL) {
-        unlock(&task->files->lock);
+        unlock(&files->lock);
+        fdtable_release(files);
         proc_put_task(task);
         return _ENOENT;
     }
+    fd = fd_retain(fd);
+    unlock(&files->lock);
+    fdtable_release(files);
     proc_printf(buf, "pos:\t%lu\n", fd->offset);
     proc_printf(buf, "flags:\t0%o\n", fd_getflags(fd));
     proc_printf(buf, "mnt_id:\t1\n");
-    unlock(&task->files->lock);
+    fd_close(fd);
     proc_put_task(task);
     return 0;
 }
 
 static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
-  //  task->mm->exefile->refcount++;  // Always note interest as soon as possible
-    if ((task == NULL) || task->exiting == true || task->mm == NULL || task->mm->exefile == NULL) {
+    if (task == NULL || task->exiting == true) {
         proc_put_task(task);
         return _ESRCH;
     }
     lock(&task->general_lock, 0);
-    int err = generic_getpath(task->mm->exefile, buf);
-   // task->mm->exefile->refcount--;
+    struct fd *fd = NULL;
+    if (task->mm != NULL && task->mm->exefile != NULL)
+        fd = fd_retain(task->mm->exefile);
     unlock(&task->general_lock);
+    if (fd == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    int err = generic_getpath(fd, buf);
+    fd_close(fd);
     proc_put_task(task);
     return err;
 }
 
 static void proc_pid_task_getname(struct proc_entry *entry, char *buf) {
-    sprintf(buf, "%d", entry->pid);
-}
-
-static int proc_pid_task_readlink(struct proc_entry *entry, char *buf) {
-    sprintf(buf, "/proc/%d", entry->pid);
-    return 0;
+    snprintf(buf, 256, "%d", entry->pid);
 }
 
 static struct proc_dir_entry proc_pid_task;
@@ -592,28 +826,44 @@ static bool proc_pid_task_readdir(struct proc_entry *entry, unsigned long *index
 
 static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
-    if (task == NULL || task->fs == NULL) {
+    if (task == NULL || task->exiting == true) {
         proc_put_task(task);
         return _ESRCH;
     }
-    complex_lockt(&task->fs->lock, 0);
-
-    int err = generic_getpath(task->fs->pwd, buf);
-    unlock(&task->fs->lock);
+    struct fs_info *fs = proc_task_fs_retain(task);
+    if (fs == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    complex_lockt(&fs->lock, 0);
+    struct fd *pwd = fs->pwd ? fd_retain(fs->pwd) : NULL;
+    unlock(&fs->lock);
+    fs_info_release(fs);
+    int err = pwd == NULL ? _ESRCH : generic_getpath(pwd, buf);
+    if (pwd != NULL)
+        fd_close(pwd);
     proc_put_task(task);
     return err;
 }
 
 static int proc_pid_root_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
-    if (task == NULL || task->fs == NULL) {
+    if (task == NULL || task->exiting == true) {
         proc_put_task(task);
         return _ESRCH;
     }
-    complex_lockt(&task->fs->lock, 0);
-
-    int err = generic_getpath(task->fs->root, buf);
-    unlock(&task->fs->lock);
+    struct fs_info *fs = proc_task_fs_retain(task);
+    if (fs == NULL) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    complex_lockt(&fs->lock, 0);
+    struct fd *root = fs->root ? fd_retain(fs->root) : NULL;
+    unlock(&fs->lock);
+    fs_info_release(fs);
+    int err = root == NULL ? _ESRCH : generic_getpath(root, buf);
+    if (root != NULL)
+        fd_close(root);
     proc_put_task(task);
     return err;
 }
@@ -622,6 +872,7 @@ struct proc_children proc_pid_children = PROC_CHILDREN({
     {"auxv", .show = proc_pid_auxv_show},
     {"cgroup", .show = proc_pid_cgroup_show},
     {"cmdline", .show = proc_pid_cmdline_show},
+    {"comm", .show = proc_pid_comm_show},
     {"cwd", S_IFLNK, .readlink = proc_pid_cwd_readlink},
     {"environ", .show = proc_pid_environ_show},
     {"exe", S_IFLNK, .readlink = proc_pid_exe_readlink},
@@ -647,5 +898,25 @@ static struct proc_dir_entry proc_pid_fd = {NULL, S_IFLNK,
 static struct proc_dir_entry proc_pid_fdinfo_entry = {NULL, S_IFREG,
     .getname = proc_pid_fd_getname, .show = proc_pid_fdinfo_show};
 
-static struct proc_dir_entry proc_pid_task = {NULL, S_IFLNK,
-    .getname = proc_pid_task_getname, .readlink = proc_pid_task_readlink};
+static struct proc_dir_entry proc_pid_task = {NULL, S_IFDIR,
+    .children = &proc_pid_children, .getname = proc_pid_task_getname};
+
+void proc_pid_init(void) {
+    struct proc_dir_entry *fd_dir;
+    struct proc_dir_entry *fdinfo_dir;
+    struct proc_dir_entry *task_dir;
+
+    proc_set_children_parent(&proc_pid_children, &proc_pid);
+
+    fd_dir = proc_children_find(&proc_pid_children, "fd");
+    if (fd_dir != NULL)
+        proc_pid_fd.parent = fd_dir;
+
+    fdinfo_dir = proc_children_find(&proc_pid_children, "fdinfo");
+    if (fdinfo_dir != NULL)
+        proc_pid_fdinfo_entry.parent = fdinfo_dir;
+
+    task_dir = proc_children_find(&proc_pid_children, "task");
+    if (task_dir != NULL)
+        proc_pid_task.parent = task_dir;
+}

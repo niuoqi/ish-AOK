@@ -1,6 +1,7 @@
 #include <sys/utsname.h>
 #include <string.h>
 #include "kernel/calls.h"
+#include "task.h"
 #include "platform/platform.h"
 
 #if __linux__
@@ -33,7 +34,7 @@ void do_uname(struct uname *uts) {
     char hostname[sizeof(uts->hostname)];
     get_current_hostname(hostname, sizeof(hostname));
     
-    // Get current date and format it in a sane way.  -mke
+    // Get current date and format it in a sane way.
     char build_date[100];
     time_t now = time(NULL);
     if (now == (time_t)-1) {
@@ -52,7 +53,10 @@ void do_uname(struct uname *uts) {
     const char *uname_version = "iSH-AOK"; // Version should be defined or externally managed
 
     // Fill the uname structure
-    strncpy(uts->arch, "i686", sizeof(uts->arch));
+    const char *machine = "i686";
+    if (current != NULL)
+        machine = task_abi_desc(current).uname_machine;
+    strncpy(uts->arch, machine, sizeof(uts->arch));
     strncpy(uts->domain, "(none)", sizeof(uts->domain));
     strncpy(uts->release, "4.20.69-ish_aok", sizeof(uts->release));
     strncpy(uts->system, "Linux", sizeof(uts->system));
@@ -61,6 +65,10 @@ void do_uname(struct uname *uts) {
 }
 
 dword_t sys_uname(addr_t uts_addr) {
+    return sys_uname_guest(uts_addr);
+}
+
+dword_t sys_uname_guest(guest_addr_t uts_addr) {
     struct uname uts;
     do_uname(&uts);
     if (user_put(uts_addr, uts))
@@ -69,9 +77,13 @@ dword_t sys_uname(addr_t uts_addr) {
 }
 
 dword_t sys_sethostname(addr_t hostname_addr, dword_t hostname_len) {
+    return sys_sethostname_guest(hostname_addr, hostname_len);
+}
+
+dword_t sys_sethostname_guest(guest_addr_t hostname_addr, dword_t hostname_len) {
     struct uname uts;
 
-    if (current->uid != 0) {
+    if (!superuser()) {
         return _EPERM;
     }
 
@@ -154,4 +166,8 @@ dword_t sys_sysinfo(addr_t info_addr) {
     if (user_put(info_addr, info))
         return _EFAULT;
     return 0;
+}
+
+dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
+    return sys_sysinfo(info_addr);
 }

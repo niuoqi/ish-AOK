@@ -33,11 +33,11 @@
         return;
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(processExited:) name:ProcessExitedNotification object:nil];
 
-    complex_lockt(&pids_lock, 0);
-    current = pid_get_task(1); // pray
-    unlock(&pids_lock);
-    self.terminal = [Terminal createPseudoTerminal:&self->_tty];
-    current = NULL;
+    struct task *previousCurrent = NULL;
+    if ([AppDelegate pushUsableInitTaskAsCurrent:&previousCurrent]) {
+        self.terminal = [Terminal createPseudoTerminal:&self->_tty];
+        [AppDelegate popCurrentTask:previousCurrent];
+    }
     
     self.terminalView.terminal = self.terminal;
 #endif
@@ -77,11 +77,11 @@
     if (code != 0) {
         [self showAlertWithTitle:@"Upgrade failed" message:@"exit status %d", code];
     } else {
-        complex_lockt(&pids_lock, 0);
-        current = pid_get_task(1); // pray
-        unlock(&pids_lock);
-        FsUpdateRepositories();
-        current = NULL;
+        struct task *previousCurrent = NULL;
+        if ([AppDelegate pushUsableInitTaskAsCurrent:&previousCurrent]) {
+            FsUpdateRepositories();
+            [AppDelegate popCurrentTask:previousCurrent];
+        }
         [self showAlertWithTitle:@"Upgrade succeeded" message:@""];
     }
     [self.terminal destroy];

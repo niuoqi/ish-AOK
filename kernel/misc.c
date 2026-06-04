@@ -41,6 +41,11 @@
 #define KEYCTL_SETPERM_ 5
 #define KEYCTL_SESSION_TO_PARENT_ 18
 
+#define ARCH_SET_GS_ 0x1001
+#define ARCH_SET_FS_ 0x1002
+#define ARCH_GET_FS_ 0x1003
+#define ARCH_GET_GS_ 0x1004
+
 static bool prctl_cap_valid(uint_t cap) {
     return cap <= PRCTL_CAP_LAST_CAP_;
 }
@@ -51,13 +56,13 @@ static bool prctl_cap_test(const dword_t caps[2], uint_t cap) {
     return (caps[cap / 32] & (1u << (cap % 32))) != 0;
 }
 
-int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), uint_t UNUSED(arg5)) {
+int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED(arg4), qword_t UNUSED(arg5)) {
     switch (option) {
         case PRCTL_SET_PDEATHSIG_:
-            current->pdeath_signal = arg2;
+            current->pdeath_signal = (dword_t) arg2;
             return 0;
         case PRCTL_GET_PDEATHSIG_:
-            if (user_put(arg2, current->pdeath_signal))
+            if (user_put((guest_addr_t) arg2, current->pdeath_signal))
                 return _EFAULT;
             return 0;
         case PRCTL_GET_DUMPABLE_:
@@ -67,15 +72,18 @@ int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), u
                 return _EINVAL;
             return 0;
         case PRCTL_GET_KEEPCAPS_:
+            return current->keepcaps ? 1 : 0;
         case PRCTL_SET_KEEPCAPS_:
-            // Compatibility stub: enough for capability-probing startup code.
+            if (arg2 > 1)
+                return _EINVAL;
+            current->keepcaps = arg2 != 0;
             return 0;
         case PRCTL_GET_NAME_: {
             char name[16] = {};
             lock(&current->general_lock, 0);
             strncpy(name, current->comm, sizeof(name) - 1);
             unlock(&current->general_lock);
-            if (user_write(arg2, name, sizeof(name)))
+            if (user_write((guest_addr_t) arg2, name, sizeof(name)))
                 return _EFAULT;
             return 0;
         }
@@ -90,7 +98,7 @@ int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), u
             return 0;
         case PRCTL_SET_NAME_: {
             char name[16];
-            if (user_read_string(arg2, name, sizeof(name) - 1))
+            if (user_read_string((guest_addr_t) arg2, name, sizeof(name) - 1))
                 return _EFAULT;
             name[sizeof(name) - 1] = '\0';
             STRACE("prctl(PRCTL_SET_NAME, \"%s\")", name);
@@ -116,22 +124,37 @@ int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), u
         case PRCTL_SET_MM_:
             if (!superuser())
                 return _EPERM;
+            lock(&current->general_lock, 0);
+            if (current->mm == NULL) {
+                unlock(&current->general_lock);
+                return _EINVAL;
+            }
             switch (arg2) {
                 case PRCTL_SET_MM_ARG_START_:
+                    current->mm->argv_start = (guest_addr_t) arg3;
+                    break;
                 case PRCTL_SET_MM_ARG_END_:
+                    current->mm->argv_end = (guest_addr_t) arg3;
+                    break;
                 case PRCTL_SET_MM_ENV_START_:
+                    current->mm->env_start = (guest_addr_t) arg3;
+                    break;
                 case PRCTL_SET_MM_ENV_END_:
-                    return 0;
+                    current->mm->env_end = (guest_addr_t) arg3;
+                    break;
                 default:
+                    unlock(&current->general_lock);
                     return _EINVAL;
             }
+            unlock(&current->general_lock);
+            return 0;
         case PRCTL_SET_CHILD_SUBREAPER_:
             if (arg2 > 1)
                 return _EINVAL;
             return 0;
         case PRCTL_GET_CHILD_SUBREAPER_: {
             dword_t value = 0;
-            if (user_write(arg2, &value, sizeof(value)))
+            if (user_write((guest_addr_t) arg2, &value, sizeof(value)))
                 return _EFAULT;
             return 0;
         }
@@ -145,12 +168,12 @@ int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), u
         case PRCTL_CAP_AMBIENT_:
             switch (arg2) {
                 case PRCTL_CAP_AMBIENT_IS_SET_:
-                    if (!prctl_cap_valid(arg3))
+                    if (!prctl_cap_valid((uint_t) arg3))
                         return _EINVAL;
                     return 0;
                 case PRCTL_CAP_AMBIENT_RAISE_:
                 case PRCTL_CAP_AMBIENT_LOWER_:
-                    if (!prctl_cap_valid(arg3))
+                    if (!prctl_cap_valid((uint_t) arg3))
                         return _EINVAL;
                     return 0;
                 case PRCTL_CAP_AMBIENT_CLEAR_ALL_:
@@ -164,13 +187,45 @@ int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t UNUSED(arg4), u
     }
 }
 
+int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t arg4, uint_t arg5) {
+    return sys_prctl_guest(option, arg2, arg3, arg4, arg5);
+}
+
+int_t sys_arch_prctl_guest(int_t code, guest_addr_t addr) {
+    STRACE("arch_prctl(%#x, %#llx)", code, (unsigned long long) addr);
+    if (!task_is_64bit(current))
+        return _EINVAL;
+
+    switch (code) {
+        case ARCH_SET_FS_:
+            current->cpu.tls_ptr = addr;
+            return 0;
+        case ARCH_GET_FS_: {
+            qword_t fs_base = current->cpu.tls_ptr;
+            if (user_put(addr, fs_base))
+                return _EFAULT;
+            return 0;
+        }
+        case ARCH_SET_GS_:
+        case ARCH_GET_GS_:
+            // The current long-mode bring-up only has one TLS base, used for
+            // amd64 FS-relative accesses.
+            return _EINVAL;
+        default:
+            return _EINVAL;
+    }
+}
+
 int_t sys_arch_prctl(int_t code, addr_t addr) {
-    STRACE("arch_prctl(%#x, %#x)", code, addr);
-    return _EINVAL;
+    return sys_arch_prctl_guest(code, addr);
 }
 
 int_t sys_rseq(addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig) {
-    STRACE("rseq(%#x, %u, %#x, %#x)", rseq_addr, rseq_len, flags, sig);
+    return sys_rseq_guest(rseq_addr, rseq_len, flags, sig);
+}
+
+int_t sys_rseq_guest(guest_addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig) {
+    STRACE("rseq(%#llx, %u, %#x, %#x)", (unsigned long long) rseq_addr, rseq_len, flags, sig);
     // Deliberately report rseq as unsupported. Modern glibc falls back cleanly
     // on ENOSYS, but a fake success here would expose an ABI we do not emulate.
     return _ENOSYS;

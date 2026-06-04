@@ -6,6 +6,8 @@
 #define _LINUX_CAPABILITY_VERSION_1_ 0x19980330
 #define _LINUX_CAPABILITY_VERSION_2_ 0x20071026
 #define _LINUX_CAPABILITY_VERSION_3_ 0x20080522
+#define CAP_SETGID_ 6
+#define CAP_SETUID_ 7
 
 struct cap_user_header_ {
     dword_t version;
@@ -36,6 +38,48 @@ static bool cap_words_subset(const dword_t *subset, const dword_t *superset, int
             return false;
     }
     return true;
+}
+
+static bool current_has_cap(uint_t cap) {
+    if (current == NULL || cap >= 64)
+        return false;
+    return (current->cap_effective[cap / 32] & (1u << (cap % 32))) != 0;
+}
+
+static bool current_can_setuids(void) {
+    return superuser() || current_has_cap(CAP_SETUID_);
+}
+
+static bool current_can_setgids(void) {
+    return superuser() || current_has_cap(CAP_SETGID_);
+}
+
+static void cap_emulate_setxuid(uid_t_ old_ruid, uid_t_ old_euid, uid_t_ old_suid) {
+    bool old_any_root = old_ruid == 0 || old_euid == 0 || old_suid == 0;
+    bool new_any_root = current->uid == 0 || current->euid == 0 || current->suid == 0;
+
+    // Linux drops all capabilities once a root-originating task has fully
+    // transitioned to non-root credentials unless PR_SET_KEEPCAPS or
+    // securebits say otherwise. We only model the keepcaps bit here.
+    if (old_any_root && !new_any_root) {
+        current->cap_effective[0] = current->cap_effective[1] = 0;
+        if (!current->keepcaps)
+            current->cap_permitted[0] = current->cap_permitted[1] = 0;
+        return;
+    }
+
+    // Dropping only the effective uid from 0 disables effective capabilities
+    // until/unless the task returns to euid 0.
+    if (old_euid == 0 && current->euid != 0) {
+        current->cap_effective[0] = current->cap_effective[1] = 0;
+        return;
+    }
+
+    // Regaining euid 0 restores effective capabilities from the permitted set.
+    if (old_euid != 0 && current->euid == 0) {
+        current->cap_effective[0] = current->cap_permitted[0];
+        current->cap_effective[1] = current->cap_permitted[1];
+    }
 }
 
 pid_t_ sys_getpid(void) {
@@ -78,7 +122,10 @@ dword_t sys_geteuid(void) {
 
 int_t sys_setuid(uid_t_ uid) {
     STRACE("setuid(%d)", uid);
-    if (superuser()) {
+    uid_t_ old_ruid = current->uid;
+    uid_t_ old_euid = current->euid;
+    uid_t_ old_suid = current->suid;
+    if (current_can_setuids()) {
         current->uid = current->suid = uid;
     } else {
         if (uid != current->uid && uid != current->suid)
@@ -86,12 +133,16 @@ int_t sys_setuid(uid_t_ uid) {
     }
     current->euid = uid;
     current->fsuid = uid;
+    cap_emulate_setxuid(old_ruid, old_euid, old_suid);
     return 0;
 }
 
 dword_t sys_setresuid(uid_t_ ruid, uid_t_ euid, uid_t_ suid) {
     STRACE("setresuid(%d, %d, %d)", ruid, euid, suid);
-    if (!superuser()) {
+    uid_t_ old_ruid = current->uid;
+    uid_t_ old_euid = current->euid;
+    uid_t_ old_suid = current->suid;
+    if (!current_can_setuids()) {
         if (ruid != (uid_t) -1 && ruid != current->uid && ruid != current->euid && ruid != current->suid)
             return _EPERM;
         if (euid != (uid_t) -1 && euid != current->uid && euid != current->euid && euid != current->suid)
@@ -108,11 +159,26 @@ dword_t sys_setresuid(uid_t_ ruid, uid_t_ euid, uid_t_ suid) {
         current->suid = suid;
     if (euid != (uid_t) -1)
         current->fsuid = euid;
+    cap_emulate_setxuid(old_ruid, old_euid, old_suid);
     return 0;
 }
 
 int_t sys_getresuid(addr_t ruid_addr, addr_t euid_addr, addr_t suid_addr) {
     STRACE("getresuid(%#x, %#x, %#x)", ruid_addr, euid_addr, suid_addr);
+    if (user_put(ruid_addr, current->uid))
+        return _EFAULT;
+    if (user_put(euid_addr, current->euid))
+        return _EFAULT;
+    if (user_put(suid_addr, current->suid))
+        return _EFAULT;
+    return 0;
+}
+
+int_t sys_getresuid_guest(guest_addr_t ruid_addr, guest_addr_t euid_addr, guest_addr_t suid_addr) {
+    STRACE("getresuid(%#llx, %#llx, %#llx)",
+            (unsigned long long) ruid_addr,
+            (unsigned long long) euid_addr,
+            (unsigned long long) suid_addr);
     if (user_put(ruid_addr, current->uid))
         return _EFAULT;
     if (user_put(euid_addr, current->euid))
@@ -131,7 +197,7 @@ uid_t_ sys_setfsuid(uid_t_ uid) {
     STRACE("setfsuid(%d)", uid);
     if (uid == (uid_t_) -1)
         return old;
-    if (superuser() || uid == current->uid || uid == current->euid || uid == current->suid)
+    if (current_can_setuids() || uid == current->uid || uid == current->euid || uid == current->suid)
         current->fsuid = uid;
     return old;
 }
@@ -156,7 +222,7 @@ dword_t sys_getegid(void) {
 
 int_t sys_setgid(uid_t_ gid) {
     STRACE("setgid(%d)", gid);
-    if (superuser()) {
+    if (current_can_setgids()) {
         current->gid = current->sgid = gid;
     } else {
         if (gid != current->gid && gid != current->sgid)
@@ -169,7 +235,7 @@ int_t sys_setgid(uid_t_ gid) {
 
 dword_t sys_setresgid(uid_t_ rgid, uid_t_ egid, uid_t_ sgid) {
     STRACE("setresgid(%d, %d, %d)", rgid, egid, sgid);
-    if (!superuser()) {
+    if (!current_can_setgids()) {
         if (rgid != (uid_t) -1 && rgid != current->gid && rgid != current->egid && rgid != current->sgid)
             return _EPERM;
         if (egid != (uid_t) -1 && egid != current->gid && egid != current->egid && egid != current->sgid)
@@ -200,6 +266,20 @@ int_t sys_getresgid(addr_t rgid_addr, addr_t egid_addr, addr_t sgid_addr) {
     return 0;
 }
 
+int_t sys_getresgid_guest(guest_addr_t rgid_addr, guest_addr_t egid_addr, guest_addr_t sgid_addr) {
+    STRACE("getresgid(%#llx, %#llx, %#llx)",
+            (unsigned long long) rgid_addr,
+            (unsigned long long) egid_addr,
+            (unsigned long long) sgid_addr);
+    if (user_put(rgid_addr, current->gid))
+        return _EFAULT;
+    if (user_put(egid_addr, current->egid))
+        return _EFAULT;
+    if (user_put(sgid_addr, current->sgid))
+        return _EFAULT;
+    return 0;
+}
+
 int_t sys_setregid(uid_t_ rgid, uid_t_ egid) {
     return sys_setresgid(rgid, egid, -1);
 }
@@ -209,12 +289,16 @@ uid_t_ sys_setfsgid(uid_t_ gid) {
     STRACE("setfsgid(%d)", gid);
     if (gid == (uid_t_) -1)
         return old;
-    if (superuser() || gid == current->gid || gid == current->egid || gid == current->sgid)
+    if (current_can_setgids() || gid == current->gid || gid == current->egid || gid == current->sgid)
         current->fsgid = gid;
     return old;
 }
 
 int_t sys_getgroups(dword_t size, addr_t list) {
+    return sys_getgroups_guest(size, list);
+}
+
+int_t sys_getgroups_guest(dword_t size, guest_addr_t list) {
     STRACE("getgroups(%d, %#x)", size, list);
     if (size == 0)
         return current->ngroups;
@@ -228,7 +312,13 @@ int_t sys_getgroups(dword_t size, addr_t list) {
 }
 
 int_t sys_setgroups(dword_t size, addr_t list) {
+    return sys_setgroups_guest(size, list);
+}
+
+int_t sys_setgroups_guest(dword_t size, guest_addr_t list) {
     STRACE("setgroups(%d, %#x)", size, list);
+    if (!current_can_setgids())
+        return _EPERM;
     if (size > MAX_GROUPS)
         return _EINVAL;
     if (user_read(list, current->groups, size * sizeof(uid_t_)))
@@ -241,7 +331,11 @@ int_t sys_setgroups(dword_t size, addr_t list) {
 
 // this does not really work
 int_t sys_capget(addr_t header_addr, addr_t data_addr) {
-    STRACE("capget(%#x, %#x)", header_addr, data_addr);
+    return sys_capget_guest(header_addr, data_addr);
+}
+
+int_t sys_capget_guest(guest_addr_t header_addr, guest_addr_t data_addr) {
+    STRACE("capget(%#llx, %#llx)", (unsigned long long) header_addr, (unsigned long long) data_addr);
     struct cap_user_header_ header;
     if (user_read(header_addr, &header, sizeof(header)))
         return _EFAULT;
@@ -269,7 +363,11 @@ int_t sys_capget(addr_t header_addr, addr_t data_addr) {
     return 0;
 }
 int_t sys_capset(addr_t header_addr, addr_t data_addr) {
-    STRACE("capset(%#x, %#x)", header_addr, data_addr);
+    return sys_capset_guest(header_addr, data_addr);
+}
+
+int_t sys_capset_guest(guest_addr_t header_addr, guest_addr_t data_addr) {
+    STRACE("capset(%#llx, %#llx)", (unsigned long long) header_addr, (unsigned long long) data_addr);
     struct cap_user_header_ header;
     if (user_read(header_addr, &header, sizeof(header)))
         return _EFAULT;

@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include "emu/cpu.h"
+#include "kernel/abi.h"
 #include "kernel/mm.h"
 #include "kernel/fs.h"
 #include "kernel/signal.h"
@@ -26,7 +27,10 @@ extern struct list tasks_pending_deletion_queue;
 extern pthread_mutex_t tasks_pending_deletion_lock;
 
 struct task {
+    enum guest_abi abi;
     struct cpu_state cpu;
+    bool force_single_step;
+    bool force_no_jit_cache;
     struct mm *mm; // locked by general_lock
     struct mem *mem; // pointer to mm.mem, for convenience
     pthread_t thread;
@@ -40,7 +44,7 @@ struct task {
     
     struct {
         pthread_mutex_t lock;
-        int count; // Count of locks held by current task =mke
+        int count; // Count of locks held by the current task.
     } locks_held;
     
     int stuck_count;
@@ -55,6 +59,7 @@ struct task {
     dword_t cap_effective[2];
     dword_t cap_permitted[2];
     dword_t cap_inheritable[2];
+    bool keepcaps;
 #define MAX_GROUPS 32
     unsigned ngroups;
     uid_t_ groups[MAX_GROUPS];
@@ -72,8 +77,8 @@ struct task {
     struct list queue;
     cond_t pause; // please don't signal this
     // per-thread alternate signal stack (not shared with CLONE_SIGHAND threads)
-    addr_t altstack;
-    dword_t altstack_size;
+    guest_addr_t altstack;
+    guest_addr_t altstack_size;
     // private
     sigset_t_ saved_mask;
     bool has_saved_mask;
@@ -92,7 +97,7 @@ struct task {
         int signal;
         struct siginfo_ info;
         int trap_event;
-        dword_t eventmsg;
+        qword_t eventmsg;
         int syscall;
         struct task *tracer;
     } ptrace;
@@ -104,8 +109,8 @@ struct task {
     struct list ptracees;
     struct list ptrace_siblings;
 
-    addr_t clear_tid;
-    addr_t robust_list;
+    guest_addr_t clear_tid;
+    guest_addr_t robust_list;
     dword_t pdeath_signal;
 
     // locked by pids_lock
@@ -131,7 +136,10 @@ struct task {
     // current condition/lock, so it can be notified in case of a signal
     cond_t *waiting_cond;
     lock_t *waiting_lock;
+    bool *waiting_interrupt_flag;
     lock_t waiting_cond_lock;
+    bool wait_interrupted;
+    bool restart_interrupted_syscall;
 };
 
 // current will always give the process that is currently executing
@@ -144,12 +152,24 @@ static inline void task_set_mm(struct task *task, struct mm *mm) {
     task->cpu.mmu = &task->mem->mmu;
 }
 
+static inline struct guest_abi_desc task_abi_desc(const struct task *task) {
+    return guest_abi_desc(task->abi);
+}
+
+static inline bool task_is_64bit(const struct task *task) {
+    return guest_abi_is_64bit(task->abi);
+}
+
 // Creates a new process, initializes most fields from the parent. Specify
 // parent as NULL to create the init process. Returns NULL if out of memory.
 // Ends with an underscore because there's a mach function by the same name
 struct task *task_create_(struct task *parent);
 // Removes the process from the process table and frees it. Must be called with pids_lock.
 void task_destroy(struct task *task, int UNUSED(caller));
+// Removes the process from the process table. Must be called with pids_lock.
+void task_unlink_locked(struct task *task);
+// Frees an already-unlinked task, or defers it if references remain.
+void task_destroy_unlinked(struct task *task, int UNUSED(caller));
 
 // misc
 void vfork_notify(struct task *task);
@@ -167,12 +187,13 @@ struct posix_timer {
 
 // struct thread_group is way too long to type comfortably
 struct tgroup {
-    struct list threads; // locked by pids_lock, by majority vote
+    struct list threads; // locked by pids_lock
     struct task *leader; // immutable
     long group_count_in_int;
     struct rusage_ rusage;
 
-    // locked by pids_lock
+    // Process-group/session membership lists are protected by pids_lock.
+    // Group-local metadata (sid, pgid, tty) is protected by group->lock.
     pid_t_ sid, pgid;
     struct list session;
     struct list pgroup;
@@ -197,7 +218,8 @@ struct tgroup {
 
     dword_t personality;
 
-    // for everything in this struct not locked by something else
+    // for everything in this struct not locked by something else.
+    // Lock ordering: pids_lock -> group->lock -> tty->lock.
     lock_t lock;
 };
 
@@ -218,13 +240,21 @@ struct pid {
 // to avoid having this head element in your cycle.
 extern struct list alive_pids_list;
 
+struct task_snapshot {
+    struct task **tasks;
+    unsigned count;
+};
+
 // synchronizes obtaining a pointer to a task and freeing that task
 extern lock_t pids_lock;
 // these functions must be called with pids_lock
 struct pid *pid_get(dword_t pid);
 struct pid *pid_get_last_allocated(void);
 struct task *pid_get_task(dword_t pid);
+struct task *pid_get_task_ref(dword_t pid);
 struct task *pid_get_task_zombie(dword_t id); // don't return null if the task exists as a zombie
+int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only);
+void task_snapshot_release(struct task_snapshot *snapshot);
 
 dword_t get_count_of_blocked_tasks(void);
 dword_t get_count_of_alive_tasks(void);
@@ -234,6 +264,7 @@ dword_t get_count_of_alive_tasks(void);
 // TODO document
 void task_start(struct task *task);
 void task_run_current(void);
+void task_poke_shared_mem(struct task *task, struct mem *mem);
 
 extern void (*exit_hook)(struct task *task, int code);
 
@@ -277,16 +308,14 @@ static inline unsigned task_ref_cnt_get(struct task *task, unsigned UNUSED(lock_
 
 
 static inline unsigned locks_held_count(struct task *task) {
-   // return 0; // Short circuit for now
-    if(task->pid < 10)  // Here be monsters.  -mke
+    if(task->pid < 10)  // Bootstrap tasks are exempt from this accounting path.
         return 0;
-    if(task->locks_held.count > 0) {
-        return(task->locks_held.count -1);
-    }
-    unsigned tmp = 0;
-    pthread_mutex_lock(&task->locks_held.lock);
-    tmp = task->locks_held.count;
-    pthread_mutex_unlock(&task->locks_held.lock);
+    unsigned tmp = __atomic_load_n(&task->locks_held.count, __ATOMIC_RELAXED);
+
+    // Exit/reap paths intentionally hold one bookkeeping lock while asking
+    // whether any other locks are still outstanding.  Discount that slot here.
+    if (tmp > 0)
+        tmp--;
 
     return tmp;
 }

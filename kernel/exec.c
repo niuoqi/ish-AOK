@@ -15,10 +15,12 @@
 #include "kernel/random.h"
 #include "kernel/errno.h"
 #include "fs/fd.h"
+#include "fs/devices.h"
 #include "fs/tty.h"
 #include "fs/path.h"
 #include "kernel/elf.h"
 #include "kernel/vdso.h"
+#include "jit/jit.h"
 #include "tools/ptraceomatic-config.h"
 #include "util/sync.h"
 
@@ -31,110 +33,188 @@ struct exec_args {
     const char *args;
 };
 
-static inline dword_t align_stack(dword_t sp);
-static inline ssize_t user_strlen(size_t p);
-static inline int user_memset(addr_t start, byte_t val, dword_t len);
-static inline dword_t copy_string(dword_t sp, const char *string);
-static inline dword_t args_copy(dword_t sp, struct exec_args args);
+struct elf_info {
+    enum guest_abi abi;
+    byte_t bitness;
+    uint16_t type;
+    uint16_t machine;
+    qword_t entry_point;
+    qword_t prghead_off;
+    uint16_t phent_size;
+    uint16_t phent_count;
+};
+
+struct elf_prg_info {
+    uint32_t type;
+    uint32_t flags;
+    qword_t offset;
+    qword_t vaddr;
+    qword_t filesize;
+    qword_t memsize;
+    qword_t alignment;
+};
+
+static inline guest_addr_t align_stack(guest_addr_t sp);
+static inline ssize_t user_strlen(guest_addr_t p);
+static inline int user_memset(guest_addr_t start, byte_t val, dword_t len);
+static inline guest_addr_t copy_string(guest_addr_t sp, const char *string);
+static inline guest_addr_t args_copy(guest_addr_t sp, struct exec_args args);
 static size_t args_size(struct exec_args args);
-static ssize_t read_execve_user_args(addr_t argv_addr, addr_t envp_addr, ssize_t *argc_out,
+static ssize_t user_read_exec_ptr(guest_addr_t addr, qword_t *ptr_out);
+static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_addr, ssize_t *argc_out,
         char **argv_out, char **envp_out);
+static int read_header(struct fd *fd, struct elf_info *header);
+static int read_prg_headers(struct fd *fd, struct elf_info header, struct elf_prg_info **ph_out);
+static int load_entry(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t bias, struct fd *fd);
+static guest_addr_t find_hole_for_elf(struct elf_info *header, struct elf_prg_info *ph);
+static int elf_load_addr_candidate(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t bias,
+        guest_addr_t *addr_out);
+static void amd64_trace_exec_attempt(const char *file, const char *argv);
+static void amd64_trace_exec_loader_failure(const char *stage, const char *file, enum guest_abi abi,
+        struct elf_prg_info *ph, guest_addr_t bias, struct fd *fd, int err, const char *interp_name);
 
-static bool trace_session_exec_name(const char *name) {
-    return strcmp(name, "login") == 0 ||
-        strcmp(name, "sshd") == 0 ||
-        strcmp(name, "sh") == 0 ||
-        strcmp(name, "bash") == 0 ||
-        strcmp(name, "dash") == 0 ||
-        strcmp(name, "getty") == 0 ||
-        strcmp(name, "agetty") == 0;
-}
-
-static bool trace_session_exec_attempt(const char *current_name, const char *file) {
-    if (trace_session_exec_name(current_name))
-        return true;
-    const char *basename = strrchr(file, '/');
-    if (basename == NULL)
-        basename = file;
-    else
-        basename++;
-    return trace_session_exec_name(basename);
-}
-
-static void trace_exec_argv(const struct exec_args *argv, char *buf, size_t size) {
-    if (size == 0)
-        return;
-    buf[0] = '\0';
-    if (argv == NULL || argv->args == NULL || argv->count == 0)
-        return;
-
-    size_t used = 0;
-    const char *arg = argv->args;
-    size_t shown = 0;
-    for (size_t i = 0; i < argv->count && shown < 4 && *arg != '\0'; i++) {
-        const char *sep = shown == 0 ? "" : " ";
-        int wrote = snprintf(buf + used, size - used, "%s\"%.48s\"", sep, arg);
-        if (wrote < 0 || (size_t) wrote >= size - used) {
-            used = size - 1;
-            break;
-        }
-        used += wrote;
-        shown++;
-        arg += strlen(arg) + 1;
+static bool elf_abi_detect(byte_t bitness, uint16_t machine, enum guest_abi *abi_out) {
+    enum guest_abi abi;
+    if (bitness == ELF_64BIT && machine == ELF_X86_64) {
+        abi = GUEST_ABI_AMD64;
+    } else if (bitness == ELF_32BIT && machine == ELF_X86) {
+        abi = GUEST_ABI_I386;
+    } else {
+        return false;
     }
-    if (shown < argv->count && used + 4 < size)
-        strcpy(buf + used, " ...");
+    if (abi_out != NULL)
+        *abi_out = abi;
+    return true;
 }
 
-static void trace_exec_tty(struct task *task, int *type_out, int *num_out) {
-    int type = -1;
-    int num = -1;
-    lock(&task->group->lock, 0);
-    struct tty *tty = task->group->tty;
-    if (tty != NULL) {
-        type = tty->type;
-        num = tty->num;
-    }
-    unlock(&task->group->lock);
-    if (type_out != NULL)
-        *type_out = type;
-    if (num_out != NULL)
-        *num_out = num;
+static bool elf_value_fits_addr(enum guest_abi abi, qword_t value) {
+    return guest_abi_addr_valid(abi, value);
 }
 
-static int read_header(struct fd *fd, struct elf_header *header) {
+static int read_header(struct fd *fd, struct elf_info *header) {
+    union {
+        struct elf_header elf32;
+        struct elf64_header elf64;
+    } raw;
+
     ssize_t err;
     if (fd->ops->lseek(fd, 0, SEEK_SET))
         return _EIO;
-    if ((err = fd->ops->read(fd, header, sizeof(*header))) != sizeof(*header)) {
+    if ((err = fd->ops->read(fd, &raw, sizeof(raw))) < (ssize_t) sizeof(struct elf_header)) {
         if (err < 0)
             return _EIO;
         return _ENOEXEC;
     }
-    if (memcmp(&header->magic, ELF_MAGIC, sizeof(header->magic)) != 0
-            || (header->type != ELF_EXECUTABLE && header->type != ELF_DYNAMIC)
-            || header->bitness != ELF_32BIT
-            || header->endian != ELF_LITTLEENDIAN
-            || header->elfversion1 != 1
-            || header->machine != ELF_X86)
+
+    struct elf_header *ident = &raw.elf32;
+    enum guest_abi elf_abi;
+    if (memcmp(&ident->magic, ELF_MAGIC, sizeof(ident->magic)) != 0
+            || (ident->type != ELF_EXECUTABLE && ident->type != ELF_DYNAMIC)
+            || ident->endian != ELF_LITTLEENDIAN
+            || ident->elfversion1 != 1
+            || !elf_abi_detect(ident->bitness, ident->machine, &elf_abi))
         return _ENOEXEC;
+
+    if (ident->bitness == ELF_32BIT) {
+        *header = (struct elf_info) {
+            .abi = elf_abi,
+            .bitness = ident->bitness,
+            .type = raw.elf32.type,
+            .machine = raw.elf32.machine,
+            .entry_point = raw.elf32.entry_point,
+            .prghead_off = raw.elf32.prghead_off,
+            .phent_size = raw.elf32.phent_size,
+            .phent_count = raw.elf32.phent_count,
+        };
+    } else if (ident->bitness == ELF_64BIT) {
+        if (err < (ssize_t) sizeof(struct elf64_header))
+            return _ENOEXEC;
+        *header = (struct elf_info) {
+            .abi = elf_abi,
+            .bitness = ident->bitness,
+            .type = raw.elf64.type,
+            .machine = raw.elf64.machine,
+            .entry_point = raw.elf64.entry_point,
+            .prghead_off = raw.elf64.prghead_off,
+            .phent_size = raw.elf64.phent_size,
+            .phent_count = raw.elf64.phent_count,
+        };
+    } else {
+        return _ENOEXEC;
+    }
     return 0;
 }
 
-static int read_prg_headers(struct fd *fd, struct elf_header header, struct prg_header **ph_out) {
-    ssize_t ph_size = sizeof(struct prg_header) * header.phent_count;
-    struct prg_header *ph = malloc(ph_size);
+static int read_prg_headers(struct fd *fd, struct elf_info header, struct elf_prg_info **ph_out) {
+    size_t ph_size = sizeof(struct elf_prg_info) * header.phent_count;
+    struct elf_prg_info *ph = malloc(ph_size);
     if (ph == NULL)
         return _ENOMEM;
 
+    memset(ph, 0, ph_size);
     if (fd->ops->lseek(fd, header.prghead_off, SEEK_SET) < 0) {
         free(ph);
         return _EIO;
     }
-    if (fd->ops->read(fd, ph, ph_size) != ph_size) {
+
+    if (header.bitness == ELF_32BIT) {
+        if (header.phent_size < sizeof(struct prg_header)) {
+            free(ph);
+            return _ENOEXEC;
+        }
+        for (uint16_t i = 0; i < header.phent_count; i++) {
+            struct prg_header raw;
+            if (fd->ops->read(fd, &raw, sizeof(raw)) != sizeof(raw)) {
+                free(ph);
+                if (errno != 0)
+                    return _EIO;
+                return _ENOEXEC;
+            }
+            if (header.phent_size > sizeof(raw) &&
+                    fd->ops->lseek(fd, header.phent_size - sizeof(raw), SEEK_CUR) < 0) {
+                free(ph);
+                return _EIO;
+            }
+            ph[i] = (struct elf_prg_info) {
+                .type = raw.type,
+                .flags = raw.flags,
+                .offset = raw.offset,
+                .vaddr = raw.vaddr,
+                .filesize = raw.filesize,
+                .memsize = raw.memsize,
+                .alignment = raw.alignment,
+            };
+        }
+    } else if (header.bitness == ELF_64BIT) {
+        if (header.phent_size < sizeof(struct prg_header64)) {
+            free(ph);
+            return _ENOEXEC;
+        }
+        for (uint16_t i = 0; i < header.phent_count; i++) {
+            struct prg_header64 raw;
+            if (fd->ops->read(fd, &raw, sizeof(raw)) != sizeof(raw)) {
+                free(ph);
+                if (errno != 0)
+                    return _EIO;
+                return _ENOEXEC;
+            }
+            if (header.phent_size > sizeof(raw) &&
+                    fd->ops->lseek(fd, header.phent_size - sizeof(raw), SEEK_CUR) < 0) {
+                free(ph);
+                return _EIO;
+            }
+            ph[i] = (struct elf_prg_info) {
+                .type = raw.type,
+                .flags = raw.flags,
+                .offset = raw.offset,
+                .vaddr = raw.vaddr,
+                .filesize = raw.filesize,
+                .memsize = raw.memsize,
+                .alignment = raw.alignment,
+            };
+        }
+    } else {
         free(ph);
-        if (errno != 0)
-            return _EIO;
         return _ENOEXEC;
     }
 
@@ -142,102 +222,173 @@ static int read_prg_headers(struct fd *fd, struct elf_header header, struct prg_
     return 0;
 }
 
-static int load_entry(struct prg_header ph, addr_t bias, struct fd *fd) {
+static int load_entry(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t bias, struct fd *fd) {
     int err;
 
-    addr_t addr = ph.vaddr + bias;
-    addr_t offset = ph.offset;
-    addr_t memsize = ph.memsize;
-    addr_t filesize = ph.filesize;
+    if (!elf_value_fits_addr(abi, ph.vaddr) || !elf_value_fits_addr(abi, ph.offset) ||
+            !elf_value_fits_addr(abi, ph.memsize) || !elf_value_fits_addr(abi, ph.filesize))
+        return _EOVERFLOW;
+    if (ph.vaddr > guest_abi_vm_layout(abi).user_addr_max - bias)
+        return _EOVERFLOW;
+
+    guest_addr_t addr = (guest_addr_t) ph.vaddr + bias;
+    guest_addr_t offset = (guest_addr_t) ph.offset;
+    guest_addr_t memsize = (guest_addr_t) ph.memsize;
+    guest_addr_t filesize = (guest_addr_t) ph.filesize;
 
     int flags = P_READ;
     if (ph.flags & PH_W) flags |= P_WRITE;
 
     if ((err = fd->ops->mmap(fd, current->mem, PAGE(addr),
                     PAGE_ROUND_UP(filesize + PGOFFSET(addr)),
-                    offset - PGOFFSET(addr), flags, MMAP_PRIVATE)) < 0)
+                    offset - PGOFFSET(addr), flags, MMAP_PRIVATE)) < 0) {
+        amd64_trace_exec_loader_failure("segment-mmap", NULL, abi, &ph, bias, fd, err, NULL);
         return err;
+    }
     // TODO find a better place for these to avoid code duplication
     mem_pt(current->mem, PAGE(addr))->data->fd = fd_retain(fd);
     mem_pt(current->mem, PAGE(addr))->data->file_offset = offset - PGOFFSET(addr);
 
-    if (memsize > filesize) {
-        // put zeroes between addr + filesize and addr + memsize, call that bss
-        dword_t bss_size = memsize - filesize;
+    guest_addr_t file_end = addr + filesize;
 
-        // first zero the tail from the end of the file mapping to the end
-        // of the load entry or the end of the page, whichever comes first
-        addr_t file_end = addr + filesize;
-        dword_t tail_size = PAGE_SIZE - PGOFFSET(file_end);
-        
-        if (tail_size == PAGE_SIZE)
-            // if you can calculate tail_size better and not have to do this please let me know
-            tail_size = 0;
+    // ELF requires the remainder of the final file-backed page in a PT_LOAD
+    // segment to read as zero. When the host page size is larger than the
+    // guest page size, the mmap above can otherwise expose later file bytes in
+    // that guest-visible tail.
+    dword_t tail_size = PAGE_SIZE - PGOFFSET(file_end);
+    if (tail_size == PAGE_SIZE)
+        tail_size = 0;
 
-        if (tail_size != 0) {
-            // Unlock and lock the mem because the user functions must be
-            // called without locking mem.
-            write_unlock(&current->mem->lock);
-            
-            mem_ref_cnt_mod(current->mem, 1);
-            user_memset(file_end, 0, tail_size);
-            write_lock(&current->mem->lock);
-            mem_ref_cnt_mod(current->mem, -1);
+    if (tail_size != 0 && (flags & P_WRITE)) {
+        // Unlock and lock the mem because the user functions must be
+        // called without locking mem.
+        struct mem *mem = current->mem;
+        write_unlock(&mem->lock);
+
+        int memset_err = user_memset(file_end, 0, tail_size);
+        write_lock(&mem->lock);
+        if (memset_err) {
+            amd64_trace_exec_loader_failure("segment-bss-tail", NULL, abi, &ph, bias, fd, _EFAULT, NULL);
+            return _EFAULT;
         }
+    }
+
+    if (memsize > filesize) {
+        dword_t bss_size = memsize - filesize;
         if (tail_size > bss_size)
             tail_size = bss_size;
-
-        // then map the pages from after the file mapping up to and including the end of bss
-        if (bss_size - tail_size != 0)
-                
-        if ((err = pt_map_nothing(current->mem, PAGE_ROUND_UP(addr + filesize),
-            PAGE_ROUND_UP(bss_size - tail_size), flags)) < 0)
-                
-        return err;
+        dword_t extra_bss_size = bss_size - tail_size;
+        if (extra_bss_size != 0) {
+            if ((err = pt_map_nothing(current->mem, PAGE_ROUND_UP(file_end),
+                            PAGE_ROUND_UP(extra_bss_size), flags)) < 0) {
+                amd64_trace_exec_loader_failure("segment-bss-map", NULL, abi, &ph, bias, fd, err, NULL);
+                return err;
+            }
+        }
     }
-    
+
     return 0;
 }
 
-static addr_t find_hole_for_elf(struct elf_header *header, struct prg_header *ph) {
-    struct prg_header *first = NULL, *last = NULL;
+static guest_addr_t find_hole_for_elf(struct elf_info *header, struct elf_prg_info *ph) {
+    bool found = false;
+    page_t first_page = 0;
+    page_t last_page = 0;
     for (int i = 0; i < header->phent_count; i++) {
-        if (ph[i].type == PT_LOAD) {
-            if (first == NULL)
-                first = &ph[i];
-            last = &ph[i];
+        if (ph[i].type != PT_LOAD)
+            continue;
+
+        qword_t end_vaddr = ph[i].vaddr + ph[i].memsize;
+        if (end_vaddr < ph[i].vaddr)
+            return 0;
+        if (!elf_value_fits_addr(header->abi, end_vaddr) || !elf_value_fits_addr(header->abi, ph[i].vaddr))
+            return 0;
+
+        page_t seg_first = PAGE(ph[i].vaddr);
+        page_t seg_last = PAGE_ROUND_UP(end_vaddr);
+        if (!found) {
+            first_page = seg_first;
+            last_page = seg_last;
+            found = true;
+            continue;
         }
+        if (seg_first < first_page)
+            first_page = seg_first;
+        if (seg_last > last_page)
+            last_page = seg_last;
     }
     pages_t size = 0;
-    if (first != NULL) {
-        pages_t a = PAGE_ROUND_UP(last->vaddr + last->memsize);
-        pages_t b = PAGE(first->vaddr);
-        size = a - b;
+    if (found) {
+        if (last_page < first_page)
+            return 0;
+        size = last_page - first_page;
     }
-    return pt_find_hole(current->mem, size) << PAGE_BITS;
+    page_t hole = pt_find_hole(current->mem, size);
+    if (hole == BAD_PAGE)
+        return 0;
+    guest_addr_t base = ((guest_addr_t) hole - first_page) << PAGE_BITS;
+    return base;
+}
+
+static int elf_load_addr_candidate(enum guest_abi abi, struct elf_prg_info ph, guest_addr_t bias,
+        guest_addr_t *addr_out) {
+    qword_t mapped_load_addr = (qword_t) bias + ph.vaddr;
+    if (ph.offset > mapped_load_addr)
+        return _EOVERFLOW;
+    mapped_load_addr -= ph.offset;
+    if (!elf_value_fits_addr(abi, mapped_load_addr))
+        return _EOVERFLOW;
+    *addr_out = (guest_addr_t) mapped_load_addr;
+    return 0;
+}
+
+static void amd64_trace_exec_attempt(const char *file, const char *argv) {
+    (void) file;
+    (void) argv;
+}
+
+static void amd64_trace_exec_loader_failure(const char *stage, const char *file, enum guest_abi abi,
+        struct elf_prg_info *ph, guest_addr_t bias, struct fd *fd, int err, const char *interp_name) {
+    (void) stage;
+    (void) file;
+    (void) abi;
+    (void) ph;
+    (void) bias;
+    (void) fd;
+    (void) err;
+    (void) interp_name;
+}
+
+static bool i386_force_safe_exec_comm(const char *comm) {
+    return comm != NULL &&
+        strcmp(comm, "pkcsslotd") == 0;
 }
 
 static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     intptr_t err = 0;
+    struct task *save = current;
+    bool mem_locked = false;
+    struct mm *new_mm = NULL;
 
     // read the headers
-    struct elf_header header;
+    struct elf_info header;
     if ((err = read_header(fd, &header)) < 0)
         return err;
-    struct prg_header *ph;
+    size_t guest_word_size = guest_abi_desc(header.abi).pointer_size;
+    bool is_64bit = guest_abi_is_64bit(header.abi);
+    struct elf_prg_info *ph;
     if ((err = read_prg_headers(fd, header, &ph)) < 0)
         return err;
 
     // look for an interpreter
     char *interp_name = NULL;
     struct fd *interp_fd = NULL;
-    struct elf_header interp_header;
-    struct prg_header *interp_ph = NULL;
+    struct elf_info interp_header;
+    struct elf_prg_info *interp_ph = NULL;
     for (unsigned i = 0; i < header.phent_count; i++) {
         if (ph[i].type != PT_INTERP)
             continue;
         if (interp_name) {
-            // can't have two interpreters
             err = _EINVAL;
             goto out_free_interp;
         }
@@ -247,27 +398,38 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
         if (interp_name == NULL)
             goto out_free_ph;
 
-        // read the interpreter name out of the file
         err = _EIO;
         if (fd->ops->lseek(fd, ph[i].offset, SEEK_SET) < 0)
             goto out_free_interp;
-        if (fd->ops->read(fd, interp_name, ph[i].filesize) != ph[i].filesize)
+        size_t interp_size = ph[i].filesize;
+        if (fd->ops->read(fd, interp_name, interp_size) != (ssize_t) interp_size)
             goto out_free_interp;
 
-        // open interpreter and read headers
         interp_fd = generic_open(interp_name, O_RDONLY, 0);
         if (IS_ERR(interp_fd)) {
             err = PTR_ERR(interp_fd);
             goto out_free_interp;
         }
         if ((err = read_header(interp_fd, &interp_header)) < 0) {
-            if (err == _ENOEXEC) err = _ELIBBAD;
+            if (err == _ENOEXEC)
+                err = _ELIBBAD;
+            goto out_free_interp;
+        }
+        if (interp_header.abi != header.abi) {
+            err = _ELIBBAD;
             goto out_free_interp;
         }
         if ((err = read_prg_headers(interp_fd, interp_header, &interp_ph)) < 0) {
-            if (err == _ENOEXEC) err = _ELIBBAD;
+            if (err == _ENOEXEC)
+                err = _ELIBBAD;
             goto out_free_interp;
         }
+    }
+
+    new_mm = mm_new(header.abi);
+    if (new_mm == NULL) {
+        err = _ENOMEM;
+        goto out_free_interp;
     }
 
     // free the process's memory.
@@ -278,200 +440,286 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
     // general_lock protects current->mm. otherwise procfs might read the
     // pointer before it's released and then try to lock it after it's
     // released.
-    struct task* save = current;
     lock(&save->general_lock, 0);
     mm_release(save->mm);
-    task_set_mm(save, mm_new());
+    save->abi = header.abi;
+    task_set_mm(save, new_mm);
+    new_mm = NULL;
     unlock(&save->general_lock);
     write_lock(&save->mem->lock);
+    mem_locked = true;
 
     save->mm->exefile = fd_retain(fd);
 
-    addr_t load_addr = 0; // used for AX_PHDR
+    guest_addr_t load_addr = 0;
     bool load_addr_set = false;
-    addr_t bias = 0; // offset for loading shared libraries as executables
+    guest_addr_t bias = 0;
 
-    // map dat shit!
     for (unsigned i = 0; i < header.phent_count; i++) {
         if (ph[i].type != PT_LOAD)
             continue;
 
         if (!load_addr_set && header.type == ELF_DYNAMIC) {
-            // see giant comment in linux/fs/binfmt_elf.c, around line 950
-            if (interp_name)
-                bias = 0x56555000; // I have no idea how this number was arrived at
+            if (interp_name && header.abi == GUEST_ABI_I386)
+                bias = 0x56555000;
             else
                 bias = find_hole_for_elf(&header, ph);
         }
 
-        if ((err = load_entry(ph[i], bias, fd)) < 0)
+        if ((err = load_entry(header.abi, ph[i], bias, fd)) < 0)
             goto beyond_hope;
 
-        // load_addr is used to get a value for AX_PHDR et al
-        if (!load_addr_set) {
-            load_addr = bias + ph[i].vaddr - ph[i].offset;
+        guest_addr_t candidate_load_addr;
+        if ((err = elf_load_addr_candidate(header.abi, ph[i], bias, &candidate_load_addr)) < 0)
+            goto beyond_hope;
+        if (!load_addr_set || candidate_load_addr < load_addr) {
+            load_addr = candidate_load_addr;
             load_addr_set = true;
         }
 
-        // we have to know where the brk starts
-        addr_t brk = bias + ph[i].vaddr + ph[i].memsize;
+        qword_t brk_q = (qword_t) bias + ph[i].vaddr + ph[i].memsize;
+        if (!elf_value_fits_addr(header.abi, brk_q)) {
+            err = _EOVERFLOW;
+            goto beyond_hope;
+        }
+        guest_addr_t brk = (guest_addr_t) brk_q;
         if (brk > save->mm->start_brk)
             save->mm->start_brk = save->mm->brk = BYTES_ROUND_UP(brk);
     }
 
-    addr_t entry = bias + header.entry_point;
-    addr_t interp_base = 0;
+    qword_t entry_q = (qword_t) bias + header.entry_point;
+    if (!elf_value_fits_addr(header.abi, entry_q)) {
+        err = _EOVERFLOW;
+        goto beyond_hope;
+    }
+    guest_addr_t entry = (guest_addr_t) entry_q;
+    guest_addr_t interp_base = 0;
 
     if (interp_name) {
-        // map dat shit! interpreter edition
         interp_base = find_hole_for_elf(&interp_header, interp_ph);
         for (int i = interp_header.phent_count - 1; i >= 0; i--) {
             if (interp_ph[i].type != PT_LOAD)
                 continue;
-            if ((err = load_entry(interp_ph[i], interp_base, interp_fd)) < 0)
+            if ((err = load_entry(interp_header.abi, interp_ph[i], interp_base, interp_fd)) < 0)
                 goto beyond_hope;
         }
-        entry = interp_base + interp_header.entry_point;
+        entry_q = (qword_t) interp_base + interp_header.entry_point;
+        if (!elf_value_fits_addr(interp_header.abi, entry_q)) {
+            err = _EOVERFLOW;
+            goto beyond_hope;
+        }
+        entry = (guest_addr_t) entry_q;
     }
 
-    // map vdso
-    err = _ENOMEM;
-    pages_t vdso_pages = sizeof(vdso_data) >> PAGE_BITS;
-    // FIXME disgusting hack: musl's dynamic linker has a one-page hole, and
-    // I'd rather not put the vdso in that hole. so find a two-page hole and
-    // add one.
-    page_t vdso_page = pt_find_hole(save->mem, vdso_pages + 1);
-    if (vdso_page == BAD_PAGE)
-        goto beyond_hope;
-    vdso_page += 1;
-    if ((err = pt_map(save->mem, vdso_page, vdso_pages, (void *) vdso_data, 0, 0)) < 0)
-        goto beyond_hope;
-    mem_pt(save->mem, vdso_page)->data->name = "[vdso]";
-    save->mm->vdso = vdso_page << PAGE_BITS;
-    addr_t vdso_entry = save->mm->vdso + ((struct elf_header *) vdso_data)->entry_point;
+    guest_addr_t vdso_entry = 0;
+    if (!is_64bit) {
+        err = _ENOMEM;
+        pages_t vdso_pages = sizeof(vdso_data) >> PAGE_BITS;
+        page_t vdso_page = pt_find_hole(save->mem, vdso_pages + 1);
+        if (vdso_page == BAD_PAGE)
+            goto beyond_hope;
+        vdso_page += 1;
+        if ((err = pt_map(save->mem, vdso_page, vdso_pages, (void *) vdso_data, 0, 0)) < 0)
+            goto beyond_hope;
+        mem_pt(save->mem, vdso_page)->data->name = "[vdso]";
+        save->mm->vdso = vdso_page << PAGE_BITS;
+        vdso_entry = save->mm->vdso + ((struct elf_header *) vdso_data)->entry_point;
 
-    // map 3 empty "vvar" pages to satisfy ptraceomatic
-    page_t vvar_page = pt_find_hole(save->mem, VVAR_PAGES);
-    if (vvar_page == BAD_PAGE)
-        goto beyond_hope;
-    if ((err = pt_map_nothing(save->mem, vvar_page, VVAR_PAGES, 0)) < 0)
-        goto beyond_hope;
-    mem_pt(save->mem, vvar_page)->data->name = "[vvar]";
+        page_t vvar_page = pt_find_hole(save->mem, VVAR_PAGES);
+        if (vvar_page == BAD_PAGE)
+            goto beyond_hope;
+        if ((err = pt_map_nothing(save->mem, vvar_page, VVAR_PAGES, 0)) < 0)
+            goto beyond_hope;
+        mem_pt(save->mem, vvar_page)->data->name = "[vvar]";
+    }
 
-    // STACK TIME!
-
-    // allocate 1 page of stack at 0xffffd, and let it grow down
-    if ((err = pt_map_nothing(save->mem, 0xffffd, 1, P_WRITE | P_GROWSDOWN)) < 0)
+    struct guest_vm_layout vm_layout = guest_abi_vm_layout(save->abi);
+    if ((err = pt_map_nothing(save->mem, vm_layout.stack_page, 1, P_WRITE | P_GROWSDOWN)) < 0)
         goto beyond_hope;
-    // that was the last memory mapping
     write_unlock(&save->mem->lock);
-    dword_t sp = 0xffffe000;
-    // on 32-bit linux, there's 4 empty bytes at the very bottom of the stack.
-    // on 64-bit linux, there's 8. make ptraceomatic happy. (a major theme in this file)
-    sp -= sizeof(void *);
+    mem_locked = false;
+
+    guest_addr_t sp = vm_layout.stack_pointer;
+    sp -= guest_word_size;
 
     err = _EFAULT;
-    // first, copy stuff pointed to by argv/envp/auxv
-    // filename, argc, argv
-    addr_t file_addr = sp = copy_string(sp, file);
+    guest_addr_t file_addr = sp = copy_string(sp, file);
     if (sp == 0)
         goto beyond_hope;
-    addr_t envp_addr = sp = args_copy(sp, envp);
+    guest_addr_t envp_addr = sp = args_copy(sp, envp);
     if (sp == 0)
         goto beyond_hope;
-    save->mm->argv_end = sp;
-    addr_t argv_addr = sp = args_copy(sp, argv);
+    save->mm->env_start = sp;
+    save->mm->env_end = sp + args_size(envp);
+    guest_addr_t argv_addr = sp = args_copy(sp, argv);
     if (sp == 0)
         goto beyond_hope;
     save->mm->argv_start = sp;
+    save->mm->argv_end = sp + args_size(argv);
     sp = align_stack(sp);
 
-    addr_t platform_addr = sp = copy_string(sp, "i686");
+    guest_addr_t platform_addr = sp = copy_string(sp, task_abi_desc(save).elf_platform);
     if (sp == 0)
         goto beyond_hope;
-    // 16 random bytes so no system call is needed to seed a userspace RNG
     char random[16] = {};
-    get_random(random, sizeof(random)); // if this fails, eh, no one's really using it
-    addr_t random_addr = sp -= sizeof(random);
+    get_random(random, sizeof(random));
+    guest_addr_t random_addr = sp -= sizeof(random);
     if (user_put(sp, random))
         goto beyond_hope;
 
-    // the way linux aligns the stack at this point is kinda funky
-    // calculate how much space is needed for argv, envp, and auxv, subtract
-    // that from sp, then align, then copy argv/envp/auxv from that down
+    size_t vector_bytes = ((argv.count + 1) + (envp.count + 1) + 1) * guest_word_size;
+    if (!is_64bit) {
+        struct aux_ent aux[] = {
+            {AX_SYSINFO, vdso_entry},
+            {AX_SYSINFO_EHDR, save->mm->vdso},
+            {AX_HWCAP, 0},
+            {AX_PAGESZ, PAGE_SIZE},
+            {AX_CLKTCK, 0x64},
+            {AX_PHDR, load_addr + header.prghead_off},
+            {AX_PHENT, header.phent_size},
+            {AX_PHNUM, header.phent_count},
+            {AX_BASE, interp_base},
+            {AX_FLAGS, 0},
+            {AX_ENTRY, bias + header.entry_point},
+            {AX_UID, 0},
+            {AX_EUID, 0},
+            {AX_GID, 0},
+            {AX_EGID, 0},
+            {AX_SECURE, 0},
+            {AX_RANDOM, random_addr},
+            {AX_HWCAP2, 0},
+            {AX_EXECFN, file_addr},
+            {AX_PLATFORM, platform_addr},
+            {0, 0}
+        };
+        sp -= vector_bytes;
+        sp -= sizeof(aux);
+        sp = align_stack(sp);
 
-    // declare elf aux now so we can know how big it is
-    struct aux_ent aux[] = {
-        {AX_SYSINFO, vdso_entry},
-        {AX_SYSINFO_EHDR, save->mm->vdso},
-        {AX_HWCAP, 0x00000000}, // suck that
-        {AX_PAGESZ, PAGE_SIZE},
-        {AX_CLKTCK, 0x64},
-        {AX_PHDR, load_addr + header.prghead_off},
-        {AX_PHENT, sizeof(struct prg_header)},
-        {AX_PHNUM, header.phent_count},
-        {AX_BASE, interp_base},
-        {AX_FLAGS, 0},
-        {AX_ENTRY, bias + header.entry_point},
-        {AX_UID, 0},
-        {AX_EUID, 0},
-        {AX_GID, 0},
-        {AX_EGID, 0},
-        {AX_SECURE, 0},
-        {AX_RANDOM, random_addr},
-        {AX_HWCAP2, 0}, // suck that too
-        {AX_EXECFN, file_addr},
-        {AX_PLATFORM, platform_addr},
-        {0, 0}
-    };
-    sp -= ((argv.count + 1) + (envp.count + 1) + 1) * sizeof(dword_t);
-    sp -= sizeof(aux);
-    sp &=~ 0xf;
+        guest_addr_t p = sp;
+        dword_t argc_word = (dword_t) argv.count;
+        dword_t zero = 0;
+        if (user_put(p, argc_word))
+            goto beyond_hope;
+        p += guest_word_size;
 
-    // now copy down, start using p so sp is preserved
-    addr_t p = sp;
+        size_t argc = argv.count;
+        while (argc-- > 0) {
+            dword_t argv_word = (dword_t) argv_addr;
+            if (user_put(p, argv_word))
+                goto beyond_hope;
+            ssize_t arg_len = user_strlen(argv_addr);
+            if (arg_len < 0)
+                goto beyond_hope;
+            argv_addr += arg_len + 1;
+            p += guest_word_size;
+        }
+        if (user_put(p, zero))
+            goto beyond_hope;
+        p += guest_word_size;
 
-    // argc
-    if (user_put(p, argv.count))
-        return _EFAULT;
-    p += sizeof(dword_t);
+        size_t envc = envp.count;
+        while (envc-- > 0) {
+            dword_t envp_word = (dword_t) envp_addr;
+            if (user_put(p, envp_word))
+                goto beyond_hope;
+            ssize_t env_len = user_strlen(envp_addr);
+            if (env_len < 0)
+                goto beyond_hope;
+            envp_addr += env_len + 1;
+            p += guest_word_size;
+        }
+        if (user_put(p, zero))
+            goto beyond_hope;
+        p += guest_word_size;
 
-    // argv
-    size_t argc = argv.count;
-    while (argc-- > 0) {
-        if (user_put(p, argv_addr))
-            return _EFAULT;
-        argv_addr += user_strlen(argv_addr) + 1;
-        p += sizeof(dword_t); // null terminator
+        save->mm->auxv_start = p;
+        if (user_put(p, aux))
+            goto beyond_hope;
+        p += sizeof(aux);
+        save->mm->auxv_end = p;
+    } else {
+        struct aux64_ent aux[] = {
+            {AX_HWCAP, 0},
+            {AX_PAGESZ, PAGE_SIZE},
+            {AX_CLKTCK, 0x64},
+            {AX_PHDR, load_addr + header.prghead_off},
+            {AX_PHENT, header.phent_size},
+            {AX_PHNUM, header.phent_count},
+            {AX_BASE, interp_base},
+            {AX_FLAGS, 0},
+            {AX_ENTRY, bias + header.entry_point},
+            {AX_UID, 0},
+            {AX_EUID, 0},
+            {AX_GID, 0},
+            {AX_EGID, 0},
+            {AX_SECURE, 0},
+            {AX_RANDOM, random_addr},
+            {AX_HWCAP2, 0},
+            {AX_EXECFN, file_addr},
+            {AX_PLATFORM, platform_addr},
+            {0, 0}
+        };
+        sp -= vector_bytes;
+        sp -= sizeof(aux);
+        sp = align_stack(sp);
+
+        guest_addr_t p = sp;
+        qword_t argc_word = (qword_t) argv.count;
+        qword_t zero = 0;
+        if (user_put(p, argc_word))
+            goto beyond_hope;
+        p += guest_word_size;
+
+        size_t argc = argv.count;
+        while (argc-- > 0) {
+            qword_t argv_word = (qword_t) argv_addr;
+            if (user_put(p, argv_word))
+                goto beyond_hope;
+            ssize_t arg_len = user_strlen(argv_addr);
+            if (arg_len < 0)
+                goto beyond_hope;
+            argv_addr += arg_len + 1;
+            p += guest_word_size;
+        }
+        if (user_put(p, zero))
+            goto beyond_hope;
+        p += guest_word_size;
+
+        size_t envc = envp.count;
+        while (envc-- > 0) {
+            qword_t envp_word = (qword_t) envp_addr;
+            if (user_put(p, envp_word))
+                goto beyond_hope;
+            ssize_t env_len = user_strlen(envp_addr);
+            if (env_len < 0)
+                goto beyond_hope;
+            envp_addr += env_len + 1;
+            p += guest_word_size;
+        }
+        if (user_put(p, zero))
+            goto beyond_hope;
+        p += guest_word_size;
+
+        save->mm->auxv_start = p;
+        if (user_put(p, aux))
+            goto beyond_hope;
+        p += sizeof(aux);
+        save->mm->auxv_end = p;
     }
-    p += sizeof(dword_t); // null terminator
-
-    // envp
-    size_t envc = envp.count;
-    while (envc-- > 0) {
-        if (user_put(p, envp_addr))
-            return _EFAULT;
-        envp_addr += user_strlen(envp_addr) + 1;
-        p += sizeof(dword_t);
-    }
-    p += sizeof(dword_t); // null terminator
-
-    // copy auxv
-    save->mm->auxv_start = p;
-    if (user_put(p, aux))
-        goto beyond_hope;
-    p += sizeof(aux);
-    save->mm->auxv_end = p;
 
     save->mm->stack_start = sp;
-    save->cpu.esp = sp;
-    save->cpu.eip = entry;
+    save->cpu.amd64_syscall = (struct amd64_syscall_state) {};
     save->cpu.fcw = 0x37f;
 
-    // This code was written when I discovered that the glibc entry point
-    // interprets edx as the address of a function to call on exit, as
-    // specified in the ABI. This register is normally set by the dynamic
-    // linker, so everything works fine until you run a static executable.
+    memset(save->cpu.amd64_regs, 0, sizeof(save->cpu.amd64_regs));
+    save->cpu.amd64_rip = entry;
+    save->cpu.amd64_regs[amd64_rsp] = sp;
+    memset(save->cpu.amd64_store_trace, 0, sizeof(save->cpu.amd64_store_trace));
+    save->cpu.amd64_store_trace_next = 0;
+
+    save->cpu.esp = (addr_t) sp;
+    save->cpu.eip = (addr_t) entry;
     save->cpu.eax = 0;
     save->cpu.ebx = 0;
     save->cpu.ecx = 0;
@@ -484,6 +732,8 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
 
     err = 0;
 out_free_interp:
+    if (new_mm != NULL)
+        mm_release(new_mm);
     if (interp_name != NULL)
         free(interp_name);
     if (interp_fd != NULL && !IS_ERR(interp_fd))
@@ -495,8 +745,9 @@ out_free_ph:
     return err;
 
 beyond_hope:
-    // TODO force sigsegv
-    write_unlock(&save->mem->lock);
+    amd64_trace_exec_loader_failure("elf-exec", file, header.abi, NULL, bias, fd, err, interp_name);
+    if (mem_locked)
+        write_unlock(&save->mem->lock);
     goto out_free_interp;
 }
 
@@ -511,18 +762,18 @@ static size_t args_size(struct exec_args args) {
     return args_end - args.args;
 }
 
-static inline dword_t align_stack(addr_t sp) {
+static inline guest_addr_t align_stack(guest_addr_t sp) {
     return sp &~ 0xf;
 }
 
-static inline dword_t copy_string(addr_t sp, const char *string) {
+static inline guest_addr_t copy_string(guest_addr_t sp, const char *string) {
     sp -= strlen(string) + 1;
     if (user_write_string(sp, string))
         return 0;
     return sp;
 }
 
-static inline dword_t args_copy(addr_t sp, struct exec_args args) {
+static inline guest_addr_t args_copy(guest_addr_t sp, struct exec_args args) {
     size_t size = args_size(args);
     sp -= size;
     if (user_write(sp, args.args, size))
@@ -530,7 +781,7 @@ static inline dword_t args_copy(addr_t sp, struct exec_args args) {
     return sp;
 }
 
-static inline ssize_t user_strlen(size_t p) {
+static inline ssize_t user_strlen(guest_addr_t p) {
     size_t i = 0;
     char c;
     do {
@@ -541,7 +792,7 @@ static inline ssize_t user_strlen(size_t p) {
     return i - 1;
 }
 
-static inline int user_memset(addr_t start, byte_t val, dword_t len) {
+static inline int user_memset(guest_addr_t start, byte_t val, dword_t len) {
     while (len--)
         if (user_put(start++, val))
             return 1;
@@ -649,51 +900,20 @@ static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, 
 }
 
 int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
-    char current_comm[sizeof(current->comm)];
-    lock(&current->general_lock, 0);
-    strncpy(current_comm, current->comm, sizeof(current_comm));
-    current_comm[sizeof(current_comm) - 1] = '\0';
-    unlock(&current->general_lock);
-
-    bool trace_attempt = trace_session_exec_attempt(current_comm, file);
-    char argv_trace[256];
-    int tty_type = -1;
-    int tty_num = -1;
-    if (trace_attempt) {
-        trace_exec_argv(&argv, argv_trace, sizeof(argv_trace));
-        trace_exec_tty(current, &tty_type, &tty_num);
-    }
-
     struct fd *fd = generic_open(file, O_RDONLY, 0);
-    if (IS_ERR(fd)) {
-        if (trace_attempt) {
-            printk("INFO: exec fail pid=%d tgid=%d comm=%s file=%s err=%d tty=%d:%d argv=%s\n",
-                   current->pid, current->tgid, current_comm, file, (int) PTR_ERR(fd),
-                   tty_type, tty_num, argv_trace);
-        }
+    if (IS_ERR(fd))
         return (int) PTR_ERR(fd);
-    }
 
     struct statbuf stat;
     int err = fd->mount->fs->fstat(fd, &stat);
     if (err < 0) {
         fd_close(fd);
-        if (trace_attempt) {
-            printk("INFO: exec fail pid=%d tgid=%d comm=%s file=%s err=%d tty=%d:%d argv=%s\n",
-                   current->pid, current->tgid, current_comm, file, err,
-                   tty_type, tty_num, argv_trace);
-        }
         return err;
     }
 
     // if nobody has permission to execute, it should be safe to not execute
     if (!(stat.mode & 0111)) {
         fd_close(fd);
-        if (trace_attempt) {
-            printk("INFO: exec fail pid=%d tgid=%d comm=%s file=%s err=%d tty=%d:%d argv=%s\n",
-                   current->pid, current->tgid, current_comm, file, _EACCES,
-                   tty_type, tty_num, argv_trace);
-        }
         return _EACCES;
     }
 
@@ -702,11 +922,7 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         err = shebang_exec(fd, file, argv, envp);
     fd_close(fd);
     if (err < 0) {
-        if (trace_attempt) {
-            printk("INFO: exec fail pid=%d tgid=%d comm=%s file=%s err=%d tty=%d:%d argv=%s\n",
-                   current->pid, current->tgid, current_comm, file, err,
-                   tty_type, tty_num, argv_trace);
-        }
+        amd64_trace_exec_loader_failure("do-execve", file, current->abi, NULL, 0, NULL, err, NULL);
         return err;
     }
 
@@ -722,12 +938,11 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
         current->fsgid = current->egid;
     }
 
-    char old_comm[sizeof(current->comm)];
-    strncpy(old_comm, current_comm, sizeof(old_comm));
-    old_comm[sizeof(old_comm) - 1] = '\0';
-
     // save current->comm
+    char old_comm[sizeof(current->comm)];
     lock(&current->general_lock, 0);
+    strncpy(old_comm, current->comm, sizeof(old_comm));
+    old_comm[sizeof(old_comm) - 1] = '\0';
     const char *basename = strrchr(file, '/');
     if (basename == NULL)
         basename = file;
@@ -737,10 +952,32 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     current->comm[sizeof(current->comm) - 1] = '\0';
     unlock(&current->general_lock);
 
-    if (trace_session_exec_name(old_comm) || trace_session_exec_name(basename)) {
-        printk("INFO: exec session pid=%d tgid=%d old=%s new=%s file=%s tty=%d:%d argv=%s\n",
-               current->pid, current->tgid, old_comm, basename, file,
-               tty_type, tty_num, argv_trace);
+    bool force_safe_i386 = current->abi == GUEST_ABI_I386 &&
+            i386_force_safe_exec_comm(current->comm);
+    current->force_single_step = (current->abi == GUEST_ABI_I386 &&
+            i386_single_step_comm_matches(current->comm)) || force_safe_i386;
+    current->force_no_jit_cache = (current->abi == GUEST_ABI_I386 &&
+            i386_no_cache_comm_matches(current->comm)) || force_safe_i386;
+    if (current->force_no_jit_cache) {
+        i386_special_trace_reset(current->tgid, current->comm);
+    }
+
+    {
+        enum { AMD64_EXEC_TRACE_BUDGET = 64 };
+        static unsigned amd64_exec_trace_count;
+        lock(&current->group->lock, 0);
+        struct tty *tty = current->group->tty;
+        unlock(&current->group->lock);
+        bool trace_exec = current->abi == GUEST_ABI_AMD64 &&
+                tty != NULL &&
+                (tty->type == TTY_CONSOLE_MAJOR || tty->type == TTY_PSEUDO_SLAVE_MAJOR);
+        bool tracked_exec = strstr(file, "rustc") != NULL || strstr(file, "cargo") != NULL;
+        bool tracked_lineage = amd64_trace_is_lineage_tgid(current->tgid);
+        if ((trace_exec || tracked_exec || tracked_lineage) &&
+                amd64_exec_trace_count < AMD64_EXEC_TRACE_BUDGET)
+            amd64_exec_trace_count++;
+        if (tracked_exec || tracked_lineage)
+            amd64_trace_track_exec(current->pid, current->tgid, file);
     }
 
     update_thread_name();
@@ -761,16 +998,22 @@ int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) 
     unlock(&current->sighand->lock);
 
     current->did_exec = true;
+    current->keepcaps = false;
     vfork_notify(current);
 
     if (current->ptrace.traced) {
         current->ptrace.syscall = current->cpu.eax;
         current->cpu.eax = 0;
-        ptrace_event_stop(SIGTRAP_, &(struct siginfo_) {
+        struct siginfo_ info = {
+            .sig = SIGTRAP_,
             .code = SI_USER_,
             .kill.pid = current->pid,
             .kill.uid = current->uid,
-        }, PTRACE_EVENT_EXEC_, current->pid);
+        };
+        if (current->ptrace.options & PTRACE_O_TRACEEXEC_)
+            ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXEC_, current->pid);
+        else
+            ptrace_signal_stop(SIGTRAP_, &info);
     }
 
     return 0;
@@ -786,15 +1029,20 @@ int do_execve(const char *file, size_t argc, const char *argv_p, const char *env
     return __do_execve(file, argv, envp);
 }
 
-static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
+static ssize_t user_read_string_array(guest_addr_t addr, char *buf, size_t max) {
+    size_t guest_ptr_size = task_abi_desc(current).pointer_size;
     size_t i = 0;
     size_t p = 0;
     for (;;) {
-        addr_t str_addr;
-        if (user_get(addr + i * sizeof(addr_t), str_addr))
-            return _EFAULT;
-        if (str_addr == 0)
+        qword_t str_addr_q;
+        ssize_t err = user_read_exec_ptr(addr + i * guest_ptr_size, &str_addr_q);
+        if (err < 0)
+            return err;
+        if (str_addr_q == 0)
             break;
+        if (!guest_abi_addr_valid(current->abi, str_addr_q))
+            return _EFAULT;
+        guest_addr_t str_addr = str_addr_q;
         size_t str_p = 0;
         for (;;) {
             if (p >= max)
@@ -812,6 +1060,21 @@ static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
         return _E2BIG;
     buf[p] = '\0';
     return i;
+}
+
+static ssize_t user_read_exec_ptr(guest_addr_t addr, qword_t *ptr_out) {
+    if (task_is_64bit(current)) {
+        qword_t ptr;
+        if (user_get(addr, ptr))
+            return _EFAULT;
+        *ptr_out = ptr;
+    } else {
+        dword_t ptr;
+        if (user_get(addr, ptr))
+            return _EFAULT;
+        *ptr_out = ptr;
+    }
+    return 0;
 }
 
 ssize_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
@@ -840,6 +1103,41 @@ ssize_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     }
     STRACE("})");
 
+    amd64_trace_exec_attempt(filename, argv);
+    err = do_execve(filename, argc, argv, envp);
+
+    free(envp);
+    free(argv);
+    return err;
+}
+
+ssize_t sys_execve_guest(guest_addr_t filename_addr, guest_addr_t argv_addr, guest_addr_t envp_addr) {
+    char filename[MAX_PATH];
+    if (user_read_string(filename_addr, filename, sizeof(filename)))
+        return _EFAULT;
+
+    ssize_t argc;
+    char *argv = NULL;
+    char *envp = NULL;
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    if (err < 0)
+        return err;
+
+    STRACE("execve(\"%.1000s\", {", filename);
+    const char *args = argv;
+    while (*args != '\0') {
+        STRACE("\"%.1000s\", ", args);
+        args += strlen(args) + 1;
+    }
+    STRACE("}, {");
+    args = envp;
+    while (*args != '\0') {
+        STRACE("\"%.1000s\", ", args);
+        args += strlen(args) + 1;
+    }
+    STRACE("})");
+
+    amd64_trace_exec_attempt(filename, argv);
     err = do_execve(filename, argc, argv, envp);
 
     free(envp);
@@ -848,8 +1146,12 @@ ssize_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
 }
 
 ssize_t sys_execveat(fd_t dirfd, addr_t filename_addr, addr_t argv_addr, addr_t envp_addr, int_t flags) {
-    if (flags & ~(AT_EMPTY_PATH_ | AT_SYMLINK_NOFOLLOW_))
+    if (flags & ~(AT_EMPTY_PATH_ | AT_SYMLINK_NOFOLLOW_)) {
+        if (current != NULL && current->abi == GUEST_ABI_AMD64 && amd64_trace_is_lineage_tgid(current->tgid))
+            printk("amd64 execveat invalid flags: pid=%d tgid=%d comm=%s flags=%#x dirfd=%d guest=0\n",
+                   current->pid, current->tgid, current->comm, flags, dirfd);
         return _EINVAL;
+    }
 
     char filename[MAX_PATH] = "";
     if (filename_addr != 0 && user_read_string(filename_addr, filename, sizeof(filename)))
@@ -891,6 +1193,7 @@ ssize_t sys_execveat(fd_t dirfd, addr_t filename_addr, addr_t argv_addr, addr_t 
     }
 
     STRACE("execveat(%d, \"%s\", ..., %#x)", dirfd, filename, flags);
+    amd64_trace_exec_attempt(resolved, argv);
     err = do_execve(resolved, argc, argv, envp);
 
 out_free_args:
@@ -899,7 +1202,77 @@ out_free_args:
     return err;
 }
 
-static ssize_t read_execve_user_args(addr_t argv_addr, addr_t envp_addr, ssize_t *argc_out,
+ssize_t sys_execveat_guest(fd_t dirfd, guest_addr_t filename_addr, guest_addr_t argv_addr, guest_addr_t envp_addr, int_t flags) {
+    if (flags & ~(AT_EMPTY_PATH_ | AT_SYMLINK_NOFOLLOW_)) {
+        if (current != NULL && current->abi == GUEST_ABI_AMD64 && amd64_trace_is_lineage_tgid(current->tgid))
+            printk("amd64 execveat invalid flags: pid=%d tgid=%d comm=%s flags=%#x dirfd=%d guest=1\n",
+                   current->pid, current->tgid, current->comm, flags, dirfd);
+        return _EINVAL;
+    }
+
+    char filename[MAX_PATH] = "";
+    if (filename_addr != 0 && user_read_string(filename_addr, filename, sizeof(filename)))
+        return _EFAULT;
+
+    ssize_t argc;
+    char *argv = NULL;
+    char *envp = NULL;
+    ssize_t err = read_execve_user_args(argv_addr, envp_addr, &argc, &argv, &envp);
+    if (err < 0)
+        return err;
+
+    char resolved[MAX_PATH];
+    if (filename[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH_)) {
+            err = _ENOENT;
+            goto out_free_args;
+        }
+        struct fd *fd = (dirfd == AT_FDCWD_) ? AT_PWD : f_get(dirfd);
+        if (fd == NULL) {
+            err = _EBADF;
+            goto out_free_args;
+        }
+        err = generic_getpath(fd, resolved);
+        if (err < 0)
+            goto out_free_args;
+    } else if (filename[0] == '/') {
+        strcpy(resolved, filename);
+    } else {
+        struct fd *at = (dirfd == AT_FDCWD_) ? AT_PWD : f_get(dirfd);
+        if (at == NULL) {
+            err = _EBADF;
+            goto out_free_args;
+        }
+        err = path_normalize(at, filename, resolved,
+                (flags & AT_SYMLINK_NOFOLLOW_) ? N_SYMLINK_NOFOLLOW : N_SYMLINK_FOLLOW);
+        if (err < 0)
+            goto out_free_args;
+    }
+
+    STRACE("execveat(%d, \"%.1000s\", {", dirfd, resolved);
+    const char *args = argv;
+    while (*args != '\0') {
+        STRACE("\"%.1000s\", ", args);
+        args += strlen(args) + 1;
+    }
+    STRACE("}, {");
+    args = envp;
+    while (*args != '\0') {
+        STRACE("\"%.1000s\", ", args);
+        args += strlen(args) + 1;
+    }
+    STRACE("}, %d)", flags);
+
+    amd64_trace_exec_attempt(resolved, argv);
+    err = do_execve(resolved, argc, argv, envp);
+
+out_free_args:
+    free(envp);
+    free(argv);
+    return err;
+}
+
+static ssize_t read_execve_user_args(guest_addr_t argv_addr, guest_addr_t envp_addr, ssize_t *argc_out,
         char **argv_out, char **envp_out) {
     char *argv = malloc(ARGV_MAX);
     if (argv == NULL)

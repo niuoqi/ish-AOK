@@ -74,6 +74,8 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
             *o = '\0';
             strcpy(possible_symlink, out);
             struct mount *mount = find_mount_and_trim_path(possible_symlink);
+            if (mount == NULL)
+                return _ENOENT;
             assert(path_is_normalized(possible_symlink));
             int res = _EINVAL;
             if (mount->fs->readlink)
@@ -130,6 +132,8 @@ static int __path_normalize(const char *at_path, const char *path, char *out, in
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     assert(at != NULL);
     if (strcmp(path, "") == 0)
+        return _ENOENT;
+    if (current == NULL || current->fs == NULL)
         return _ENOENT;
 
     // start with root or cwd, depending on whether it starts with a slash

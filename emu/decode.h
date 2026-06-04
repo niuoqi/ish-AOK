@@ -34,10 +34,19 @@ __no_instrument DECODER_RET glue(DECODER_NAME, OP_SIZE)(DECODER_ARGS) {
 #define READIMM16 READIMM_(imm, 16)
 #define READMODRM_MEM READMODRM; if (modrm.type == modrm_reg) UNDEFINED
 #define READMODRM_NOMEM READMODRM; if (modrm.type != modrm_reg) UNDEFINED
+#define TRACE_SPECIAL(opname) i386_trace_special_op(opname, state->orig_ip)
 
 restart:
    // TRACEIP(current);
     READINSN;
+    if (current != NULL && current->abi == GUEST_ABI_AMD64 &&
+            insn >= 0x40 && insn <= 0x4f) {
+        // Minimal long-mode bring-up: consume REX prefixes so amd64 code does
+        // not immediately decode them as legacy inc/dec opcodes. The actual
+        // REX.W/R/X/B semantics still need a later CPU-state conversion pass.
+        TRACEI("rex prefix %#x (ignored)", insn);
+        goto restart;
+    }
     switch (insn) {
 #define MAKE_OP(x, OP, op) \
         case x+0x0: TRACEI(op " reg8, modrm8"); \
@@ -69,6 +78,8 @@ restart:
 
                 case 0x31: TRACEI("rdtsc");
                            RDTSC; break;
+                case 0x05: TRACEI("syscall");
+                           SYSCALL_AMD64; break;
 
                 case 0x40: TRACEI("cmovo modrm, reg");
                            READMODRM; CMOV(O, modrm_val, modrm_reg,oz); break;
@@ -174,7 +185,8 @@ restart:
                 case 0xa2: TRACEI("cpuid"); CPUID(); break;
 
                 case 0xa3: TRACEI("bt reg, modrm");
-                           READMODRM; BT(modrm_reg, modrm_val,oz); break;
+                           READMODRM; if (modrm.type != modrm_reg) TRACE_SPECIAL("bt");
+                           BT(modrm_reg, modrm_val,oz); break;
 
                 case 0xa4: TRACEI("shld imm8, reg, modrm");
                            READMODRM; READIMM8; SHLD(imm, modrm_reg, modrm_val,oz); break;
@@ -182,7 +194,8 @@ restart:
                            READMODRM; SHLD(reg_c, modrm_reg, modrm_val,oz); break;
 
                 case 0xab: TRACEI("bts reg, modrm");
-                           READMODRM; BTS(modrm_reg, modrm_val,oz); break;
+                           READMODRM; if (modrm.type != modrm_reg) TRACE_SPECIAL("bts");
+                           BTS(modrm_reg, modrm_val,oz); break;
 
                 case 0xac: TRACEI("shrd imm8, reg, modrm");
                            READMODRM; READIMM8; SHRD(imm, modrm_reg, modrm_val,oz); break;
@@ -195,12 +208,17 @@ restart:
                            READMODRM; IMUL2(modrm_val, modrm_reg,oz); break;
 
                 case 0xb0: TRACEI("cmpxchg reg8, modrm8");
-                           READMODRM_MEM; CMPXCHG(modrm_reg, modrm_val,8); break;
+                           READMODRM_MEM;
+                           i386_trace_special_reg_op("cmpxchg8", state->orig_ip, modrm.reg);
+                           CMPXCHG(modrm_reg, modrm_val,8); break;
                 case 0xb1: TRACEI("cmpxchg reg, modrm");
-                           READMODRM_MEM; CMPXCHG(modrm_reg, modrm_val,oz); break;
+                           READMODRM_MEM;
+                           TRACE_SPECIAL(OP_SIZE == 16 ? "cmpxchg16" : "cmpxchg32");
+                           CMPXCHG(modrm_reg, modrm_val,oz); break;
 
                 case 0xb3: TRACEI("btr reg, modrm");
-                           READMODRM; BTR(modrm_reg, modrm_val,oz); break;
+                           READMODRM; if (modrm.type != modrm_reg) TRACE_SPECIAL("btr");
+                           BTR(modrm_reg, modrm_val,oz); break;
 
                 case 0xb6: TRACEI("movz modrm8, reg");
                            READMODRM; MOVZX(modrm_val, modrm_reg,8,oz); break;
@@ -222,7 +240,8 @@ restart:
 #undef GRP8
 
                 case 0xbb: TRACEI("btc reg, modrm");
-                           READMODRM; BTC(modrm_reg, modrm_val,oz); break;
+                           READMODRM; if (modrm.type != modrm_reg) TRACE_SPECIAL("btc");
+                           BTC(modrm_reg, modrm_val,oz); break;
                 case 0xbc: TRACEI("bsf modrm, reg");
                            READMODRM; BSF(modrm_val, modrm_reg,oz); break;
                 case 0xbd: TRACEI("bsr modrm, reg");
@@ -234,14 +253,19 @@ restart:
                            READMODRM; MOVSX(modrm_val, modrm_reg,16,oz); break;
 
                 case 0xc0: TRACEI("xadd reg8, modrm8");
-                           READMODRM; XADD(modrm_reg, modrm_val,8); break;
+                           READMODRM;
+                           i386_trace_special_reg_op("xadd8", state->orig_ip, modrm.reg);
+                           XADD(modrm_reg, modrm_val,8); break;
                 case 0xc1: TRACEI("xadd reg, modrm");
-                           READMODRM; XADD(modrm_reg, modrm_val,oz); break;
+                           READMODRM;
+                           TRACE_SPECIAL(OP_SIZE == 16 ? "xadd16" : "xadd32");
+                           XADD(modrm_reg, modrm_val,oz); break;
                 case 0xc2: TRACEI("cmppd xmm:modrm, xmm, imm8");
                            READMODRM; READIMM8; V_OP_IMM(fcmp_p, xmm_modrm_val, xmm_modrm_reg,64); break;
 
                 case 0xc7: READMODRM_MEM; switch (modrm.opcode) {
                                case 1: TRACEI("cmpxchg8b modrm");
+                                       TRACE_SPECIAL("cmpxchg8b");
                                        CMPXCHG8B(modrm_val,64); break;
                                default: UNDEFINED;
                            };
@@ -652,6 +676,14 @@ restart:
         MAKE_OP(0x38, CMP, "cmp");
 
         case 0x3e: TRACEI("segment ds (useless)"); goto restart;
+        case 0x64:
+                   if (current != NULL && current->abi == GUEST_ABI_AMD64) {
+                       TRACE("segment fs\n");
+                       SEG_FS();
+                   } else {
+                       TRACEI("segment fs (ignoring)");
+                   }
+                   goto restart;
 
         case 0x40: TRACEI("inc oax"); INC(reg_a,oz); break;
         case 0x41: TRACEI("inc ocx"); INC(reg_c,oz); break;
@@ -810,13 +842,15 @@ restart:
         case 0x8d: TRACEI("lea\t\t"); READMODRM_MEM;
                    MOV(addr, modrm_reg,oz); break;
 
-        // only gs is supported, and it does nothing
-        // see comment in sys/tls.c
+        // We only emulate one TLS-backed segment selector. FS and GS are both
+        // accepted here and share the same backing state, matching the rest of
+        // the tree where both FS: and GS: memory references resolve via
+        // cpu->tls_ptr. ES/CS/SS/DS remain unsupported.
         case 0x8c: TRACEI("mov seg, modrm\t"); READMODRM;
-            if (modrm.reg != reg_ebp) UNDEFINED;
+            if (modrm.reg != reg_esp && modrm.reg != reg_ebp) UNDEFINED;
             MOV(gs, modrm_val,16); break;
         case 0x8e: TRACEI("mov modrm, seg\t"); READMODRM;
-            if (modrm.reg != reg_ebp) UNDEFINED;
+            if (modrm.reg != reg_esp && modrm.reg != reg_ebp) UNDEFINED;
             MOV(modrm_val, gs,16); break;
 
         case 0x8f: TRACEI("pop modrm");
@@ -1107,6 +1141,14 @@ restart:
             lockrestart:
             READINSN;
             switch (insn) {
+                case 0x64:
+                    if (current != NULL && current->abi == GUEST_ABI_AMD64) {
+                        TRACE("segment fs\n");
+                        SEG_FS();
+                    } else {
+                        TRACEI("segment fs (ignoring)");
+                    }
+                    goto lockrestart;
                 case 0x65: TRACE("segment gs\n"); SEG_GS(); goto lockrestart;
 
                 case 0x66:
@@ -1123,8 +1165,10 @@ restart:
 
 #define MAKE_OP_ATOMIC(x, OP, op) \
         case x+0x0: TRACEI("lock " op " reg8, modrm8"); \
+                   TRACE_SPECIAL("lock " op); \
                    READMODRM_MEM; ATOMIC_##OP(modrm_reg, modrm_val,8); break; \
         case x+0x1: TRACEI("lock " op " reg, modrm"); \
+                   TRACE_SPECIAL("lock " op); \
                    READMODRM_MEM; ATOMIC_##OP(modrm_reg, modrm_val,oz); break; \
 
                 MAKE_OP_ATOMIC(0x00, ADD, "add");
@@ -1162,17 +1206,20 @@ restart:
                     READINSN;
                     switch (insn) {
                         case 0xab: TRACEI("lock bts reg, modrm");
+                                   TRACE_SPECIAL("lock bts");
                                    READMODRM; ATOMIC_BTS(modrm_reg, modrm_val,oz); break;
                         case 0xb3: TRACEI("lock btr reg, modrm");
+                                   TRACE_SPECIAL("lock btr");
                                    READMODRM; ATOMIC_BTR(modrm_reg, modrm_val,oz); break;
                         case 0xbb: TRACEI("lock btc reg, modrm");
+                                   TRACE_SPECIAL("lock btc");
                                    READMODRM; ATOMIC_BTC(modrm_reg, modrm_val,oz); break;
 
 #define GRP8_ATOMIC(bit, val,z) \
     switch (modrm.opcode) { \
-        case 5: TRACEI("bts"); ATOMIC_BTS(bit, val,z); break; \
-        case 6: TRACEI("btr"); ATOMIC_BTR(bit, val,z); break; \
-        case 7: TRACEI("btc"); ATOMIC_BTC(bit, val,z); break; \
+        case 5: TRACEI("bts"); TRACE_SPECIAL("lock bts"); ATOMIC_BTS(bit, val,z); break; \
+        case 6: TRACEI("btr"); TRACE_SPECIAL("lock btr"); ATOMIC_BTR(bit, val,z); break; \
+        case 7: TRACEI("btc"); TRACE_SPECIAL("lock btc"); ATOMIC_BTC(bit, val,z); break; \
         default: UNDEFINED; \
     }
                         case 0xba: TRACEI("lock grp8 imm8, modrm");
@@ -1180,17 +1227,26 @@ restart:
 #undef GRP8_ATOMIC
 
                         case 0xb0: TRACEI("lock cmpxchg reg8, modrm8");
-                                   READMODRM_MEM; ATOMIC_CMPXCHG(modrm_reg, modrm_val,8); break;
+                                   READMODRM_MEM;
+                                   i386_trace_special_reg_op("lock cmpxchg8", state->orig_ip, modrm.reg);
+                                   ATOMIC_CMPXCHG(modrm_reg, modrm_val,8); break;
                         case 0xb1: TRACEI("lock cmpxchg reg, modrm");
-                                   READMODRM_MEM; ATOMIC_CMPXCHG(modrm_reg, modrm_val,oz); break;
+                                   READMODRM_MEM;
+                                   TRACE_SPECIAL(OP_SIZE == 16 ? "lock cmpxchg16" : "lock cmpxchg32");
+                                   ATOMIC_CMPXCHG(modrm_reg, modrm_val,oz); break;
 
                         case 0xc0: TRACEI("lock xadd reg8, modrm8");
-                                   READMODRM_MEM; ATOMIC_XADD(modrm_reg, modrm_val,8); break;
+                                   READMODRM_MEM;
+                                   i386_trace_special_reg_op("lock xadd8", state->orig_ip, modrm.reg);
+                                   ATOMIC_XADD(modrm_reg, modrm_val,8); break;
                         case 0xc1: TRACEI("lock xadd reg, modrm");
-                                   READMODRM_MEM; ATOMIC_XADD(modrm_reg, modrm_val,oz); break;
+                                   READMODRM_MEM;
+                                   TRACE_SPECIAL(OP_SIZE == 16 ? "lock xadd16" : "lock xadd32");
+                                   ATOMIC_XADD(modrm_reg, modrm_val,oz); break;
 
                         case 0xc7: READMODRM_MEM; switch (modrm.opcode) {
                                        case 1: TRACEI("lock cmpxchg8b modrm");
+                                               TRACE_SPECIAL("lock cmpxchg8b");
                                                ATOMIC_CMPXCHG8B(modrm_val,64); break;
                                        default: UNDEFINED;
                                    };
@@ -1383,6 +1439,13 @@ restart:
 
 #undef GRP3
 
+        case 0xf5: TRACEI("cmc"); CMC; break;
+        case 0xf8: TRACEI("clc"); CLC; break;
+        case 0xf9: TRACEI("stc"); STC; break;
+        case 0xfa: TRACEI("cli");
+                   return INT_PRIV;
+        case 0xfb: TRACEI("sti");
+                   return INT_PRIV;
         case 0xfc: TRACEI("cld"); CLD; break;
         case 0xfd: TRACEI("std"); STD; break;
 

@@ -22,11 +22,13 @@
     restore_c
     gret
 
+.extern helper_trace_unaligned_atomic
+
 .macro do_cmpxchg size, s
     .gadget cmpxchg\size\()_mem
         write_prep \size, cmpxchg\size\()_mem
         ldr\s w8, [_xaddr]
-        setf_a eax, w8
+        setf_a w8, eax, \s
         mov w9, eax
         do_add sub, w9, w8, \s
         setf_zsp \s, val=w9
@@ -45,11 +47,27 @@
 
     .gadget atomic_cmpxchg\size\()_mem
         write_prep \size, atomic_cmpxchg\size\()_mem
+        .if \size != 8
+            tst _addr, (\size/8)-1
+            b.eq 9f
+            save_c
+            mov x0, _cpu
+            mov w1, _addr
+            .if \size == 16
+                mov w2, 1
+            .else
+                mov w2, 2
+            .endif
+            bl NAME(helper_trace_unaligned_atomic)
+            restore_c
+        9:
+        .endif
+        dmb ish
         mov w12, eax
-        ldr w11, [_xaddr]
+        ldr\s w11, [_xaddr]
     1:
         mov w8, w11
-        setf_a eax, w8
+        setf_a w8, eax, \s
         mov w9, eax
         do_add sub, w9, w8, \s
         setf_zsp \s, val=w9
@@ -71,6 +89,7 @@
         stlxr\s w10, w8, [_xaddr]
         cbnz w10, 2b
 
+        dmb ish
         write_done \size, atomic_cmpxchg\size\()_mem
         gret 1
         write_bullshit \size, atomic_cmpxchg\size\()_mem
@@ -96,6 +115,7 @@
 
     #cmpxchg8b via aligned exclusive 8b load
     write_prep 64, atomic_cmpxchg8b
+    dmb ish
     mov w9, eax
     bfi x9, xdx, 32, 32
     mov w10, ebx
@@ -114,6 +134,7 @@
     mov x9, x8                // x9 = actual value (for edx:eax return)
     mov w11, wzr              // failure
 4:
+    dmb ish
     write_done 64, atomic_cmpxchg8b
     ubfx xax, x9, 0, 32
     ubfx xdx, x9, 32, 32
@@ -128,6 +149,12 @@
     write_bullshit 64, atomic_cmpxchg8b
 
 2:  #All unaligned paths
+    save_c
+    mov x0, _cpu
+    mov w1, _addr
+    mov w2, 5
+    bl NAME(helper_trace_unaligned_atomic)
+    restore_c
     b segfault_write
 
 
@@ -205,6 +232,74 @@ do_helper 2
     do_helper read, \size
     do_helper write, \size
 .endr
+
+.macro do_helper_tlb_retint type
+    .gadget helper_tlb_\type\()_retint
+        save_regs
+        save_c
+        mov x0, _cpu
+        sub x1, _tlb, TLB_entries
+        .ifc \type,1
+            ldr x2, [_ip, 8]
+        .endif
+        .ifc \type,2
+            ldr x2, [_ip, 8]
+            ldr x3, [_ip, 16]
+        .endif
+        ldr x8, [_ip]
+        blr x8
+        mov x14, x0
+        restore_c
+        load_regs
+        cmn w14, #1
+        b.eq 0f
+        mov x0, x14
+        .ifc \type,0
+            ldr eip, [_ip, 16]
+        .endif
+        .ifc \type,1
+            ldr eip, [_ip, 24]
+        .endif
+        .ifc \type,2
+            ldr eip, [_ip, 32]
+        .endif
+        b jit_exit
+    0:
+        .ifc \type,0
+            gret 1
+        .endif
+        .ifc \type,1
+            gret 2
+        .endif
+        .ifc \type,2
+            gret 3
+        .endif
+.endm
+
+do_helper_tlb_retint 0
+do_helper_tlb_retint 1
+do_helper_tlb_retint 2
+
+.gadget helper_tlb_3_retint
+    save_regs
+    save_c
+    mov x0, _cpu
+    sub x1, _tlb, TLB_entries
+    ldr x2, [_ip, 8]
+    ldr x3, [_ip, 16]
+    ldr x4, [_ip, 24]
+    ldr x8, [_ip]
+    blr x8
+    mov x14, x0
+    restore_c
+    load_regs
+    cmn w14, #1
+    b.eq 0f
+    mov x0, x14
+    ldr eip, [_ip, 40]
+    b jit_exit
+0:
+    gret 4
 
 .macro do_vec_helper rm, _imm, size=
     .gadget vec_helper_\rm\size\_imm
@@ -308,4 +403,3 @@ do_helper 2
     ldrh w10, [_cpu, CPU_fsw]
     movs eax, w10, h
     gret
-

@@ -26,7 +26,7 @@ extern bool doEnableExtraLocking;
 
 extern struct timespec lock_pause;
 
-extern lock_t atomic_l_lock; // Used to make all lock operations atomic, even read->write and right->read -mke
+extern lock_t atomic_l_lock; // Used to make lock state transitions atomic.
 
 #if LOCK_DEBUG
 #define LOCK_INITIALIZER { \
@@ -80,6 +80,7 @@ void notify_once(cond_t *cond);
 
 extern __thread sigjmp_buf unwind_buf;
 extern __thread bool should_unwind;
+extern __thread bool should_mark_wait_interrupted;
 static inline int sigunwind_start(void) {
     if (sigsetjmp(unwind_buf, 1)) {
         should_unwind = false;

@@ -1,6 +1,7 @@
 #ifndef FD_H
 #define FD_H
 #include <dirent.h>
+#include <sys/stat.h>
 #include "emu/memory.h"
 #include "util/list.h"
 #include "util/ro_locks.h"
@@ -69,11 +70,14 @@ struct fd {
             bool unix_passcred;
             bool unix_devlog_sink;
             bool unix_initctl_sink;
+            bool reuseaddr;
+            bool reuseport;
             dword_t ip_mtu_discover;
             dword_t ipv6_mtu_discover;
             dword_t ipv6_mtu;
             bool ip_recverr;
             bool ipv6_recverr;
+            int ipv6_recverr_fd;
             bool icmp6_filter_valid;
             uint32_t icmp6_filter[8];
             dword_t tcp_defer_accept;
@@ -124,6 +128,7 @@ struct fd {
     // fs/inode data
     struct mount *mount;
     int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
+    bool realfs_fifo_had_data;
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
@@ -148,8 +153,22 @@ int fd_setflags(struct fd *fd, int flags);
 #define NAME_MAX 255
 struct dir_entry {
     qword_t inode;
+    byte_t type;
     char name[NAME_MAX + 1];
 };
+
+static inline byte_t dir_entry_type_for_mode(mode_t_ mode) {
+    switch (mode & S_IFMT) {
+        case S_IFREG: return DT_REG;
+        case S_IFDIR: return DT_DIR;
+        case S_IFLNK: return DT_LNK;
+        case S_IFCHR: return DT_CHR;
+        case S_IFBLK: return DT_BLK;
+        case S_IFIFO: return DT_FIFO;
+        case S_IFSOCK: return DT_SOCK;
+        default: return DT_UNKNOWN;
+    }
+}
 
 #define LSEEK_SET 0
 #define LSEEK_CUR 1
@@ -208,6 +227,7 @@ struct fdtable {
 };
 
 struct fdtable *fdtable_new(int size);
+struct fdtable *fdtable_retain(struct fdtable *table);
 void fdtable_release(struct fdtable *table);
 struct fdtable *fdtable_copy(struct fdtable *table);
 int fdtable_unshare_current(void);

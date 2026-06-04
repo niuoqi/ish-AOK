@@ -12,6 +12,34 @@
 #include "kernel/task.h"
 #include "kernel/errno.h"
 
+static struct fdtable *procfd_task_files_retain(struct task *task) {
+    struct fdtable *files = NULL;
+    lock(&task->general_lock, 0);
+    if (!task->exiting && task->files != NULL)
+        files = fdtable_retain(task->files);
+    unlock(&task->general_lock);
+    return files;
+}
+
+static struct fd *procfd_reopen_regular(struct fd *fd) {
+    if (fd->mount == NULL || fd->mount->fs == &procfs || !S_ISREG(fd->type))
+        return NULL;
+
+    char path[MAX_PATH];
+    int err = generic_getpath(fd, path);
+    if (err < 0)
+        return NULL;
+
+    int flags = fd_getflags(fd);
+    if (flags < 0)
+        return NULL;
+
+    struct fd *reopened = generic_open(path, flags & ~O_CLOEXEC_, 0);
+    if (IS_ERR(reopened))
+        return NULL;
+    return reopened;
+}
+
 static struct fd *procfd_openat(struct fd *at, const char *path_raw) {
     char path[MAX_PATH];
     int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW);
@@ -19,6 +47,8 @@ static struct fd *procfd_openat(struct fd *at, const char *path_raw) {
         return NULL;
 
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return NULL;
     if (mount->fs != &procfs) {
         mount_release(mount);
         return NULL;
@@ -33,42 +63,51 @@ static struct fd *procfd_openat(struct fd *at, const char *path_raw) {
     }
     mount_release(mount);
 
-    complex_lockt(&pids_lock, 0);
-    struct task *task = pid_get_task(pid);
-    if (task == NULL || task->exiting) {
-        unlock(&pids_lock);
+    struct task *task = pid_get_task_ref(pid);
+    if (task == NULL)
+        return ERR_PTR(_ENOENT);
+
+    struct fdtable *files = procfd_task_files_retain(task);
+    if (files == NULL) {
+        task_ref_cnt_mod(task, -1);
         return ERR_PTR(_ENOENT);
     }
 
-    lock(&task->files->lock, 0);
-    struct fd *fd = fdtable_get(task->files, fd_no);
+    lock(&files->lock, 0);
+    struct fd *fd = fdtable_get(files, fd_no);
     if (fd == NULL) {
-        unlock(&task->files->lock);
-        unlock(&pids_lock);
+        unlock(&files->lock);
+        fdtable_release(files);
+        task_ref_cnt_mod(task, -1);
         return ERR_PTR(_ENOENT);
     }
     fd = fd_retain(fd);
-    unlock(&task->files->lock);
-    unlock(&pids_lock);
+    unlock(&files->lock);
+    fdtable_release(files);
+    task_ref_cnt_mod(task, -1);
 
-    if (fd->type == S_IFREG || fd->type == S_IFDIR) {
-        char reopened_path[MAX_PATH];
-        int err = generic_getpath(fd, reopened_path);
-        if (err >= 0) {
-            int reopen_flags = fd->flags & (O_RDWR_ | O_WRONLY_ | O_NONBLOCK_ | O_APPEND_ | O_DIRECTORY_);
-            struct fd *reopened = generic_open(reopened_path, reopen_flags, 0);
-            if (!IS_ERR(reopened)) {
-                fd_close(fd);
-                return reopened;
-            }
-        }
+    // Linux procfd opens give regular files a fresh file position, which shell
+    // script loaders rely on when they execute /proc/self/fd/N after the
+    // parent has already inspected the script FD. Prefer a reopen for normal
+    // file-backed descriptors.
+    struct fd *reopened = procfd_reopen_regular(fd);
+    if (reopened != NULL) {
+        fd_close(fd);
+        return reopened;
     }
-
+    // Deleted or anonymous regular files may not have a stable path we can
+    // reopen. We cannot cheaply create a distinct open-file description here,
+    // but resetting the retained descriptor keeps shell interpreters from
+    // starting mid-script after apk has read the shebang.
+    if (S_ISREG(fd->type) && fd->ops != NULL && fd->ops->lseek != NULL)
+        fd->ops->lseek(fd, 0, SEEK_SET);
     return fd;
 }
 
 struct mount *find_mount_and_trim_path(char *path) {
     struct mount *mount = mount_find(path);
+    if (mount == NULL)
+        return NULL;
     char *dst = path;
     const char *src = path + mount->point_len;
     while (*src != '\0')
@@ -104,14 +143,38 @@ struct fd *generic_openat(struct fd *at, const char *path_raw, int flags, int mo
     if (err < 0)
         return ERR_PTR(err);
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return ERR_PTR(_ENOENT);
+
     bool created = false;
-    if (flags & O_CREAT_) {
-        struct statbuf existing;
-        int stat_err = mount->fs->stat(mount, path, &existing);
-        if (stat_err == _ENOENT)
-            created = true;
-    }
+
+    struct statbuf stat;
     lock(&inodes_lock, 0); // TODO: don't do this
+
+    // Stat before open so permission checks happen before backends can truncate
+    // or otherwise mutate an existing file as a side effect of open.
+    err = mount->fs->stat(mount, path, &stat);
+    if (err < 0) {
+        if ((flags & O_CREAT_) && err == _ENOENT) {
+            created = true;
+        } else {
+            unlock(&inodes_lock);
+            mount_release(mount);
+            return ERR_PTR(err);
+        }
+    } else {
+        int accmode;
+        if (flags & O_RDWR_) accmode = AC_R | AC_W;
+        else if (flags & O_WRONLY_) accmode = AC_W;
+        else accmode = AC_R;
+        err = access_check(&stat, accmode);
+        if (err < 0) {
+            unlock(&inodes_lock);
+            mount_release(mount);
+            return ERR_PTR(err);
+        }
+    }
+
     struct fd *fd = mount->fs->open(mount, path, flags, mode);
     if (IS_ERR(fd)) {
         unlock(&inodes_lock);
@@ -122,7 +185,6 @@ struct fd *generic_openat(struct fd *at, const char *path_raw, int flags, int mo
     }
     fd->mount = mount;
 
-    struct statbuf stat;
     err = fd->mount->fs->fstat(fd, &stat);
     if (err < 0) {
         unlock(&inodes_lock);
@@ -132,14 +194,6 @@ struct fd *generic_openat(struct fd *at, const char *path_raw, int flags, int mo
     unlock(&inodes_lock);
     fd->type = stat.mode & S_IFMT;
     fd->flags = flags;
-
-    int accmode;
-    if (flags & O_RDWR_) accmode = AC_R | AC_W;
-    else if (flags & O_WRONLY_) accmode = AC_W;
-    else accmode = AC_R;
-    err = access_check(&stat, accmode);
-    if (err < 0)
-        goto error;
 
     assert(!S_ISLNK(fd->type)); // would mean path_normalize didn't do its job
     if (S_ISBLK(fd->type) || S_ISCHR(fd->type)) {
@@ -201,6 +255,8 @@ int generic_accessat(struct fd *dirfd, const char *path_raw, int mode) {
         return err;
 
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     struct statbuf stat = {};
     err = mount->fs->stat(mount, path, &stat);
     mount_release(mount);
@@ -220,6 +276,13 @@ int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, co
         return err;
     struct mount *mount = find_mount_and_trim_path(src);
     struct mount *dst_mount = find_mount_and_trim_path(dst);
+    if (mount == NULL || dst_mount == NULL) {
+        if (mount != NULL)
+            mount_release(mount);
+        if (dst_mount != NULL)
+            mount_release(dst_mount);
+        return _ENOENT;
+    }
     if (mount != dst_mount)
         err = _EXDEV;
     else if (mount->fs->link == NULL)
@@ -237,6 +300,8 @@ int generic_unlinkat(struct fd *at, const char *path_raw) {
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->unlink)
         err = mount->fs->unlink(mount, path);
@@ -259,6 +324,13 @@ int generic_renameat(struct fd *src_at, const char *src_raw, struct fd *dst_at, 
         return _EBUSY;
     struct mount *mount = find_mount_and_trim_path(src);
     struct mount *dst_mount = find_mount_and_trim_path(dst);
+    if (mount == NULL || dst_mount == NULL) {
+        if (mount != NULL)
+            mount_release(mount);
+        if (dst_mount != NULL)
+            mount_release(dst_mount);
+        return _ENOENT;
+    }
     bool is_dir = false;
     if (mount != dst_mount)
         err = _EXDEV;
@@ -283,6 +355,8 @@ int generic_symlinkat(const char *target, struct fd *at, const char *link_raw) {
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(link);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->symlink)
         err = mount->fs->symlink(mount, target, link);
@@ -303,6 +377,8 @@ int generic_mknodat(struct fd *at, const char *path_raw, mode_t_ mode, dev_t_ de
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->mknod)
         err = mount->fs->mknod(mount, path, mode, dev);
@@ -318,6 +394,8 @@ int generic_setattrat(struct fd *at, const char *path_raw, struct attr attr, boo
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->setattr)
         err = mount->fs->setattr(mount, path, attr);
@@ -337,9 +415,11 @@ int generic_utime(struct fd *at, const char *path_raw, struct timespec atime, st
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->utime)
-        err = mount->fs->utime(mount, path, atime, mtime);
+        err = mount->fs->utime(mount, path, atime, mtime, follow_links);
     mount_release(mount);
     return err;
 }
@@ -350,6 +430,8 @@ ssize_t generic_readlinkat(struct fd *at, const char *path_raw, char *buf, size_
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EINVAL;
     if (mount->fs->readlink)
         err = mount->fs->readlink(mount, path, buf, bufsize);
@@ -363,6 +445,8 @@ int generic_mkdirat(struct fd *at, const char *path_raw, mode_t_ mode) {
     if (err < 0)
         return err;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     struct statbuf stat;
     err = mount->fs->stat(mount, path, &stat);
     if (err == 0) {
@@ -390,6 +474,8 @@ int generic_rmdirat(struct fd *at, const char *path_raw) {
     if (contains_mount_point(path))
         return _EBUSY;
     struct mount *mount = find_mount_and_trim_path(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = _EPERM;
     if (mount->fs->rmdir)
         err = mount->fs->rmdir(mount, path);

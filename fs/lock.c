@@ -154,6 +154,8 @@ static int file_lock_from_flock(struct fd *fd, struct flock_ *flock, struct file
             offset = 0;
             break;
         case LSEEK_CUR:
+            if (fd->ops->lseek == NULL)
+                return _ESPIPE;
             mylock(&fd->lock, 0);
             offset = fd->ops->lseek(fd, 0, LSEEK_CUR);
             unlock(&fd->lock);
@@ -197,7 +199,7 @@ static int flock_from_file_lock(struct file_lock *lock, struct flock_ *flock) {
     else
         flock->len = 0;
     flock->pid = lock->pid;
-    strncpy(lock->comm, flock->comm, 16);
+    strncpy(flock->comm, lock->comm, sizeof(flock->comm));
     return 0;
 }
 

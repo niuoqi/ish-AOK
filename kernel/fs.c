@@ -1,5 +1,6 @@
 #include "debug.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include "kernel/calls.h"
@@ -11,6 +12,8 @@
 #include "fs/inode.h"
 #include "fs/path.h"
 #include "fs/dev.h"
+#include "fs/devices.h"
+#include "fs/tty.h"
 
 #define MAX_RW_COUNT (16 * 1024 * 1024)
 
@@ -26,6 +29,63 @@ static struct fd *at_fd(fd_t f) {
 
 static bool fs_trace_elogind(void) {
     return false;
+}
+
+static bool http_resolver_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_HTTPFS") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    return current != NULL && strncmp(current->comm, "http", 4) == 0;
+}
+
+static bool ldconfig_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_LDCONFIG_FS") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    return current != NULL && strcmp(current->comm, "ldconfig") == 0;
+}
+
+static bool ldconfig_trace_path(const char *path) {
+    static const char *prefixes[] = {
+        "/lib/i386-linux-gnu",
+        "/usr/lib/i386-linux-gnu",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d/",
+        "/usr/local/lib/i386-linux-gnu",
+        "/usr/local/lib/i686-linux-gnu",
+        "/lib/i686-linux-gnu",
+        "/usr/lib/i686-linux-gnu",
+    };
+    if (path == NULL)
+        return false;
+    for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+        size_t len = strlen(prefixes[i]);
+        if (strncmp(path, prefixes[i], len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void http_resolver_trace_path_result(const char *op, fd_t at_f, const char *path, long result, unsigned long arg) {
+    if (!http_resolver_trace_enabled() || path == NULL)
+        return;
+    fprintf(stderr, "ish-httpfs:%s pid=%d comm=%s at=%d path=%s arg=%#lx result=%ld\n",
+            op, current->pid, current->comm, at_f, path, arg, result);
+}
+
+static void ldconfig_trace_path_result(const char *op, fd_t at_f, const char *path, long result,
+        unsigned long arg, const char *extra) {
+    if (!ldconfig_trace_enabled() || !ldconfig_trace_path(path))
+        return;
+    fprintf(stderr,
+            "ish-ldconfig-fs:%s pid=%d at=%d path=%s arg=%#lx result=%ld%s%s\n",
+            op, current->pid, at_f, path, arg, result,
+            extra != NULL ? " " : "",
+            extra != NULL ? extra : "");
 }
 
 static bool fs_trace_interesting_path(const char *path) {
@@ -44,6 +104,142 @@ static bool fs_trace_interesting_path(const char *path) {
             return true;
     }
     return false;
+}
+
+static struct tty *amd64_tty_stdio_trace_tty(fd_t fd_no) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_AMD64_TTY_STDIO") != NULL ? 1 : 0;
+    if (!enabled)
+        return NULL;
+    if (current == NULL || current->abi != GUEST_ABI_AMD64 || fd_no > 2)
+        return NULL;
+    if (strcmp(current->comm, "sh") != 0)
+        return NULL;
+    struct fd *fd = f_get(fd_no);
+    if (fd == NULL || fd->tty == NULL)
+        return NULL;
+    if (fd->tty->type != TTY_CONSOLE_MAJOR || fd->tty->num != 2)
+        return NULL;
+    return fd->tty;
+}
+
+static void amd64_tty_stdio_trace(const char *op, fd_t fd_no, guest_addr_t addr,
+        dword_t size, ssize_t res, const void *buf, size_t buf_len) {
+    enum { AMD64_TTY_STDIO_LOG_BUDGET = 128, AMD64_TTY_STDIO_PREVIEW = 48 };
+    static unsigned amd64_tty_stdio_log_count;
+    struct tty *tty = amd64_tty_stdio_trace_tty(fd_no);
+    if (tty == NULL)
+        return;
+    if (amd64_tty_stdio_log_count >= AMD64_TTY_STDIO_LOG_BUDGET)
+        return;
+    amd64_tty_stdio_log_count++;
+
+    char preview[AMD64_TTY_STDIO_PREVIEW + 1];
+    size_t preview_len = buf_len > AMD64_TTY_STDIO_PREVIEW ? AMD64_TTY_STDIO_PREVIEW : buf_len;
+    for (size_t i = 0; i < preview_len; i++) {
+        unsigned char ch = ((const unsigned char *) buf)[i];
+        preview[i] = (ch >= 0x20 && ch <= 0x7e) ? (char) ch : '.';
+    }
+    preview[preview_len] = '\0';
+
+    printk("amd64 tty io: tty=%d pid=%d comm=%s %s fd=%d addr=%#llx size=%u res=%zd data=\"%s\"\n",
+           tty->num, current->pid, current->comm, op, fd_no,
+           (unsigned long long) addr, size, res, preview);
+}
+
+static bool amd64_as_source_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_AMD64_AS_SOURCE") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    return current != NULL &&
+        current->abi == GUEST_ABI_AMD64 &&
+        strcmp(current->comm, "as") == 0;
+}
+
+static bool amd64_as_source_trace_path(const char *path) {
+    size_t len;
+    if (path == NULL)
+        return false;
+    if (strncmp(path, "/tmp/", 5) != 0)
+        return false;
+    len = strlen(path);
+    return len >= 3 && strcmp(path + len - 2, ".s") == 0;
+}
+
+static void amd64_as_source_trace_open(fd_t fd_no, const char *path, dword_t flags) {
+    enum { AMD64_AS_SOURCE_OPEN_BUDGET = 16 };
+    static unsigned amd64_as_source_open_count;
+
+    if (!amd64_as_source_trace_enabled() || !amd64_as_source_trace_path(path))
+        return;
+    if (amd64_as_source_open_count >= AMD64_AS_SOURCE_OPEN_BUDGET)
+        return;
+    amd64_as_source_open_count++;
+    printk("amd64 as source open: pid=%d tgid=%d fd=%d flags=%#x path=%s\n",
+           current->pid, current->tgid, fd_no, flags, path);
+}
+
+static void amd64_as_source_trace_read(fd_t fd_no, const char *path, const void *buf, size_t buf_len) {
+    enum {
+        AMD64_AS_SOURCE_READ_BUDGET = 8,
+        AMD64_AS_SOURCE_MAX_BYTES = 4096,
+        AMD64_AS_SOURCE_MAX_LINES = 80,
+        AMD64_AS_SOURCE_LINE_MAX = 192
+    };
+    static unsigned amd64_as_source_read_count;
+    static pid_t_ amd64_as_source_last_pid;
+    static fd_t amd64_as_source_last_fd;
+    const unsigned char *src = buf;
+    size_t limit, i = 0;
+    unsigned line_no = 1;
+
+    if (!amd64_as_source_trace_enabled() || !amd64_as_source_trace_path(path))
+        return;
+    if (amd64_as_source_read_count >= AMD64_AS_SOURCE_READ_BUDGET)
+        return;
+    if (amd64_as_source_last_pid == current->pid && amd64_as_source_last_fd == fd_no)
+        return;
+
+    amd64_as_source_last_pid = current->pid;
+    amd64_as_source_last_fd = fd_no;
+    amd64_as_source_read_count++;
+
+    limit = buf_len;
+    if (limit > AMD64_AS_SOURCE_MAX_BYTES)
+        limit = AMD64_AS_SOURCE_MAX_BYTES;
+
+    printk("amd64 as source read: pid=%d tgid=%d fd=%d path=%s bytes=%zu\n",
+           current->pid, current->tgid, fd_no, path, limit);
+
+    while (i < limit && line_no <= AMD64_AS_SOURCE_MAX_LINES) {
+        char line[AMD64_AS_SOURCE_LINE_MAX];
+        size_t li = 0;
+
+        while (i < limit) {
+            unsigned char ch = src[i++];
+            if (ch == '\n')
+                break;
+            if (li + 1 >= sizeof(line))
+                continue;
+            if (ch == '\t') {
+                if (li + 2 < sizeof(line)) {
+                    line[li++] = '\\';
+                    line[li++] = 't';
+                }
+                continue;
+            }
+            line[li++] = (ch >= 0x20 && ch <= 0x7e) ? (char) ch : '.';
+        }
+        line[li] = '\0';
+        printk("amd64 as source:%4u | %s\n", line_no, line);
+        line_no++;
+    }
+
+    if (i < buf_len)
+        printk("amd64 as source: ... truncated after %zu bytes\n", limit);
 }
 
 static void apply_umask(mode_t_ *mode) {
@@ -79,10 +275,7 @@ struct open_how_ {
     qword_t resolve;
 };
 
-dword_t sys_access(addr_t path_addr, dword_t mode) {
-    return sys_faccessat(AT_FDCWD_, path_addr, mode, 0);
-}
-dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) {
+static dword_t sys_faccessat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mode, dword_t flags) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -90,6 +283,13 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) 
     if (at == NULL)
         return _EBADF;
     STRACE("faccessat(%d, \"%s\", 0x%x, %d)", at_f, path, mode, flags);
+
+    bool trace_dpkg = getenv("ISH_TRACE_DPKG_STAT") != NULL &&
+        current != NULL &&
+        (strncmp(current->comm, "dpkg", 4) == 0 ||
+         strcmp(current->comm, "apt") == 0 ||
+         strcmp(current->comm, "apt-get") == 0) &&
+        strncmp(path, "/var/lib/dpkg/", strlen("/var/lib/dpkg/")) == 0;
 
     if (flags & ~FACCESSAT_ALLOWED_FLAGS_)
         return _EINVAL;
@@ -104,11 +304,29 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) 
         if (stat_flags != 0) {
             struct statbuf stat = {};
             int err = generic_statat(at, path, &stat, stat_flags);
+            if (trace_dpkg) {
+                fprintf(stderr,
+                        "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=stat result=%d\n",
+                        current->pid, current->comm, current->abi, at_f, path, mode, flags, err);
+            }
             if (err < 0)
                 return err;
-            return access_check(&stat, mode);
+            err = access_check(&stat, mode);
+            if (trace_dpkg) {
+                fprintf(stderr,
+                        "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=check result=%d dev=%llu ino=%llu\n",
+                        current->pid, current->comm, current->abi, at_f, path, mode, flags, err,
+                        (unsigned long long) stat.dev, (unsigned long long) stat.inode);
+            }
+            return err;
         }
-        return generic_accessat(at, path, mode);
+        int err = generic_accessat(at, path, mode);
+        if (trace_dpkg) {
+            fprintf(stderr,
+                    "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=generic result=%d\n",
+                    current->pid, current->comm, current->abi, at_f, path, mode, flags, err);
+        }
+        return err;
     }
 
     uid_t_ uid_tmp = current->fsuid;
@@ -119,17 +337,56 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) 
     if (stat_flags != 0) {
         struct statbuf stat = {};
         err = generic_statat(at, path, &stat, stat_flags);
+        if (trace_dpkg) {
+            fprintf(stderr,
+                    "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=stat result=%d\n",
+                    current->pid, current->comm, current->abi, at_f, path, mode, flags, err);
+        }
         if (err >= 0)
             err = access_check(&stat, mode);
+        if (trace_dpkg) {
+            fprintf(stderr,
+                    "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=check result=%d dev=%llu ino=%llu\n",
+                    current->pid, current->comm, current->abi, at_f, path, mode, flags, err,
+                    (unsigned long long) stat.dev, (unsigned long long) stat.inode);
+        }
     } else {
         err = generic_accessat(at, path, mode);
+        if (trace_dpkg) {
+            fprintf(stderr,
+                    "ish-dpkgstat:faccessat pid=%d comm=%s abi=%d at=%d path=%s mode=%#x flags=%#x phase=generic result=%d\n",
+                    current->pid, current->comm, current->abi, at_f, path, mode, flags, err);
+        }
     }
     current->fsuid = uid_tmp;
     current->fsgid = gid_tmp;
     return err;
 }
 
-fd_t sys_openat(fd_t at_f, addr_t path_addr, dword_t flags, mode_t_ mode) {
+dword_t sys_access_guest(guest_addr_t path_addr, dword_t mode) {
+    char path[MAX_PATH];
+    if (user_read_string(path_addr, path, sizeof(path)))
+        return _EFAULT;
+    dword_t err = sys_faccessat_common(AT_FDCWD_, path_addr, mode, 0);
+    http_resolver_trace_path_result("access", AT_FDCWD_, path, err, mode);
+    return err;
+}
+dword_t sys_access(addr_t path_addr, dword_t mode) {
+    return sys_access_guest(path_addr, mode);
+}
+dword_t sys_faccessat_guest(fd_t at_f, guest_addr_t path_addr, mode_t_ mode, dword_t flags) {
+    char path[MAX_PATH];
+    if (user_read_string(path_addr, path, sizeof(path)))
+        return _EFAULT;
+    dword_t err = sys_faccessat_common(at_f, path_addr, mode, flags);
+    http_resolver_trace_path_result("faccessat", at_f, path, err, ((unsigned long) flags << 16) | mode);
+    return err;
+}
+dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) {
+    return sys_faccessat_guest(at_f, path_addr, mode, flags);
+}
+
+fd_t sys_openat_guest(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -145,26 +402,32 @@ fd_t sys_openat(fd_t at_f, addr_t path_addr, dword_t flags, mode_t_ mode) {
     TASK_MAY_BLOCK {
         fd = generic_openat(at, path, flags, mode);
     }
-    if (IS_ERR(fd)) {
-        if (fs_trace_elogind()) {
-            printk("INFO: elogind openat pid=%d comm=%s at=%d path=%s flags=%#x mode=%#o result=%d\n",
-                   current->pid, current->comm, at_f, path, flags, mode, PTR_ERR(fd));
-        }
-        return PTR_ERR(fd);
-    }
+    if (IS_ERR(fd))
+        goto out;
     fd_t installed = f_install(fd, flags);
-    if (fs_trace_elogind() && fs_trace_interesting_path(path)) {
-        printk("INFO: elogind openat-ok pid=%d comm=%s at=%d path=%s flags=%#x mode=%#o fd=%d\n",
-               current->pid, current->comm, at_f, path, flags, mode, installed);
-    }
+    amd64_as_source_trace_open(installed, path, flags);
+    http_resolver_trace_path_result("openat", at_f, path, installed, flags);
+    ldconfig_trace_path_result("openat", at_f, path, installed, flags, NULL);
     return installed;
+out:
+    http_resolver_trace_path_result("openat", at_f, path, PTR_ERR(fd), flags);
+    ldconfig_trace_path_result("openat", at_f, path, PTR_ERR(fd), flags, NULL);
+    return PTR_ERR(fd);
+}
+
+fd_t sys_openat(fd_t at_f, addr_t path_addr, dword_t flags, mode_t_ mode) {
+    return sys_openat_guest(at_f, path_addr, flags, mode);
+}
+
+fd_t sys_open_guest(guest_addr_t path_addr, dword_t flags, mode_t_ mode) {
+    return sys_openat_guest(AT_FDCWD_, path_addr, flags, mode);
 }
 
 fd_t sys_open(addr_t path_addr, dword_t flags, mode_t_ mode) {
-    return sys_openat(AT_FDCWD_, path_addr, flags, mode);
+    return sys_open_guest(path_addr, flags, mode);
 }
 
-fd_t sys_openat2(fd_t at_f, addr_t path_addr, addr_t how_addr, dword_t size) {
+fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr, dword_t size) {
     STRACE("openat2(%d, %#x, %#x, %u)", at_f, path_addr, how_addr, size);
 
     if (size < sizeof(struct open_how_))
@@ -196,21 +459,29 @@ fd_t sys_openat2(fd_t at_f, addr_t path_addr, addr_t how_addr, dword_t size) {
     if (how.resolve != 0)
         return _EINVAL;
 
-    return sys_openat(at_f, path_addr, (dword_t) how.flags, (mode_t_) how.mode);
+    return sys_openat_guest(at_f, path_addr, (dword_t) how.flags, (mode_t_) how.mode);
 }
 
-fd_t sys_creat(addr_t path_addr, mode_t_ mode) {
+fd_t sys_openat2(fd_t at_f, addr_t path_addr, addr_t how_addr, dword_t size) {
+    return sys_openat2_guest(at_f, path_addr, how_addr, size);
+}
+
+fd_t sys_creat_guest(guest_addr_t path_addr, mode_t_ mode) {
     isGlibC = true; // In theory, musl should never call creat  -mk
     dword_t flags = 0;
     flags |= O_CREAT_;
     flags |= O_WRONLY_;
     flags |= O_TRUNC_;
-    return sys_openat(AT_FDCWD_, path_addr, flags, mode);
+    return sys_openat_guest(AT_FDCWD_, path_addr, flags, mode);
+}
+
+fd_t sys_creat(addr_t path_addr, mode_t_ mode) {
+    return sys_creat_guest(path_addr, mode);
 }
 
 
 
-dword_t sys_readlinkat(fd_t at_f, addr_t path_addr, addr_t buf_addr, dword_t bufsize) {
+static dword_t sys_readlinkat_common(fd_t at_f, guest_addr_t path_addr, guest_addr_t buf_addr, dword_t bufsize) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -227,14 +498,31 @@ dword_t sys_readlinkat(fd_t at_f, addr_t path_addr, addr_t buf_addr, dword_t buf
         if (user_write(buf_addr, buf, size))
             return _EFAULT;
     }
+    http_resolver_trace_path_result("readlinkat", at_f, path, size, bufsize);
+    if (size >= 0) {
+        char target[MAX_PATH + 32];
+        snprintf(target, sizeof(target), "target=\"%.*s\"", (int) size, buf);
+        ldconfig_trace_path_result("readlinkat", at_f, path, size, bufsize, target);
+    } else {
+        ldconfig_trace_path_result("readlinkat", at_f, path, size, bufsize, NULL);
+    }
     return (dword_t)size;
 }
 
+dword_t sys_readlinkat_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t buf_addr, dword_t bufsize) {
+    return sys_readlinkat_common(at_f, path_addr, buf_addr, bufsize);
+}
 dword_t sys_readlink(addr_t path_addr, addr_t buf_addr, dword_t bufsize) {
-    return sys_readlinkat(AT_FDCWD_, path_addr, buf_addr, bufsize);
+    return sys_readlinkat_common(AT_FDCWD_, path_addr, buf_addr, bufsize);
+}
+dword_t sys_readlink_guest(guest_addr_t path_addr, guest_addr_t buf_addr, dword_t bufsize) {
+    return sys_readlinkat_common(AT_FDCWD_, path_addr, buf_addr, bufsize);
+}
+dword_t sys_readlinkat(fd_t at_f, addr_t path_addr, addr_t buf_addr, dword_t bufsize) {
+    return sys_readlinkat_common(at_f, path_addr, buf_addr, bufsize);
 }
 
-dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
+static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
     char src[MAX_PATH];
     if (user_read_string(src_addr, src, sizeof(src)))
         return _EFAULT;
@@ -251,12 +539,21 @@ dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_add
     return generic_linkat(src_at, src, dst_at, dst);
 }
 
+dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
+}
 dword_t sys_link(addr_t src_addr, addr_t dst_addr) {
-    return sys_linkat(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+}
+dword_t sys_link_guest(guest_addr_t src_addr, guest_addr_t dst_addr) {
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+}
+dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
 }
 
 #define AT_REMOVEDIR_ 0x200
-dword_t sys_unlinkat(fd_t at_f, addr_t path_addr, int_t flags) {
+static dword_t sys_unlinkat_common(fd_t at_f, guest_addr_t path_addr, int_t flags) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -270,11 +567,20 @@ dword_t sys_unlinkat(fd_t at_f, addr_t path_addr, int_t flags) {
         return generic_unlinkat(at, path);
 }
 
+dword_t sys_unlinkat_guest(fd_t at_f, guest_addr_t path_addr, int_t flags) {
+    return sys_unlinkat_common(at_f, path_addr, flags);
+}
 dword_t sys_unlink(addr_t path_addr) {
-    return sys_unlinkat(AT_FDCWD_, path_addr, 0);
+    return sys_unlinkat_common(AT_FDCWD_, path_addr, 0);
+}
+dword_t sys_unlink_guest(guest_addr_t path_addr) {
+    return sys_unlinkat_common(AT_FDCWD_, path_addr, 0);
+}
+dword_t sys_unlinkat(fd_t at_f, addr_t path_addr, int_t flags) {
+    return sys_unlinkat_common(at_f, path_addr, flags);
 }
 
-dword_t sys_renameat2(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags) {
+static dword_t sys_renameat2_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
     if (flags != 0)
         return _EINVAL;
     char src[MAX_PATH];
@@ -293,15 +599,27 @@ dword_t sys_renameat2(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_
     return generic_renameat(src_at, src, dst_at, dst);
 }
 
+dword_t sys_renameat2_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
+    return sys_renameat2_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
+}
 dword_t sys_renameat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
-    return sys_renameat2(src_at_f, src_addr, dst_at_f, dst_addr, 0);
+    return sys_renameat2_common(src_at_f, src_addr, dst_at_f, dst_addr, 0);
 }
 
 dword_t sys_rename(addr_t src_addr, addr_t dst_addr) {
-    return sys_renameat2(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
+    return sys_renameat2_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
+}
+dword_t sys_renameat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
+    return sys_renameat2_common(src_at_f, src_addr, dst_at_f, dst_addr, 0);
+}
+dword_t sys_rename_guest(guest_addr_t src_addr, guest_addr_t dst_addr) {
+    return sys_renameat2_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
+}
+dword_t sys_renameat2(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags) {
+    return sys_renameat2_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
 }
 
-dword_t sys_symlinkat(addr_t target_addr, fd_t at_f, addr_t link_addr) {
+static dword_t sys_symlinkat_common(guest_addr_t target_addr, fd_t at_f, guest_addr_t link_addr) {
     char target[MAX_PATH];
     if (user_read_string(target_addr, target, sizeof(target)))
         return _EFAULT;
@@ -315,11 +633,20 @@ dword_t sys_symlinkat(addr_t target_addr, fd_t at_f, addr_t link_addr) {
     return generic_symlinkat(target, at, link);
 }
 
+dword_t sys_symlinkat_guest(guest_addr_t target_addr, fd_t at_f, guest_addr_t link_addr) {
+    return sys_symlinkat_common(target_addr, at_f, link_addr);
+}
 dword_t sys_symlink(addr_t target_addr, addr_t link_addr) {
-    return sys_symlinkat(target_addr, AT_FDCWD_, link_addr);
+    return sys_symlinkat_common(target_addr, AT_FDCWD_, link_addr);
+}
+dword_t sys_symlink_guest(guest_addr_t target_addr, guest_addr_t link_addr) {
+    return sys_symlinkat_common(target_addr, AT_FDCWD_, link_addr);
+}
+dword_t sys_symlinkat(addr_t target_addr, fd_t at_f, addr_t link_addr) {
+    return sys_symlinkat_common(target_addr, at_f, link_addr);
 }
 
-dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
+static dword_t sys_mknodat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -336,8 +663,17 @@ dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     return err;
 }
 
+dword_t sys_mknodat_guest(fd_t at_f, guest_addr_t path_addr, mode_t_ mode, dev_t_ dev) {
+    return sys_mknodat_common(at_f, path_addr, mode, dev);
+}
 dword_t sys_mknod(addr_t path_addr, mode_t_ mode, dev_t_ dev) {
-    return sys_mknodat(AT_FDCWD_, path_addr, mode, dev);
+    return sys_mknodat_common(AT_FDCWD_, path_addr, mode, dev);
+}
+dword_t sys_mknod_guest(guest_addr_t path_addr, mode_t_ mode, dev_t_ dev) {
+    return sys_mknodat_common(AT_FDCWD_, path_addr, mode, dev);
+}
+dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
+    return sys_mknodat_common(at_f, path_addr, mode, dev);
 }
 
 static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
@@ -361,20 +697,23 @@ static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
 
     if (res >= 0) {
         char path[MAX_PATH];
-        if (fs_trace_elogind() && generic_getpath(fd, path) == 0 && fs_trace_interesting_path(path)) {
-            size_t print_size = res;
-            if (print_size > 80)
-                print_size = 80;
-            printk("INFO: elogind read pid=%d comm=%s fd=%d path=%s size=%zd data=\"%.*s\"\n",
-                   current->pid, current->comm, fd_no, path, res, (int) print_size, (char *) buf);
+        if (generic_getpath(fd, path) == 0) {
+            amd64_as_source_trace_read(fd_no, path, buf, (size_t) res);
+            if (fs_trace_elogind() && fs_trace_interesting_path(path)) {
+                size_t print_size = res;
+                if (print_size > 80)
+                    print_size = 80;
+                printk("INFO: elogind read pid=%d comm=%s fd=%d path=%s size=%zd data=\"%.*s\"\n",
+                       current->pid, current->comm, fd_no, path, res, (int) print_size, (char *) buf);
+            }
         }
         STRACE(" -> %zd bytes", res);
     }
     return res;
 }
 
-dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
-    STRACE("read(%d, 0x%x, %d)", fd_no, buf_addr, size);
+static dword_t sys_read_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size) {
+    STRACE("read(%d, %#llx, %d)", fd_no, (unsigned long long) buf_addr, size);
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
 
@@ -391,6 +730,9 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
     TASK_MAY_BLOCK {
         res = (int_t)sys_read_buf(fd_no, buf, size);
     }
+    if (res == _EINTR && signal_should_restart_syscall())
+        res = _ERESTART;
+    amd64_tty_stdio_trace("read", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : 0);
     if (res >= 0) {
         if (user_write(buf_addr, buf, res))
             res = _EFAULT;
@@ -398,6 +740,14 @@ dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
     if (buf != stack_buf) free(buf);
     
     return res;
+}
+
+dword_t sys_read(fd_t fd_no, addr_t buf_addr, dword_t size) {
+    return sys_read_common(fd_no, buf_addr, size);
+}
+
+dword_t sys_read_guest(fd_t fd_no, guest_addr_t buf_addr, dword_t size) {
+    return sys_read_common(fd_no, buf_addr, size);
 }
 
 static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
@@ -417,6 +767,8 @@ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
         return _EBADF;
     }
     if (res > 0) {
+        if (fd->mount != NULL && fd->mount->fs == &procfs)
+            return res;
         char path[MAX_PATH];
         if (generic_getpath(fd, path) == 0) {
             inotify_notify_modify(path);
@@ -432,7 +784,7 @@ static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
     return res;
 }
 
-dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
+static dword_t sys_write_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size) {
     // FIXME this is a DOS vector, should ideally use vectorized I/O
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
@@ -449,14 +801,23 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
     if (user_read(buf_addr, buf, size))
         goto out;
 
-    STRACE("write(%d, %#x, %d)", fd_no, buf_addr, size);
+    STRACE("write(%d, %#llx, %d)", fd_no, (unsigned long long) buf_addr, size);
 
     TASK_MAY_BLOCK {
         res = sys_write_buf(fd_no, buf, size);
     }
+    amd64_tty_stdio_trace("write", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : size);
 out:
     if (buf != stack_buf) free(buf);
     return res;
+}
+
+dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
+    return sys_write_common(fd_no, buf_addr, size);
+}
+
+dword_t sys_write_guest(fd_t fd_no, guest_addr_t buf_addr, dword_t size) {
+    return sys_write_common(fd_no, buf_addr, size);
 }
 
 // The vector operations work by flattening the vector into a malloc buffer.
@@ -466,32 +827,16 @@ out:
 // that yet because it's more work and the efficiency gain from that is dwarfed
 // by the inefficiency of the emulator.
 
-static struct iovec_ *read_iovec(addr_t iovec_addr, unsigned iovec_count) {
-    dword_t iovec_size = sizeof(struct iovec_) * iovec_count;
-    struct iovec_ *iovec = malloc(iovec_size);
-    if (iovec == NULL)
-        return ERR_PTR(_ENOMEM);
-    if (user_read(iovec_addr, iovec, iovec_size)) {
-        free(iovec);
-        return ERR_PTR(_EFAULT);
-    }
-    return iovec;
-}
-
-static ssize_t iovec_size(struct iovec_ *iovec, unsigned iovec_count) {
+static ssize_t iovec_size(struct guest_iovec_ *iovec, unsigned iovec_count) {
     size_t size = 0;
     for (unsigned i = 0; i < iovec_count; i++)
         size += iovec[i].len;
     return size;
 }
 
-dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
-    STRACE("readv(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
-   // if(doEnableExtraLocking)
-    //    pthread_mutex_lock(&extra_lock);
-    struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
-    //if(doEnableExtraLocking)
-     //   pthread_mutex_unlock(&extra_lock);
+static dword_t sys_readv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count, enum guest_abi abi) {
+    STRACE("readv(%d, %#llx, %d)", fd_no, (unsigned long long) iovec_addr, iovec_count);
+    struct guest_iovec_ *iovec = user_read_iovecs_abi(current, abi, iovec_addr, iovec_count);
     
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
@@ -523,7 +868,7 @@ dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
         if (offset + len > total)
             len = total - offset;
 
-        STRACE(" {base=%#x, len=%u}", iovec[i].base, iovec[i].len);
+        STRACE(" {base=%#llx, len=%zu}", (unsigned long long) iovec[i].base, iovec[i].len);
 
         if (user_write(iovec[i].base, buf + offset, len)) {
             res = _EFAULT;
@@ -538,9 +883,25 @@ error:
     return res;
 }
 
-dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
-    STRACE("writev(%d, %#x, %d)", fd_no, iovec_addr, iovec_count);
-    struct iovec_ *iovec = read_iovec(iovec_addr, iovec_count);
+dword_t sys_readv(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
+    return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
+}
+
+dword_t sys_readv_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count) {
+    return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
+}
+
+dword_t sys_readv_amd64(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
+    return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
+}
+
+dword_t sys_readv_amd64_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count) {
+    return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
+}
+
+static dword_t sys_writev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count, enum guest_abi abi) {
+    STRACE("writev(%d, %#llx, %d)", fd_no, (unsigned long long) iovec_addr, iovec_count);
+    struct guest_iovec_ *iovec = user_read_iovecs_abi(current, abi, iovec_addr, iovec_count);
     if (IS_ERR(iovec))
         return PTR_ERR(iovec);
     size_t io_size = iovec_size(iovec, iovec_count);
@@ -570,16 +931,34 @@ dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
             goto error;
         }
 
-        STRACE(" {base=%#x, len=%u}", iovec[i].base, iovec[i].len);
+        STRACE(" {base=%#llx, len=%zu}", (unsigned long long) iovec[i].base, iovec[i].len);
         offset += copy_len;
     }
     TASK_MAY_BLOCK {
         res = sys_write_buf(fd_no, buf, offset);
     }
+    amd64_tty_stdio_trace("writev", fd_no, iovec_addr, (dword_t) offset, res, buf,
+            res > 0 ? (size_t) res : offset);
 error:
     if (buf != stack_buf) free(buf);
     free(iovec);
     return res;
+}
+
+dword_t sys_writev(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
+    return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
+}
+
+dword_t sys_writev_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count) {
+    return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
+}
+
+dword_t sys_writev_amd64(fd_t fd_no, addr_t iovec_addr, dword_t iovec_count) {
+    return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
+}
+
+dword_t sys_writev_amd64_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count) {
+    return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
 }
 
 dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, dword_t whence) {
@@ -602,20 +981,36 @@ dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, 
 }
 
 dword_t sys_lseek(fd_t f, dword_t off, dword_t whence) {
+    off_t_ res = sys_lseek_guest(f, off, whence);
+    if ((dword_t) res != res)
+        return _EOVERFLOW;
+    return (dword_t) res;
+}
+
+dword_t sys_lseek_amd64(fd_t f, dword_t off, dword_t whence) {
+    off_t_ res = sys_lseek_amd64_guest(f, off, whence);
+    if ((dword_t) res != res)
+        return _EOVERFLOW;
+    return (dword_t) res;
+}
+
+off_t_ sys_lseek_guest(fd_t f, off_t_ off, dword_t whence) {
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
     if (!fd->ops->lseek)
         return _ESPIPE;
     lock(&fd->lock, 0);
-    off_t res = fd->ops->lseek(fd, off, whence);
+    off_t_ res = fd->ops->lseek(fd, off, whence);
     unlock(&fd->lock);
-    if ((dword_t) res != res)
-        return _EOVERFLOW;
     return res;
 }
 
-dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
+off_t_ sys_lseek_amd64_guest(fd_t f, off_t_ off, dword_t whence) {
+    return sys_lseek_guest(f, off, whence);
+}
+
+dword_t sys_pread_guest(fd_t f, guest_addr_t buf_addr, dword_t size, off_t_ off) {
     STRACE("pread(%d, 0x%x, %d, %d)", f, buf_addr, size, off);
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
@@ -670,7 +1065,11 @@ out:
     return res;
 }
 
-dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
+dword_t sys_pread(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
+    return sys_pread_guest(f, buf_addr, size, off);
+}
+
+dword_t sys_pwrite_guest(fd_t f, guest_addr_t buf_addr, dword_t size, off_t_ off) {
     STRACE("pwrite(%d, 0x%x, %d, %d)", f, buf_addr, size, off);
     if (size > MAX_RW_COUNT)
         size = MAX_RW_COUNT;
@@ -715,28 +1114,65 @@ dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
     return res;
 }
 
-static int fd_ioctl(struct fd *fd, dword_t cmd, dword_t arg) {
+dword_t sys_pwrite(fd_t f, addr_t buf_addr, dword_t size, off_t_ off) {
+    return sys_pwrite_guest(f, buf_addr, size, off);
+}
+
+static bool ioctl_user_arg_needs_read(dword_t cmd) {
+    switch (cmd) {
+        case TCGETS_:
+        case TIOCGPGRP_:
+        case TIOCGWINSZ_:
+        case TIOCGPTN_:
+        case TIOCGPKT_:
+        case FIONREAD_:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static bool ioctl_user_arg_needs_write(dword_t cmd) {
+    switch (cmd) {
+        case TCSETS_:
+        case TCSETSF_:
+        case TCSETSW_:
+        case TIOCSPGRP_:
+        case TIOCSPTLCK_:
+        case TIOCPKT_:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static int fd_ioctl(struct fd *fd, dword_t cmd, guest_addr_t arg) {
     ssize_t size = -1;
     if (fd->ops->ioctl_size)
         size = fd->ops->ioctl_size(cmd);
     if (size < 0)
         return _ENOTTY;
     if (size == 0)
-        return fd->ops->ioctl(fd, cmd, (void *) (long) arg);
+        return fd->ops->ioctl(fd, cmd, (void *) (unsigned long) arg);
 
-    // praying that this won't break
+    // Some ioctls are pure output and must not fault on unreadable scratch
+    // buffers. Others are pure input and do not need a copy-back.
     char buf[size];
-    if (user_read(arg, buf, size))
-        return _EFAULT;
+    if (ioctl_user_arg_needs_read(cmd)) {
+        if (user_read(arg, buf, size))
+            return _EFAULT;
+    } else {
+        memset(buf, 0, size);
+    }
     int res = fd->ops->ioctl(fd, cmd, buf);
     if (res < 0)
         return res;
-    if (user_write(arg, buf, size))
+    if (ioctl_user_arg_needs_write(cmd) && user_write(arg, buf, size))
         return _EFAULT;
     return res;
 }
 
-static int set_nonblock(struct fd *fd, addr_t nb_addr) {
+static int set_nonblock(struct fd *fd, guest_addr_t nb_addr) {
     dword_t nonblock;
     if (user_get(nb_addr, nonblock))
         return _EFAULT;
@@ -748,8 +1184,8 @@ static int set_nonblock(struct fd *fd, addr_t nb_addr) {
     return fd_setflags(fd, flags);
 }
 
-dword_t sys_ioctl(fd_t f, dword_t cmd, dword_t arg) {
-    STRACE("ioctl(%d, 0x%x, 0x%x)", f, cmd, arg);
+static dword_t sys_ioctl_common(fd_t f, dword_t cmd, guest_addr_t arg) {
+    STRACE("ioctl(%d, 0x%x, %#llx)", f, cmd, (unsigned long long) arg);
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
@@ -769,17 +1205,18 @@ dword_t sys_ioctl(fd_t f, dword_t cmd, dword_t arg) {
     TASK_MAY_BLOCK {
         res = fd_ioctl(fd, cmd, arg);
     }
-    if (fs_trace_elogind()) {
-        char path[MAX_PATH];
-        if (generic_getpath(fd, path) == 0 && fs_trace_interesting_path(path)) {
-            printk("INFO: elogind ioctl pid=%d comm=%s fd=%d path=%s cmd=%#x arg=%#x result=%d\n",
-                   current->pid, current->comm, f, path, cmd, arg, res);
-        }
-    }
     return res;
 }
 
-dword_t sys_getcwd(addr_t buf_addr, dword_t size) {
+dword_t sys_ioctl(fd_t f, dword_t cmd, dword_t arg) {
+    return sys_ioctl_common(f, cmd, arg);
+}
+
+dword_t sys_ioctl_guest(fd_t f, dword_t cmd, guest_addr_t arg) {
+    return sys_ioctl_common(f, cmd, arg);
+}
+
+static dword_t sys_getcwd_common(guest_addr_t buf_addr, dword_t size) {
     STRACE("getcwd(%#x, %#x)", buf_addr, size);
     lock(&current->fs->lock, 0);
     struct fd *wd = current->fs->pwd;
@@ -801,6 +1238,12 @@ dword_t sys_getcwd(addr_t buf_addr, dword_t size) {
         res = _EFAULT;
     return res;
 }
+dword_t sys_getcwd_guest(guest_addr_t buf_addr, dword_t size) {
+    return sys_getcwd_common(buf_addr, size);
+}
+dword_t sys_getcwd(addr_t buf_addr, dword_t size) {
+    return sys_getcwd_common(buf_addr, size);
+}
 
 static struct fd *open_dir(const char *path) {
     struct statbuf stat;
@@ -820,7 +1263,7 @@ void fs_chdir(struct fs_info *fs, struct fd *fd) {
     unlock(&fs->lock);
 }
 
-dword_t sys_chdir(addr_t path_addr) {
+static dword_t sys_chdir_common(guest_addr_t path_addr) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -831,6 +1274,12 @@ dword_t sys_chdir(addr_t path_addr) {
         return PTR_ERR(dir);
     fs_chdir(current->fs, dir);
     return 0;
+}
+dword_t sys_chdir_guest(guest_addr_t path_addr) {
+    return sys_chdir_common(path_addr);
+}
+dword_t sys_chdir(addr_t path_addr) {
+    return sys_chdir_common(path_addr);
 }
 
 dword_t sys_fchdir(fd_t f) {
@@ -843,7 +1292,7 @@ dword_t sys_fchdir(fd_t f) {
     return 0;
 }
 
-dword_t sys_chroot(addr_t path_addr) {
+static dword_t sys_chroot_common(guest_addr_t path_addr) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -857,6 +1306,12 @@ dword_t sys_chroot(addr_t path_addr) {
     current->fs->root = dir;
     unlock(&current->fs->lock);
     return 0;
+}
+dword_t sys_chroot_guest(guest_addr_t path_addr) {
+    return sys_chroot_common(path_addr);
+}
+dword_t sys_chroot(addr_t path_addr) {
+    return sys_chroot_common(path_addr);
 }
 
 dword_t sys_umask(dword_t mask) {
@@ -884,6 +1339,29 @@ static int_t statfs_mount(struct mount *mount, addr_t buf_addr) {
     if (err < 0)
         return err;
     struct statfs_ out_buf = {
+        .type = buf.type,
+        .bsize = buf.bsize,
+        .blocks = buf.blocks,
+        .bfree = buf.bfree,
+        .bavail = buf.bavail,
+        .files = buf.files,
+        .ffree = buf.ffree,
+        .fsid = buf.fsid,
+        .namelen = buf.namelen,
+        .frsize = buf.frsize,
+        .flags = buf.flags,
+    };
+    if (user_put(buf_addr, out_buf))
+        return _EFAULT;
+    return 0;
+}
+
+static int_t statfs_mount_amd64(struct mount *mount, guest_addr_t buf_addr) {
+    struct statfsbuf buf = {};
+    int err = mount_statfs(mount, &buf);
+    if (err < 0)
+        return err;
+    struct amd64_statfs_ out_buf = {
         .type = buf.type,
         .bsize = buf.bsize,
         .blocks = buf.blocks,
@@ -934,9 +1412,34 @@ dword_t sys_statfs(addr_t path_addr, addr_t buf_addr) {
     if (err < 0)
         return err;
     struct mount *mount = mount_find(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = statfs_mount(mount, buf_addr);
     mount_release(mount);
     return err;
+}
+
+static dword_t sys_statfs_amd64_common(guest_addr_t path_addr, guest_addr_t buf_addr) {
+    char path_raw[MAX_PATH];
+    if (user_read_string(path_addr, path_raw, sizeof(path_raw)))
+        return _EFAULT;
+    STRACE("statfs_amd64(\"%s\", %#x)", path_raw, buf_addr);
+    char path[MAX_PATH];
+    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_NOFOLLOW);
+    if (err < 0)
+        return err;
+    struct mount *mount = mount_find(path);
+    if (mount == NULL)
+        return _ENOENT;
+    err = statfs_mount_amd64(mount, buf_addr);
+    mount_release(mount);
+    return err;
+}
+dword_t sys_statfs_amd64_guest(guest_addr_t path_addr, guest_addr_t buf_addr) {
+    return sys_statfs_amd64_common(path_addr, buf_addr);
+}
+dword_t sys_statfs_amd64(addr_t path_addr, addr_t buf_addr) {
+    return sys_statfs_amd64_common(path_addr, buf_addr);
 }
 
 dword_t sys_statfs64(addr_t path_addr, dword_t buf_size, addr_t buf_addr) {
@@ -951,6 +1454,8 @@ dword_t sys_statfs64(addr_t path_addr, dword_t buf_size, addr_t buf_addr) {
     if (err < 0)
         return err;
     struct mount *mount = mount_find(path);
+    if (mount == NULL)
+        return _ENOENT;
     err = statfs64_mount(mount, buf_addr);
     mount_release(mount);
     return err;
@@ -961,6 +1466,16 @@ dword_t sys_fstatfs(fd_t f, addr_t buf_addr) {
     if (fd == NULL)
         return _EBADF;
     return statfs_mount(fd->mount, buf_addr);
+}
+
+dword_t sys_fstatfs_amd64_guest(fd_t f, guest_addr_t buf_addr) {
+    struct fd *fd = f_get(f);
+    if (fd == NULL)
+        return _EBADF;
+    return statfs_mount_amd64(fd->mount, buf_addr);
+}
+dword_t sys_fstatfs_amd64(fd_t f, addr_t buf_addr) {
+    return sys_fstatfs_amd64_guest(f, buf_addr);
 }
 
 dword_t sys_fstatfs64(fd_t f, dword_t buf_size, addr_t buf_addr) {
@@ -985,21 +1500,7 @@ dword_t sys_flock(fd_t f, dword_t operation) {
     return fd->mount->fs->flock(fd, operation);
 }
 
-static struct timespec convert_timespec(struct timespec_ t) {
-    struct timespec ts;
-    ts.tv_sec = t.sec;
-    ts.tv_nsec = t.nsec;
-    return ts;
-}
-
-static struct timespec convert_timeval(struct timeval_ t) {
-    struct timespec ts;
-    ts.tv_sec = t.sec;
-    ts.tv_nsec = t.usec * 1000;
-    return ts;
-}
-
-static dword_t sys_utime_common(fd_t at_f, addr_t path_addr, struct timespec atime, struct timespec mtime, dword_t flags) {
+static dword_t sys_utime_common(fd_t at_f, guest_addr_t path_addr, struct timespec atime, struct timespec mtime, dword_t flags) {
     char path[MAX_PATH];
     if (path_addr != 0)
         if (user_read_string(path_addr, path, sizeof(path)))
@@ -1020,46 +1521,168 @@ dword_t sys_utimensat64(fd_t at_f, addr_t path_addr, addr_t times_addr, dword_t 
     if (times_addr == 0) {
         atime = mtime = timespec_now(CLOCK_REALTIME);
     } else {
-        struct timespec_ times[2];
-        if (user_get(times_addr, times))
+        size_t stride = sizeof(struct timespec64_);
+        if (read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr, &atime) ||
+                read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr + stride, &mtime))
             return _EFAULT;
-        atime = convert_timespec(times[0]);
-        mtime = convert_timespec(times[1]);
     }
     return sys_utime_common(at_f, path_addr, atime, mtime, flags);
 }
 
+dword_t sys_utimensat_amd64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t times_addr, dword_t flags) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        size_t stride = guest_timespec_size(GUEST_ABI_AMD64);
+        if (read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr, &atime) ||
+                read_guest_timespec_abi(GUEST_ABI_AMD64, times_addr + stride, &mtime))
+            return _EFAULT;
+    }
+    return sys_utime_common(at_f, path_addr, atime, mtime, flags);
+}
+
+dword_t sys_utimensat_amd64(fd_t at_f, addr_t path_addr, addr_t times_addr, dword_t flags) {
+    return sys_utimensat_amd64_guest(at_f, path_addr, times_addr, flags);
+}
+
+dword_t sys_utimensat_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t times_addr, dword_t flags) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        size_t stride = guest_timespec_size(GUEST_ABI_I386);
+        if (read_guest_timespec_abi(GUEST_ABI_I386, times_addr, &atime) ||
+                read_guest_timespec_abi(GUEST_ABI_I386, times_addr + stride, &mtime))
+            return _EFAULT;
+    }
+    return sys_utime_common(at_f, path_addr, atime, mtime, flags);
+}
 dword_t sys_utimensat(fd_t at_f, addr_t path_addr, addr_t times_addr, dword_t flags) {
-    struct timespec atime;
-    struct timespec mtime;
-    if (times_addr == 0) {
-        atime = mtime = timespec_now(CLOCK_REALTIME);
-    } else {
-        struct timespec_ times[2];
-        if (user_get(times_addr, times))
-            return _EFAULT;
-        atime = convert_timespec(times[0]);
-        mtime = convert_timespec(times[1]);
-    }
-    return sys_utime_common(at_f, path_addr, atime, mtime, flags);
+    return sys_utimensat_guest(at_f, path_addr, times_addr, flags);
 }
 
-dword_t sys_utimes(addr_t path_addr, addr_t times_addr) {
+dword_t sys_utimes_amd64_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
         atime = mtime = timespec_now(CLOCK_REALTIME);
     } else {
-        struct timeval_ times[2];
-        if (user_get(times_addr, times))
+        size_t stride = guest_timeval_size(GUEST_ABI_AMD64);
+        struct timeval time_a;
+        struct timeval time_m;
+        if (read_guest_timeval_abi(GUEST_ABI_AMD64, times_addr, &time_a) ||
+                read_guest_timeval_abi(GUEST_ABI_AMD64, times_addr + stride, &time_m))
             return _EFAULT;
-        atime = convert_timeval(times[0]);
-        mtime = convert_timeval(times[1]);
+        atime.tv_sec = time_a.tv_sec;
+        atime.tv_nsec = time_a.tv_usec * 1000;
+        mtime.tv_sec = time_m.tv_sec;
+        mtime.tv_nsec = time_m.tv_usec * 1000;
     }
     return sys_utime_common(AT_FDCWD_, path_addr, atime, mtime, 0);
 }
 
-dword_t sys_utime(addr_t path_addr, addr_t times_addr) {
+dword_t sys_utimes_amd64(addr_t path_addr, addr_t times_addr) {
+    return sys_utimes_amd64_guest(path_addr, times_addr);
+}
+
+dword_t sys_utimes_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        size_t stride = guest_timeval_size(GUEST_ABI_I386);
+        struct timeval time_a;
+        struct timeval time_m;
+        if (read_guest_timeval_abi(GUEST_ABI_I386, times_addr, &time_a) ||
+                read_guest_timeval_abi(GUEST_ABI_I386, times_addr + stride, &time_m))
+            return _EFAULT;
+        atime.tv_sec = time_a.tv_sec;
+        atime.tv_nsec = time_a.tv_usec * 1000;
+        mtime.tv_sec = time_m.tv_sec;
+        mtime.tv_nsec = time_m.tv_usec * 1000;
+    }
+    return sys_utime_common(AT_FDCWD_, path_addr, atime, mtime, 0);
+}
+dword_t sys_utimes(addr_t path_addr, addr_t times_addr) {
+    return sys_utimes_guest(path_addr, times_addr);
+}
+
+dword_t sys_futimesat_amd64_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t times_addr) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        size_t stride = guest_timeval_size(GUEST_ABI_AMD64);
+        struct timeval time_a;
+        struct timeval time_m;
+        if (read_guest_timeval_abi(GUEST_ABI_AMD64, times_addr, &time_a) ||
+                read_guest_timeval_abi(GUEST_ABI_AMD64, times_addr + stride, &time_m))
+            return _EFAULT;
+        atime.tv_sec = time_a.tv_sec;
+        atime.tv_nsec = time_a.tv_usec * 1000;
+        mtime.tv_sec = time_m.tv_sec;
+        mtime.tv_nsec = time_m.tv_usec * 1000;
+    }
+    return sys_utime_common(at_f, path_addr, atime, mtime, 0);
+}
+
+dword_t sys_futimesat_amd64(fd_t at_f, addr_t path_addr, addr_t times_addr) {
+    return sys_futimesat_amd64_guest(at_f, path_addr, times_addr);
+}
+
+dword_t sys_futimesat_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t times_addr) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        size_t stride = guest_timeval_size(GUEST_ABI_I386);
+        struct timeval time_a;
+        struct timeval time_m;
+        if (read_guest_timeval_abi(GUEST_ABI_I386, times_addr, &time_a) ||
+                read_guest_timeval_abi(GUEST_ABI_I386, times_addr + stride, &time_m))
+            return _EFAULT;
+        atime.tv_sec = time_a.tv_sec;
+        atime.tv_nsec = time_a.tv_usec * 1000;
+        mtime.tv_sec = time_m.tv_sec;
+        mtime.tv_nsec = time_m.tv_usec * 1000;
+    }
+    return sys_utime_common(at_f, path_addr, atime, mtime, 0);
+}
+dword_t sys_futimesat(fd_t at_f, addr_t path_addr, addr_t times_addr) {
+    return sys_futimesat_guest(at_f, path_addr, times_addr);
+}
+
+dword_t sys_utime_amd64_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
+    struct timespec atime;
+    struct timespec mtime;
+    if (times_addr == 0) {
+        atime = mtime = timespec_now(CLOCK_REALTIME);
+    } else {
+        struct amd64_utimbuf_ {
+            qword_t actime;
+            qword_t modtime;
+        } times;
+        if (user_get(times_addr, times))
+            return _EFAULT;
+        atime.tv_sec = times.actime;
+        atime.tv_nsec = 0;
+        mtime.tv_sec = times.modtime;
+        mtime.tv_nsec = 0;
+    }
+    return sys_utime_common(AT_FDCWD_, path_addr, atime, mtime, 0);
+}
+
+dword_t sys_utime_amd64(addr_t path_addr, addr_t times_addr) {
+    return sys_utime_amd64_guest(path_addr, times_addr);
+}
+
+dword_t sys_utime_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
     struct timespec atime;
     struct timespec mtime;
     if (times_addr == 0) {
@@ -1077,6 +1700,9 @@ dword_t sys_utime(addr_t path_addr, addr_t times_addr) {
         mtime.tv_nsec = 0;
     }
     return sys_utime_common(AT_FDCWD_, path_addr, atime, mtime, 0);
+}
+dword_t sys_utime(addr_t path_addr, addr_t times_addr) {
+    return sys_utime_guest(path_addr, times_addr);
 }
 
 static int generic_fsetattr(struct fd *fd, struct attr attr) {
@@ -1104,7 +1730,7 @@ dword_t sys_fchmod(fd_t f, dword_t mode) {
     return generic_fsetattr(fd, make_attr(mode, mode));
 }
 
-static dword_t sys_fchmodat_common(fd_t at_f, addr_t path_addr, dword_t mode, dword_t flags, bool is_fchmodat2) {
+static dword_t sys_fchmodat_common(fd_t at_f, guest_addr_t path_addr, dword_t mode, dword_t flags, bool is_fchmodat2) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -1144,15 +1770,24 @@ dword_t sys_fchmodat(fd_t at_f, addr_t path_addr, dword_t mode) {
     return sys_fchmodat_common(at_f, path_addr, mode, 0, false);
 }
 
+dword_t sys_fchmodat_guest(fd_t at_f, guest_addr_t path_addr, dword_t mode) {
+    return sys_fchmodat_common(at_f, path_addr, mode, 0, false);
+}
 dword_t sys_fchmodat2(fd_t at_f, addr_t path_addr, dword_t mode, dword_t flags) {
+    return sys_fchmodat_common(at_f, path_addr, mode, flags, true);
+}
+dword_t sys_fchmodat2_guest(fd_t at_f, guest_addr_t path_addr, dword_t mode, dword_t flags) {
     return sys_fchmodat_common(at_f, path_addr, mode, flags, true);
 }
 
 dword_t sys_chmod(addr_t path_addr, dword_t mode) {
     return sys_fchmodat(AT_FDCWD_, path_addr, mode);
 }
+dword_t sys_chmod_guest(guest_addr_t path_addr, dword_t mode) {
+    return sys_fchmodat_guest(AT_FDCWD_, path_addr, mode);
+}
 
-dword_t sys_fchown32(fd_t f, uid_t_ owner, uid_t_ group) {
+static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
     STRACE("fchown(%d, %d, %d)", f, owner, group);
     struct fd *fd = f_get(f);
     if (fd == NULL)
@@ -1171,7 +1806,15 @@ dword_t sys_fchown32(fd_t f, uid_t_ owner, uid_t_ group) {
     return 0;
 }
 
-dword_t sys_fchownat(fd_t at_f, addr_t path_addr, dword_t owner, dword_t group, int flags) {
+dword_t sys_fchown32(fd_t f, uid_t_ owner, uid_t_ group) {
+    return sys_fchown_common(f, owner, group);
+}
+
+dword_t sys_fchown_amd64(fd_t f, uid_t_ owner, uid_t_ group) {
+    return sys_fchown_common(f, owner, group);
+}
+
+static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t owner, dword_t group, int flags) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -1194,20 +1837,49 @@ dword_t sys_fchownat(fd_t at_f, addr_t path_addr, dword_t owner, dword_t group, 
     return 0;
 }
 
+dword_t sys_fchownat_guest(fd_t at_f, guest_addr_t path_addr, dword_t owner, dword_t group, int flags) {
+    return sys_fchownat_common(at_f, path_addr, owner, group, flags);
+}
+dword_t sys_fchownat(fd_t at_f, addr_t path_addr, dword_t owner, dword_t group, int flags) {
+    return sys_fchownat_common(at_f, path_addr, owner, group, flags);
+}
 dword_t sys_chown32(addr_t path_addr, uid_t_ owner, uid_t_ group) {
-    return sys_fchownat(AT_FDCWD_, path_addr, owner, group, 0);
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, 0);
+}
+dword_t sys_chown32_guest(guest_addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, 0);
+}
+
+dword_t sys_chown_amd64(addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, 0);
+}
+dword_t sys_chown_amd64_guest(guest_addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, 0);
 }
 
 dword_t sys_lchown(addr_t path_addr, uid_t_ owner, uid_t_ group) {
-    return sys_fchownat(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
+}
+dword_t sys_lchown_guest(guest_addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
 }
 
-dword_t sys_truncate64(addr_t path_addr, dword_t size_low, dword_t size_high) {
+dword_t sys_lchown_amd64(addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
+}
+dword_t sys_lchown_amd64_guest(guest_addr_t path_addr, uid_t_ owner, uid_t_ group) {
+    return sys_fchownat_common(AT_FDCWD_, path_addr, owner, group, AT_SYMLINK_NOFOLLOW_);
+}
+
+dword_t sys_truncate64_guest(guest_addr_t path_addr, dword_t size_low, dword_t size_high) {
     off_t_ size = ((qword_t) size_high << 32) | size_low;
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
     return generic_setattrat(NULL, path, make_attr(size, size), true);
+}
+dword_t sys_truncate64(addr_t path_addr, dword_t size_low, dword_t size_high) {
+    return sys_truncate64_guest(path_addr, size_low, size_high);
 }
 
 dword_t sys_ftruncate64(fd_t f, dword_t size_low, dword_t size_high) {
@@ -1240,7 +1912,7 @@ dword_t sys_fallocate(fd_t f, dword_t UNUSED(mode), dword_t offset_low, dword_t 
     return 0;
 }
 
-dword_t sys_mkdirat(fd_t at_f, addr_t path_addr, mode_t_ mode) {
+static dword_t sys_mkdirat_common(fd_t at_f, guest_addr_t path_addr, mode_t_ mode) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
@@ -1257,16 +1929,28 @@ dword_t sys_mkdirat(fd_t at_f, addr_t path_addr, mode_t_ mode) {
     return err;
 }
 
+dword_t sys_mkdirat_guest(fd_t at_f, guest_addr_t path_addr, mode_t_ mode) {
+    return sys_mkdirat_common(at_f, path_addr, mode);
+}
 dword_t sys_mkdir(addr_t path_addr, mode_t_ mode) {
-    return sys_mkdirat(AT_FDCWD_, path_addr, mode);
+    return sys_mkdirat_common(AT_FDCWD_, path_addr, mode);
+}
+dword_t sys_mkdir_guest(guest_addr_t path_addr, mode_t_ mode) {
+    return sys_mkdirat_common(AT_FDCWD_, path_addr, mode);
+}
+dword_t sys_mkdirat(fd_t at_f, addr_t path_addr, mode_t_ mode) {
+    return sys_mkdirat_common(at_f, path_addr, mode);
 }
 
-dword_t sys_rmdir(addr_t path_addr) {
+dword_t sys_rmdir_guest(guest_addr_t path_addr) {
     char path[MAX_PATH];
     if (user_read_string(path_addr, path, sizeof(path)))
         return _EFAULT;
     STRACE("rmdir(%s)", path);
     return generic_rmdirat(AT_PWD, path);
+}
+dword_t sys_rmdir(addr_t path_addr) {
+    return sys_rmdir_guest(path_addr);
 }
 
 dword_t sys_fsync(fd_t f) {
@@ -1299,4 +1983,45 @@ dword_t sys_copy_file_range(fd_t UNUSED(in_fd), addr_t UNUSED(in_off), fd_t UNUS
 dword_t sys_xattr_stub(addr_t UNUSED(path_addr), addr_t UNUSED(name_addr),
         addr_t UNUSED(value_addr), dword_t UNUSED(size), dword_t UNUSED(flags)) {
     return _ENOTSUP;
+}
+
+static dword_t sys_xattr_stub_guest_impl(guest_addr_t UNUSED(path_addr), guest_addr_t UNUSED(name_addr),
+        guest_addr_t UNUSED(value_addr), dword_t UNUSED(size), dword_t UNUSED(flags)) {
+    return _ENOTSUP;
+}
+
+dword_t sys_setxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr,
+        guest_addr_t value_addr, dword_t size, dword_t flags) {
+    return sys_xattr_stub_guest_impl(path_addr, name_addr, value_addr, size, flags);
+}
+
+dword_t sys_fsetxattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr,
+        guest_addr_t value_addr, dword_t size, dword_t flags) {
+    return sys_xattr_stub_guest_impl(0, name_addr, value_addr, size, flags);
+}
+
+dword_t sys_getxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr,
+        guest_addr_t value_addr, dword_t size) {
+    return sys_xattr_stub_guest_impl(path_addr, name_addr, value_addr, size, 0);
+}
+
+dword_t sys_fgetxattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr,
+        guest_addr_t value_addr, dword_t size) {
+    return sys_xattr_stub_guest_impl(0, name_addr, value_addr, size, 0);
+}
+
+dword_t sys_listxattr_guest(guest_addr_t path_addr, guest_addr_t list_addr, dword_t size) {
+    return sys_xattr_stub_guest_impl(path_addr, 0, list_addr, size, 0);
+}
+
+dword_t sys_flistxattr_guest(fd_t UNUSED(fd), guest_addr_t list_addr, dword_t size) {
+    return sys_xattr_stub_guest_impl(0, 0, list_addr, size, 0);
+}
+
+dword_t sys_removexattr_guest(guest_addr_t path_addr, guest_addr_t name_addr) {
+    return sys_xattr_stub_guest_impl(path_addr, name_addr, 0, 0, 0);
+}
+
+dword_t sys_fremovexattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr) {
+    return sys_xattr_stub_guest_impl(0, name_addr, 0, 0, 0);
 }

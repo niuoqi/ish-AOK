@@ -81,51 +81,6 @@ struct proc_net_socket_entry {
     unsigned cap;
 };
 
-struct proc_net_task_snapshot {
-    struct task **tasks;
-    unsigned count;
-};
-
-static void proc_net_task_snapshot_release(struct proc_net_task_snapshot *snapshot) {
-    for (unsigned i = 0; i < snapshot->count; i++)
-        task_ref_cnt_mod(snapshot->tasks[i], -1);
-    free(snapshot->tasks);
-    snapshot->tasks = NULL;
-    snapshot->count = 0;
-}
-
-static int proc_net_task_snapshot_collect(struct proc_net_task_snapshot *snapshot) {
-    unsigned cap = 0;
-    complex_lockt(&pids_lock, 0);
-    struct pid *pid_entry;
-    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
-        if (task != NULL && !task->zombie)
-            cap++;
-    }
-    unlock(&pids_lock);
-
-    if (cap == 0)
-        return 0;
-
-    snapshot->tasks = calloc(cap, sizeof(*snapshot->tasks));
-    if (snapshot->tasks == NULL)
-        return _ENOMEM;
-
-    complex_lockt(&pids_lock, 0);
-    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        struct task *task = pid_entry->task;
-        if (task == NULL || task->zombie)
-            continue;
-        if (snapshot->count >= cap)
-            break;
-        task_ref_cnt_mod(task, 1);
-        snapshot->tasks[snapshot->count++] = task;
-    }
-    unlock(&pids_lock);
-    return 0;
-}
-
 static int proc_net_socket_push(struct proc_net_socket_entry *entries, struct fd *fd) {
     for (unsigned i = 0; i < entries->count; i++) {
         if (entries->fds[i] == fd)
@@ -143,6 +98,15 @@ static int proc_net_socket_push(struct proc_net_socket_entry *entries, struct fd
     return 0;
 }
 
+static struct fdtable *proc_net_task_files_retain(struct task *task) {
+    struct fdtable *files = NULL;
+    lock(&task->general_lock, 0);
+    if (task->files != NULL)
+        files = fdtable_retain(task->files);
+    unlock(&task->general_lock);
+    return files;
+}
+
 static void proc_net_socket_release(struct proc_net_socket_entry *entries) {
     for (unsigned i = 0; i < entries->count; i++)
         fd_close(entries->fds[i]);
@@ -150,18 +114,21 @@ static void proc_net_socket_release(struct proc_net_socket_entry *entries) {
 }
 
 static int proc_net_collect_sockets(struct proc_net_socket_entry *entries, int domain, int type) {
-    struct proc_net_task_snapshot snapshot = {};
-    int err = proc_net_task_snapshot_collect(&snapshot);
+    struct task_snapshot snapshot = {};
+    int err = task_snapshot_collect(&snapshot, false);
     if (err < 0)
         return err;
 
     for (unsigned i = 0; i < snapshot.count; i++) {
         struct task *task = snapshot.tasks[i];
-        if (task == NULL || task->files == NULL)
+        if (task == NULL)
             continue;
-        lock(&task->files->lock, 0);
-        for (fd_t fd_no = 0; (unsigned) fd_no < task->files->size; fd_no++) {
-            struct fd *fd = fdtable_get(task->files, fd_no);
+        struct fdtable *files = proc_net_task_files_retain(task);
+        if (files == NULL)
+            continue;
+        lock(&files->lock, 0);
+        for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
+            struct fd *fd = fdtable_get(files, fd_no);
             if (fd == NULL || fd->ops != &socket_fdops)
                 continue;
             if (fd->socket.domain != domain || fd->socket.type != type)
@@ -172,27 +139,31 @@ static int proc_net_collect_sockets(struct proc_net_socket_entry *entries, int d
             if (err < 0)
                 break;
         }
-        unlock(&task->files->lock);
+        unlock(&files->lock);
+        fdtable_release(files);
         if (err < 0)
             break;
     }
-    proc_net_task_snapshot_release(&snapshot);
+    task_snapshot_release(&snapshot);
     return err;
 }
 
 static int proc_net_collect_sockets_any_type(struct proc_net_socket_entry *entries, int domain) {
-    struct proc_net_task_snapshot snapshot = {};
-    int err = proc_net_task_snapshot_collect(&snapshot);
+    struct task_snapshot snapshot = {};
+    int err = task_snapshot_collect(&snapshot, false);
     if (err < 0)
         return err;
 
     for (unsigned i = 0; i < snapshot.count; i++) {
         struct task *task = snapshot.tasks[i];
-        if (task == NULL || task->files == NULL)
+        if (task == NULL)
             continue;
-        lock(&task->files->lock, 0);
-        for (fd_t fd_no = 0; (unsigned) fd_no < task->files->size; fd_no++) {
-            struct fd *fd = fdtable_get(task->files, fd_no);
+        struct fdtable *files = proc_net_task_files_retain(task);
+        if (files == NULL)
+            continue;
+        lock(&files->lock, 0);
+        for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
+            struct fd *fd = fdtable_get(files, fd_no);
             if (fd == NULL || fd->ops != &socket_fdops)
                 continue;
             if (fd->socket.domain != domain)
@@ -201,11 +172,12 @@ static int proc_net_collect_sockets_any_type(struct proc_net_socket_entry *entri
             if (err < 0)
                 break;
         }
-        unlock(&task->files->lock);
+        unlock(&files->lock);
+        fdtable_release(files);
         if (err < 0)
             break;
     }
-    proc_net_task_snapshot_release(&snapshot);
+    task_snapshot_release(&snapshot);
     return err;
 }
 
@@ -559,3 +531,9 @@ struct proc_children proc_net_children = PROC_CHILDREN({
     {"route", .show = proc_show_route },
     {"if_inet6", .show = proc_show_if_inet6 },
 });
+
+void proc_net_init(struct proc_dir_entry *root_entry) {
+    if (root_entry == NULL)
+        return;
+    proc_set_children_parent(&proc_net_children, root_entry);
+}

@@ -12,6 +12,16 @@ NS_ASSUME_NONNULL_BEGIN
 extern NSString *const kPreferenceOpenDiagnosticsOnLaunchKey;
 extern UINavigationController *ISHCreateAboutNavigationController(BOOL recoveryMode, BOOL startInDiagnostics);
 extern UIViewController *ISHCreateDiagnosticsViewController(void);
+extern UIViewController *ISHCreateLLMClientViewController(void);
+extern UIViewController *ISHCreateLLMClientViewControllerWithInitialPrompt(NSString *_Nullable initialPrompt);
+extern UIViewController *ISHCreateLLMSettingsViewController(void);
+extern BOOL ISHLLMClientEnabled(void);
+
+typedef NS_ENUM(NSInteger, AOKLLMBackend) {
+    AOKLLMBackendAppleFoundationModels,
+    AOKLLMBackendBundledQwenTiny,
+    AOKLLMBackendOpenAICompatibleEndpoint,
+};
 
 @interface AboutViewController : UITableViewController
 

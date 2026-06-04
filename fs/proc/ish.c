@@ -1,6 +1,7 @@
 #include "fs/proc.h"
 #include "fs/proc/ish.h"
 #include "fs/proc/net.h"
+#include "jit/jit.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include <stdbool.h>
@@ -74,6 +75,93 @@ static int proc_ish_show_documents(struct proc_entry *UNUSED(entry), struct proc
     return 0;
 }
 
+static int proc_ish_show_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "%s\n", amd64_jit_preference_get() ? "on" : "off");
+    return 0;
+}
+
+static int proc_ish_show_i386_single_step_comm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char comm[16];
+    i386_single_step_comm_get(comm, sizeof(comm));
+    proc_printf(buf, "%s\n", comm);
+    return 0;
+}
+
+static int proc_ish_show_i386_no_cache_comm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char comm[16];
+    i386_no_cache_comm_get(comm, sizeof(comm));
+    proc_printf(buf, "%s\n", comm);
+    return 0;
+}
+
+static int proc_ish_update_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    size_t start = 0;
+    size_t end = data->size;
+
+    while (start < end && (data->data[start] == ' ' || data->data[start] == '\t' ||
+            data->data[start] == '\r' || data->data[start] == '\n'))
+        start++;
+    while (end > start && (data->data[end - 1] == ' ' || data->data[end - 1] == '\t' ||
+            data->data[end - 1] == '\r' || data->data[end - 1] == '\n'))
+        end--;
+
+    if (end - start != 1)
+        return _EINVAL;
+    if (data->data[start] == '0') {
+        amd64_jit_preference_set(false);
+        return 0;
+    }
+    if (data->data[start] == '1') {
+        amd64_jit_preference_set(true);
+        return 0;
+    }
+    return _EINVAL;
+}
+
+static int proc_ish_update_i386_single_step_comm(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    size_t start = 0;
+    size_t end = data->size;
+
+    while (start < end && (data->data[start] == ' ' || data->data[start] == '\t' ||
+            data->data[start] == '\r' || data->data[start] == '\n'))
+        start++;
+    while (end > start && (data->data[end - 1] == ' ' || data->data[end - 1] == '\t' ||
+            data->data[end - 1] == '\r' || data->data[end - 1] == '\n'))
+        end--;
+
+    size_t len = end - start;
+    if (len >= 16)
+        return _EINVAL;
+
+    char comm[16];
+    memcpy(comm, &data->data[start], len);
+    comm[len] = '\0';
+    i386_single_step_comm_set(comm);
+    return 0;
+}
+
+static int proc_ish_update_i386_no_cache_comm(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    size_t start = 0;
+    size_t end = data->size;
+
+    while (start < end && (data->data[start] == ' ' || data->data[start] == '\t' ||
+            data->data[start] == '\r' || data->data[start] == '\n'))
+        start++;
+    while (end > start && (data->data[end - 1] == ' ' || data->data[end - 1] == '\t' ||
+            data->data[end - 1] == '\r' || data->data[end - 1] == '\n'))
+        end--;
+
+    size_t len = end - start;
+    if (len >= 16)
+        return _EINVAL;
+
+    char comm[16];
+    memcpy(comm, &data->data[start], len);
+    comm[len] = '\0';
+    i386_no_cache_comm_set(comm);
+    return 0;
+}
+
 static void proc_ish_defaults_getname(struct proc_entry *entry, char *buf) {
     strcpy(buf, entry->name);
 }
@@ -96,7 +184,7 @@ static int proc_ish_underlying_defaults_show(struct proc_entry *entry, struct pr
 }
 
 static int proc_ish_underlying_defaults_update(struct proc_entry *entry, struct proc_data *data) {
-    if (!set_user_default(entry->name, data->data, data->size)) //mkemkemke Set Defaults
+    if (!set_user_default(entry->name, data->data, data->size))
         return _EIO;
     return 0;
 }
@@ -318,6 +406,10 @@ static int proc_ish_show_host_info(struct proc_entry *UNUSED(entry), struct proc
 }
 
 struct proc_children proc_ish_children = PROC_CHILDREN({
+    {"amd64_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
+    {"amd_jit", S_IFREG | 0644, .show = proc_ish_show_amd64_jit, .update = proc_ish_update_amd64_jit},
+    {"i386_no_cache_comm", S_IFREG | 0644, .show = proc_ish_show_i386_no_cache_comm, .update = proc_ish_update_i386_no_cache_comm},
+    {"i386_single_step_comm", S_IFREG | 0644, .show = proc_ish_show_i386_single_step_comm, .update = proc_ish_update_i386_single_step_comm},
     {"BAT0", .show = proc_ish_show_battery},
     {"BAT0_capacity", .show = proc_ish_show_battery_capacity},
     {"BAT0_status", .show = proc_ish_show_battery_status},
@@ -330,3 +422,21 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"ips", .show = proc_ish_show_ips},
     {"version", .show = proc_ish_show_version},
 });
+
+void proc_ish_init(struct proc_dir_entry *root_entry) {
+    struct proc_dir_entry *defaults_dir;
+    struct proc_dir_entry *underlying_defaults_dir;
+
+    if (root_entry == NULL)
+        return;
+
+    proc_set_children_parent(&proc_ish_children, root_entry);
+
+    underlying_defaults_dir = proc_children_find(&proc_ish_children, ".defaults");
+    if (underlying_defaults_dir != NULL)
+        proc_ish_underlying_defaults_fd.parent = underlying_defaults_dir;
+
+    defaults_dir = proc_children_find(&proc_ish_children, "defaults");
+    if (defaults_dir != NULL)
+        proc_ish_defaults_fd.parent = defaults_dir;
+}

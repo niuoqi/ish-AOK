@@ -1,9 +1,22 @@
 #include "kernel/calls.h"
 #include "fs/poll.h"
+#include <stdlib.h>
+#include <string.h>
 
 static struct fd_ops epoll_ops;
 
 extern bool doEnableMulticore;
+
+static bool epoll_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_EPOLL") != NULL ? 1 : 0;
+    return enabled == 1;
+}
+
+static bool epoll_trace_comm(void) {
+    return epoll_trace_enabled() && current != NULL && strcmp(current->comm, "compile") == 0;
+}
 
 fd_t sys_epoll_create(int_t flags) {
     STRACE("epoll_create(%#x)", flags);
@@ -63,6 +76,11 @@ int_t sys_epoll_ctl(fd_t epoll_f, int_t op, fd_t f, addr_t event_addr) {
         return _EFAULT;
     }
     STRACE(" {events: %#x, data: %#x}", event.events, event.data);
+    if (epoll_trace_comm()) {
+        printk("epoll-trace: ctl pid=%d comm=%s epfd=%d op=%d fd=%d real=%d req_events=%#x data=%#llx\n",
+               current->pid, current->comm, epoll_f, op, f,
+               fd->real_fd, event.events, (unsigned long long) event.data);
+    }
 
     int_t res;
     if (op == EPOLL_CTL_ADD_) {
@@ -78,6 +96,10 @@ int_t sys_epoll_ctl(fd_t epoll_f, int_t op, fd_t f, addr_t event_addr) {
     return res;
 }
 
+int_t sys_epoll_ctl_guest(fd_t epoll_f, int_t op, fd_t f, guest_addr_t event_addr) {
+    return sys_epoll_ctl(epoll_f, op, f, event_addr);
+}
+
 struct epoll_context {
     struct epoll_event_ *events;
     int n;
@@ -88,6 +110,11 @@ static int epoll_callback(void *context, int types, union poll_fd_info info) {
     struct epoll_context *c = context;
     if (c->n >= c->max_events)
         return 0;
+    if (epoll_trace_comm()) {
+        printk("epoll-trace: callback pid=%d comm=%s slot=%d types=%#x data=%#llx\n",
+               current->pid, current->comm, c->n, types,
+               (unsigned long long) info.num);
+    }
     c->events[c->n++] = (struct epoll_event_) {.events = types, .data = info.num};
     return 1;
 }
@@ -114,7 +141,7 @@ static int epoll_wait_common(fd_t epoll_f, addr_t events_addr, int_t max_events,
         struct timespec mytime;
         mytime.tv_sec = 2;
         mytime.tv_nsec = 0;
-        res = poll_wait(epoll->epollfd.poll, epoll_callback, &context, &mytime); // This is arguably evil, but it makes go work much better and I haven't found a downside yet.  -mke
+        res = poll_wait(epoll->epollfd.poll, epoll_callback, &context, &mytime); // Use a bounded wait in single-core mode to keep Go progressing.
     } else {
         res = poll_wait(epoll->epollfd.poll, epoll_callback, &context, timeout_ts_ptr);
     }
@@ -144,6 +171,10 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
     return epoll_wait_common(epoll_f, events_addr, max_events, timeout_ts_ptr);
 }
 
+int_t sys_epoll_wait_guest(fd_t epoll_f, guest_addr_t events_addr, int_t max_events, int_t timeout) {
+    return sys_epoll_wait(epoll_f, events_addr, max_events, timeout);
+}
+
 int_t sys_epoll_pwait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t timeout, addr_t sigmask_addr, dword_t sigsetsize) {
     sigset_t_ mask;
     if (sigmask_addr != 0) {
@@ -163,6 +194,11 @@ int_t sys_epoll_pwait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t 
     }
 
     return epoll_wait_common(epoll_f, events_addr, max_events, timeout_ts_ptr);
+}
+
+int_t sys_epoll_pwait_guest(fd_t epoll_f, guest_addr_t events_addr, int_t max_events, int_t timeout,
+        guest_addr_t sigmask_addr, dword_t sigsetsize) {
+    return sys_epoll_pwait(epoll_f, events_addr, max_events, timeout, sigmask_addr, sigsetsize);
 }
 
 int_t sys_epoll_pwait2(fd_t epoll_f, addr_t events_addr, int_t max_events, addr_t timeout_addr, addr_t sigmask_addr, dword_t sigsetsize) {
@@ -189,6 +225,11 @@ int_t sys_epoll_pwait2(fd_t epoll_f, addr_t events_addr, int_t max_events, addr_
     }
 
     return epoll_wait_common(epoll_f, events_addr, max_events, timeout_ts_ptr);
+}
+
+int_t sys_epoll_pwait2_guest(fd_t epoll_f, guest_addr_t events_addr, int_t max_events,
+        guest_addr_t timeout_addr, guest_addr_t sigmask_addr, dword_t sigsetsize) {
+    return sys_epoll_pwait2(epoll_f, events_addr, max_events, timeout_addr, sigmask_addr, sigsetsize);
 }
 
 static int epoll_close(struct fd *fd) {

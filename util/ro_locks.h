@@ -44,7 +44,7 @@ typedef struct {
 #endif
 } lock_t;
 
-extern lock_t atomic_l_lock; // Used to make all lock operations atomic, even read->write and right->read -mke
+extern lock_t atomic_l_lock; // Used to make lock state transitions atomic.
 extern bool doEnableExtraLocking;
 
 void lock_init(lock_t *lock, char lname[16]);
@@ -69,22 +69,6 @@ static inline void unlock(lock_t *lock) {
     lock->debug = (struct lock_debug) { .initialized = true };
 #endif
     return;
-}
-
-static inline void atomic_l_lockf(char lname[16], int skiplog) {
-    if(!doEnableExtraLocking)
-        return;
-
-    int res = pthread_mutex_lock(&atomic_l_lock.m);
-    if(!res) {
-        strlcpy((char *)&atomic_l_lock.lname, lname, 16);
-        // Track owner so jit_crash_fn can release the mutex if the JIT thread
-        // faults while holding it (e.g. inside read_lock/read_unlock).
-        atomic_l_lock.owner = pthread_self();
-        modify_locks_held_count(current, 1);
-    } else if (!skiplog) {
-        printk("Error on locking lock (%s)\n", lname);
-    }
 }
 
 static inline void mylock(lock_t *lock, int log_lock) {
@@ -129,64 +113,30 @@ static inline int mylock_with_timeout(lock_t *lock, int UNUSED(log_lock)) {
     return 0; // Success
 }
 
-static inline void atomic_l_unlockf(void) {
-    if(!doEnableExtraLocking)
-        return;
-    int res = 0;
-    strncpy((char *)&atomic_l_lock.lname,"\0", 1);
-    atomic_l_lock.owner = zero_init(pthread_t);  // Clear owner before unlock
-    res = pthread_mutex_unlock(&atomic_l_lock.m);
-    if(res) {
-        printk("ERROR: unlocking locking lock\n");
-    } else {
-        atomic_l_lock.pid = -1; // Reset
-    }
-
-    modify_locks_held_count(current, -1);
-}
-
 static inline void complex_lockt(lock_t *lock, int log_lock) {
-    //if (lock->pid == pid)
-    //    return;
-
-    unsigned int count = 0;
-    int random_wait = WAIT_SLEEP + rand() % WAIT_SLEEP;
-    struct timespec lock_pause = {0, random_wait};
-    long count_max = (WAIT_MAX_UPPER - random_wait);
-
-    while (pthread_mutex_trylock(&lock->m)) {
-        count++;
-        if (nanosleep(&lock_pause, NULL) == -1) {
-            // Handle error
-        }
-        if (count > count_max) {
-            if (!log_lock)
-                printk("WARNING: lock contention exceeded retry budget for %s, blocking instead of forcing unlock\n",
-                    lock->lname);
-            pthread_mutex_lock(&lock->m);
-            break;
+    struct timespec start = {};
+    struct timespec end = {};
+    bool contended = pthread_mutex_trylock(&lock->m) != 0;
+    if (contended) {
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        pthread_mutex_lock(&lock->m);
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        if (!log_lock) {
+            long waited_ms = (end.tv_sec - start.tv_sec) * 1000L +
+                (end.tv_nsec - start.tv_nsec) / 1000000L;
+            if (waited_ms >= 1000)
+                printk("INFO: contended lock %s waited %ldms\n", lock->lname, waited_ms);
         }
     }
 
     modify_locks_held_count(current, 1);
 
-  /*  if (count > count_max * 0.90) {
-        if (!log_lock)
-            printk("Warning: large lock attempt count (%d), aborted lock attempt(PID: %d Process: %s) (Previously Owned:%s:%d) \n",
-                   count, current_pid(current), current_comm(current), lock->comm, lock->pid);
-    } */
-
     lock->owner = pthread_self();
-    //lock->pid = current_pid(current);
-    //lock->uid = current_uid(current);
-    // strncpy(lock->comm, current_comm(current), sizeof(lock->comm) - 1);
     lock->comm[sizeof(lock->comm) - 1] = '\0';  // Null-terminate just in case
 }
 
 static inline int trylock(lock_t *lock) {
-    atomic_l_lockf("trylock\0", 0);
     int status = pthread_mutex_trylock(&lock->m);
-    atomic_l_unlockf();
 #if LOCK_DEBUG
     if (!status) {
         lock->debug.file = file;
@@ -197,6 +147,8 @@ static inline int trylock(lock_t *lock) {
 #endif
     if (!status) {
         modify_locks_held_count(current, 1);
+        lock->owner = pthread_self();
+        lock->comm[sizeof(lock->comm) - 1] = '\0';
     }
     return status;
 }
@@ -212,12 +164,13 @@ static inline int trylocknl(lock_t *lock, char *comm, int pid) {
         lock->debug.pid = current_pid(current);
     }
 #endif
-    if(!status) {// iSH-AOK crashes if low number processes are not excluded.  Might be able to go lower then 10?  -mke
+    if(!status) {
         modify_locks_held_count(current, 1);
-        
+        lock->owner = pthread_self();
         //STRACE("trylock(%x, %s(%d), %s, %d\n", lock, lock->comm, lock->pid, file, line);
         lock->pid = pid;
         strncpy(lock->comm, comm, 16);
+        lock->comm[sizeof(lock->comm) - 1] = '\0';
     }
     return status;
 }

@@ -155,6 +155,8 @@
             mov w9, 32
             sub w9, w9, w8
             sub w8, w8, 1 /* shift by one less */
+            mov w12, w8
+            ubfx w13, _tmp, 31, 1
             .ifc \op,shrd
                 lsr w8, _tmp, w8
                 # and by one more
@@ -170,6 +172,17 @@
             .endif
             orr _tmp, w8, w9
             strb w10, [_cpu, CPU_cf]
+            cmp w12, 0
+            b.ne 2f
+            .ifc \op,shrd
+                ubfx w11, _tmp, 31, 1
+                eor w11, w11, w13
+            .else
+                ubfx w11, _tmp, 31, 1
+                eor w11, w11, w10
+            .endif
+            strb w11, [_cpu, CPU_of]
+        2:
             setf_zsp
         1:
             .ifc \arg,imm
@@ -216,7 +229,7 @@
 
 .macro do_bt op, size, s
     .gadget \op\size\()_mem
-        bic w8, _tmp, 0x1f
+        and w8, _tmp, ~(\size-1)
         add _addr, _addr, w8, lsr 3
         # hell {{{
         .ifin(\op, bt)
@@ -226,10 +239,10 @@
             write_prep \size, \op\size\()_mem
         .endifin
         # }}}
-        ldr w8, [_xaddr]
+        ldr\s w8, [_xaddr]
         do_bt_op \op, w8, \size, \s
         .ifin(\op, btc,bts,btr)
-            str w8, [_xaddr]
+            str\s w8, [_xaddr]
             write_done \size, \op\size\()_mem
         .endifin
         gret 1
@@ -262,12 +275,13 @@
 
 .macro do_bt_atomic op, size, s
     .gadget atomic_\op\size\()_mem
-        bic w8, _tmp, 0x1f
+        and w8, _tmp, ~(\size-1)
         add _addr, _addr, w8, lsr 3
         write_prep \size, atomic_\op\size\()_mem
+        dmb ish
         # this is simple enough that I'm comfortable doing it with ldaxr/stlxr
     1:
-        ldaxr w8, [_xaddr]
+        ldaxr\s w8, [_xaddr]
         mov w9, 1
         and _tmp, _tmp, \size-1
         lsl w9, w9, _tmp
@@ -280,9 +294,10 @@
             bic w8, w8, w9
         .endif N .endif N .endif
         cset w9, ne
-        stlxr w10, w8, [_xaddr]
+        stlxr\s w10, w8, [_xaddr]
         cbnz w10, 1b
         strb w9, [_cpu, CPU_cf]
+        dmb ish
         write_done \size, atomic_\op\size\()_mem
         gret 1
         write_bullshit \size, atomic_\op\size\()_mem

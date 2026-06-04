@@ -13,8 +13,131 @@
 
 struct cpu_state;
 struct tlb;
+struct task;
 int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb);
+int cpu_run_to_interrupt_amd64(struct cpu_state *cpu, struct tlb *tlb);
+int amd64_step_to_interrupt_jit(struct cpu_state *cpu, struct tlb *tlb);
+int amd64_step_to_interrupt_jit_bridge(struct cpu_state *cpu);
+int amd64_jit_ret(struct cpu_state *cpu, struct tlb *tlb);
+int amd64_jit_ret_imm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long imm16);
+int amd64_jit_leave(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long pop_size, unsigned long next_ip);
+int amd64_jit_push_reg(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long reg, unsigned long next_ip);
+int amd64_jit_pop_reg(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long reg, unsigned long next_ip);
+int amd64_jit_pop_rm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+int amd64_jit_bswap(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long reg_size, unsigned long next_ip);
+int amd64_jit_push_flags(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long push_size, unsigned long next_ip);
+int amd64_jit_pop_flags(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long pop_size, unsigned long next_ip);
+int amd64_jit_push_imm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long value, unsigned long next_ip);
+int amd64_jit_xchg_rax_reg(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long reg_size, unsigned long next_ip);
+int amd64_jit_xchg_rm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_jmp_abs(struct cpu_state *cpu, struct tlb *tlb, unsigned long target);
+int amd64_jit_call_abs(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long target, unsigned long next_ip);
+int amd64_jit_jcc_abs(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long cc, unsigned long target, unsigned long next_ip);
+int amd64_jit_syscall(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+int amd64_jit_rdtsc(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+int amd64_jit_cpuid(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+int amd64_jit_moffs_accum(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_sign_extend(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_string_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_mov_imm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long reg_size, unsigned long value, unsigned long next_ip);
+int amd64_jit_reg_reg_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op_regs_size, unsigned long next_ip);
+int amd64_jit_reg_imm_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op_group_rm_size, unsigned long value, unsigned long next_ip);
+int amd64_jit_imul_imm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_accum_imm_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_mem_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long meta, unsigned long disp, unsigned long next_ip);
+int amd64_jit_movx(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip);
+int amd64_jit_0f_rm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip);
+int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip);
+int amd64_jit_grp3_test(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_grp3_op(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_modrm_imm(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_shift(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long opcode, unsigned long next_ip);
+int amd64_jit_fe_group(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+int amd64_jit_ff_group(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long next_ip);
+void amd64_jit_bridge_set_tlb(struct tlb *tlb);
 void cpu_poke(struct cpu_state *cpu);
+void dump_amd64_cc1_trace(const struct cpu_state *cpu);
+void dump_amd64_as_trace_task(const struct task *task);
+void dump_amd64_as_state_task(const struct task *task);
+void dump_amd64_as_stack_task(const struct task *task);
+
+enum amd64_reg {
+    amd64_rax = 0,
+    amd64_rcx = 1,
+    amd64_rdx = 2,
+    amd64_rbx = 3,
+    amd64_rsp = 4,
+    amd64_rbp = 5,
+    amd64_rsi = 6,
+    amd64_rdi = 7,
+    amd64_r8 = 8,
+    amd64_r9 = 9,
+    amd64_r10 = 10,
+    amd64_r11 = 11,
+    amd64_r12 = 12,
+    amd64_r13 = 13,
+    amd64_r14 = 14,
+    amd64_r15 = 15,
+    amd64_reg_count = 16,
+};
+
+// Full guest-visible amd64 register state is still a separate bring-up task.
+// Until then, keep syscall-entry registers in a shadow block so the kernel can
+// route amd64 syscalls without forcing the interpreter/JIT state layout over in
+// one step.
+struct amd64_syscall_state {
+    qword_t rax;
+    qword_t rdi;
+    qword_t rsi;
+    qword_t rdx;
+    qword_t r10;
+    qword_t r8;
+    qword_t r9;
+    qword_t rcx;
+    qword_t r11;
+};
+
+#define AMD64_STORE_TRACE_COUNT 32
+struct amd64_store_trace {
+    qword_t rip;
+    qword_t addr;
+    qword_t value;
+    uint8_t opcode;
+};
 
 union mm_reg {
     qword_t qw;
@@ -71,6 +194,15 @@ struct cpu_state {
 
     dword_t eip;
 
+    qword_t amd64_regs[amd64_reg_count];
+    qword_t amd64_rip;
+    qword_t amd64_current_insn_rip;
+    bool amd64_address_size_prefix;
+
+    struct amd64_syscall_state amd64_syscall;
+    struct amd64_store_trace amd64_store_trace[AMD64_STORE_TRACE_COUNT];
+    unsigned amd64_store_trace_next;
+
     // flags
     union {
         dword_t eflags;
@@ -120,7 +252,7 @@ struct cpu_state {
     };
 
     union mm_reg mm[8];
-    union xmm_reg xmm[8];
+    union xmm_reg xmm[16];
 
     // fpu
     float80 fp[8];
@@ -161,10 +293,10 @@ struct cpu_state {
 
     // TLS bullshit
     word_t gs;
-    addr_t tls_ptr;
+    guest_addr_t tls_ptr;
 
     // for the page fault handler
-    addr_t segfault_addr;
+    guest_addr_t segfault_addr;
     bool segfault_was_write;
 
     dword_t trapno;

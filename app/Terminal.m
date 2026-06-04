@@ -15,6 +15,8 @@
 #include "fs/tty.h"
 #include "fs/devices.h"
 #include "util/ro_locks.h"
+#include <stdlib.h>
+#include <string.h>
 
 extern struct tty_driver ios_pty_driver;
 
@@ -42,6 +44,9 @@ NSNotificationName const TerminalRegistryDidChangeNotification = @"TerminalRegis
 @property (nonatomic) NSMutableData *pendingData;
 // sending output is an asynchronous thing due to javascript, this is used to ensure it doesn't happen twice at once
 @property (nonatomic) BOOL outputInProgress;
+@property (nonatomic) NSData *inFlightData;
+@property (nonatomic) NSUInteger outputGeneration;
+@property (nonatomic) CFTimeInterval outputStartedAt;
 
 @property DelayedUITask *refreshTask;
 @property DelayedUITask *scrollToBottomTask;
@@ -50,6 +55,7 @@ NSNotificationName const TerminalRegistryDidChangeNotification = @"TerminalRegis
 
 @property NSNumber *terminalsKey;
 @property NSUUID *uuid;
+@property (nonatomic, copy) NSString *pendingDestroyReason;
 
 @end
 
@@ -69,6 +75,26 @@ NSNotificationName const TerminalRegistryDidChangeNotification = @"TerminalRegis
     }
     return [super canPerformAction:action withSender:sender];
 }
+
+- (UIView *)snapshotViewAfterScreenUpdates:(BOOL)afterUpdates {
+    if (self.window == nil || self.hidden || self.alpha <= 0.0) {
+        return [super snapshotViewAfterScreenUpdates:YES];
+    }
+    return [super snapshotViewAfterScreenUpdates:afterUpdates];
+}
+
+- (UIView *)resizableSnapshotViewFromRect:(CGRect)rect
+                       afterScreenUpdates:(BOOL)afterUpdates
+                            withCapInsets:(UIEdgeInsets)capInsets {
+    if (self.window == nil || self.hidden || self.alpha <= 0.0) {
+        return [super resizableSnapshotViewFromRect:rect
+                                 afterScreenUpdates:YES
+                                      withCapInsets:capInsets];
+    }
+    return [super resizableSnapshotViewFromRect:rect
+                             afterScreenUpdates:afterUpdates
+                                  withCapInsets:capInsets];
+}
 @end
 
 @implementation Terminal
@@ -78,6 +104,184 @@ static const int BUF_SIZE = 1<<14;
 
 static NSMapTable<NSNumber *, Terminal *> *terminals;
 static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
+
+static NSString *ISHJavaScriptLiteralForTerminalData(NSData *data) {
+    const unsigned char *bytes = data.bytes;
+    NSMutableString *literal = [[NSMutableString alloc] initWithCapacity:data.length * 4];
+    for (NSUInteger i = 0; i < data.length; i++) {
+        unsigned char byte = bytes[i];
+        switch (byte) {
+            case '\\':
+                [literal appendString:@"\\\\"];
+                break;
+            case '"':
+                [literal appendString:@"\\\""];
+                break;
+            case '\r':
+                [literal appendString:@"\\r"];
+                break;
+            case '\n':
+                [literal appendString:@"\\n"];
+                break;
+            case '\t':
+                [literal appendString:@"\\t"];
+                break;
+            default:
+                if (byte >= 0x20 && byte <= 0x7e) {
+                    [literal appendFormat:@"%c", byte];
+                } else {
+                    // Prompts and line editing emit raw escape/control bytes.
+                    [literal appendFormat:@"\\x%02x", byte];
+                }
+                break;
+        }
+    }
+    return literal;
+}
+
+static BOOL TerminalShouldMirrorDebugOutput(Terminal *terminal) {
+    if (terminal == nil || terminal.type != 136 || terminal.number != 1)
+        return NO;
+    const char *enabled = getenv("ISH_DEBUG_MIRROR_TTY1_OUTPUT");
+    return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
+}
+
+static void TerminalDebugMirrorOutput(Terminal *terminal, const void *buf, int len) {
+    if (!TerminalShouldMirrorDebugOutput(terminal) || buf == NULL || len <= 0)
+        return;
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytes:buf length:(NSUInteger) len];
+        NSString *escaped = ISHJavaScriptLiteralForTerminalData(data);
+        fprintf(stderr, "ish-tty1-output: \"%s\"\n", escaped.UTF8String ?: "");
+        fflush(stderr);
+    }
+}
+
+static NSString *ISHTerminalTypeString(int type) {
+    if (type == TTY_CONSOLE_MAJOR)
+        return @"console";
+    if (type == TTY_PSEUDO_SLAVE_MAJOR)
+        return @"pty-slave";
+    if (type == TTY_PSEUDO_MASTER_MAJOR)
+        return @"pty-master";
+    return [NSString stringWithFormat:@"%d", type];
+}
+
+static BOOL ISHTerminalLifecycleLogEnabled(void) {
+    const char *enabled = getenv("ISH_TRACE_TERMINAL_LIFECYCLE");
+    return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
+}
+
+static CFTimeInterval ISHTerminalNowMonotonic(void) {
+    return CACurrentMediaTime();
+}
+
+static const CFTimeInterval ISHTerminalOutputWatchdogSeconds = 1.5;
+
+static NSString *ISHStringFromBOOL(BOOL value) {
+    return value ? @"yes" : @"no";
+}
+
+static NSString *TerminalDebugReadRowsForTerminal(Terminal *terminal, int maxRows) {
+    if (terminal == nil)
+        return @"<no-terminal>";
+
+    WKWebView *webView = terminal.webView;
+    if (webView == nil)
+        return @"<no-webview>";
+
+    __block NSString *output = @"<pending>";
+    __block BOOL done = NO;
+    int rows = maxRows > 0 ? maxRows : 0;
+    NSString *script = [NSString stringWithFormat:@"term.getRowsText(Math.max(0,term.getRowCount()-%d), term.getRowCount())", rows];
+    void (^readBlock)(void) = ^{
+        [webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+            if ([result isKindOfClass:NSString.class]) {
+                output = result;
+            } else if (error != nil) {
+                output = error.localizedDescription ?: @"<error>";
+            } else {
+                output = @"<no-output>";
+            }
+            done = YES;
+        }];
+    };
+
+    if (NSThread.isMainThread) {
+        readBlock();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), readBlock);
+    }
+
+    while (!done) {
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return output;
+}
+
+__attribute__((used))
+NSString *Terminal_debugReadRows(int type, int number, int maxRows) {
+    @autoreleasepool {
+        return TerminalDebugReadRowsForTerminal([Terminal terminalWithType:type number:number], maxRows);
+    }
+}
+
+__attribute__((used))
+NSString *Terminal_debugSendInputUTF8(int type, int number, const char *input) {
+    @autoreleasepool {
+        Terminal *terminal = [Terminal terminalWithType:type number:number];
+        if (terminal == nil)
+            return @"<no-terminal>";
+        if (input == NULL)
+            return @"<null-input>";
+
+        NSString *string = [NSString stringWithUTF8String:input];
+        if (string == nil)
+            return @"<invalid-utf8>";
+
+        NSData *data = [string dataUsingEncoding:NSUTF8StringEncoding];
+        [terminal sendInput:data];
+        return @"ok";
+    }
+}
+
+__attribute__((used))
+int Terminal_debugSendInputUTF8Sync(int type, int number, const char *input) {
+    @autoreleasepool {
+        Terminal *terminal = [Terminal terminalWithType:type number:number];
+        if (terminal == nil)
+            return -1;
+        if (input == NULL)
+            return -2;
+        if (terminal.tty == NULL)
+            return -3;
+
+        size_t length = strlen(input);
+        char *copy = NULL;
+        if (length > 0) {
+            copy = malloc(length);
+            if (copy == NULL)
+                return -4;
+            memcpy(copy, input, length);
+            uint8_t first = (uint8_t) copy[0];
+            [terminal recordLifecycleEvent:@"terminal.debugSendInputSync"
+                                   details:@{@"bytes": @(length),
+                                             @"firstByte": [NSString stringWithFormat:@"%#x", first]}];
+        }
+
+#if !ISH_LINUX
+        tty_input(terminal.tty, copy, length, 0);
+        free(copy);
+#else
+        sync_do_in_workqueue(^(void (^done)(void)) {
+            terminal.tty->ops->send_input(terminal.tty, copy, length);
+            free(copy);
+            done();
+        });
+#endif
+        return 0;
+    }
+}
 
 static void NotifyTerminalRegistryChanged(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -125,6 +329,63 @@ static void NotifyTerminalRegistryChanged(void) {
                                                           object:self
                                                         userInfo:error != nil ? @{@"error": error} : @{}];
     });
+}
+
+- (void)resetOutputStateAndRequeueInFlightDataLocked {
+    NSData *retryData = self.inFlightData;
+    if (retryData.length > 0) {
+        NSMutableData *restored = [[NSMutableData alloc] initWithCapacity:retryData.length + self.pendingData.length];
+        [restored appendData:retryData];
+        [restored appendData:self.pendingData];
+        self.pendingData = restored;
+    }
+    self.inFlightData = nil;
+    self.outputInProgress = NO;
+    self.outputStartedAt = 0;
+    self.outputGeneration++;
+}
+
+- (void)recoverTerminalWebViewWithReason:(NSString *)reason error:(NSError *)error {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUInteger pendingBytes = 0;
+#if !ISH_LINUX
+        lock(&self->_dataLock, 0);
+        [self resetOutputStateAndRequeueInFlightDataLocked];
+        pendingBytes = self.pendingData.length;
+        unlock(&self->_dataLock);
+#else
+        @synchronized (self) {
+            [self resetOutputStateAndRequeueInFlightDataLocked];
+            pendingBytes = self.pendingData.length;
+        }
+#endif
+        [self recordLifecycleEvent:@"terminal.webview.recover"
+                           details:@{@"reason": reason ?: @"unknown",
+                                     @"pendingBytes": @(pendingBytes),
+                                     @"error": error.localizedDescription ?: @"unknown"}];
+        self.loaded = NO;
+        self.didReportLoadFailure = NO;
+        WKWebView *oldWebView = _webView;
+        oldWebView.navigationDelegate = nil;
+        [oldWebView stopLoading];
+        [oldWebView removeFromSuperview];
+        _webView = nil;
+        [self webView];
+    });
+}
+
+- (void)recordLifecycleEvent:(NSString *)event details:(NSDictionary<NSString *, id> *)details {
+    NSMutableDictionary<NSString *, id> *payload = [NSMutableDictionary dictionaryWithDictionary:details ?: @{}];
+    payload[@"terminalUUID"] = self.uuid.UUIDString ?: @"";
+    payload[@"type"] = ISHTerminalTypeString(self.type);
+    payload[@"number"] = @(self.number);
+    payload[@"loaded"] = ISHStringFromBOOL(self.loaded);
+    [ISHDiagnosticsStore recordBreadcrumb:event details:payload];
+    if (ISHTerminalLifecycleLogEnabled()) {
+        NSLog(@"%@ %@ type=%@ num=%d loaded=%@ details=%@",
+              event, self.uuid.UUIDString ?: @"", ISHTerminalTypeString(self.type), self.number,
+              ISHStringFromBOOL(self.loaded), payload);
+    }
 }
 
 - (WKWebView *)webView {
@@ -178,7 +439,11 @@ static void NotifyTerminalRegistryChanged(void) {
     if ([message.name isEqualToString:@"load"]) {
         self.loaded = YES;
         self.didReportLoadFailure = NO;
-        NSLog(@"Terminal %@ finished loading terminal UI", self.uuid.UUIDString ?: @"(unknown)");
+        [self recordLifecycleEvent:@"terminal.webview.load"
+                           details:@{@"script": @"load"}];
+        if (ISHTerminalLifecycleLogEnabled()) {
+            NSLog(@"Terminal %@ finished loading terminal UI", self.uuid.UUIDString ?: @"(unknown)");
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             [NSNotificationCenter.defaultCenter postNotificationName:TerminalDidLoadNotification
                                                               object:self];
@@ -189,8 +454,11 @@ static void NotifyTerminalRegistryChanged(void) {
         self.enableVoiceOverAnnounce = self.enableVoiceOverAnnounce;
     } else if ([message.name isEqualToString:@"sendInput"]) {
         NSData *data = [message.body dataUsingEncoding:NSUTF8StringEncoding];
+        [self recordLifecycleEvent:@"terminal.webview.sendInput"
+                           details:@{@"bytes": @(data.length)}];
         [self sendInput:data];
     } else if ([message.name isEqualToString:@"resize"]) {
+        [self recordLifecycleEvent:@"terminal.webview.resize" details:nil];
         [self syncWindowSize];
     } else if ([message.name isEqualToString:@"propUpdate"]) {
         [self setValue:message.body[1] forKey:message.body[0]];
@@ -207,12 +475,13 @@ static void NotifyTerminalRegistryChanged(void) {
 
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
     self.loaded = NO;
-    [ISHDiagnosticsStore recordBreadcrumb:@"terminal.webContentProcessTerminated"
-                                  details:@{@"terminalUUID": self.uuid.UUIDString ?: @""}];
+    [self recordLifecycleEvent:@"terminal.webContentProcessTerminated"
+                       details:@{@"webViewHidden": ISHStringFromBOOL(webView.isHidden)}];
     NSError *error = [NSError errorWithDomain:WKErrorDomain
                                          code:WKErrorWebContentProcessTerminated
                                      userInfo:@{NSLocalizedDescriptionKey: @"terminal web content process terminated"}];
     [self reportTerminalLoadFailure:error];
+    [self recoverTerminalWebViewWithReason:@"webContentProcessTerminated" error:error];
 }
 
 - (void)syncWindowSize {
@@ -247,13 +516,34 @@ static void NotifyTerminalRegistryChanged(void) {
 }
 
 - (int)sendOutput:(const void *)buf length:(int)len {
+    TerminalDebugMirrorOutput(self, buf, len);
 #if !ISH_LINUX
     lock(&_dataLock, 0);
     if (!NSThread.isMainThread) {
-        // The main thread is the only one that can unblock this, so sleeping here would be a deadlock.
-        // The only reason for this to be called on the main thread is if input is echoed.
-        while (_pendingData.length > BUF_SIZE)
-            wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
+        if (!self.loaded) {
+            // Hidden/background consoles (for example tty2-tty6 getty instances
+            // started by init) may never get a web view to drain them. Keep a
+            // bounded tail of recent output instead of blocking guest writers
+            // forever once the buffer fills.
+            if (len > BUF_SIZE) {
+                buf = (const char *) buf + (len - BUF_SIZE);
+                len = BUF_SIZE;
+                [_pendingData setLength:0];
+            } else {
+                NSUInteger needed = (NSUInteger) len;
+                NSUInteger available = _pendingData.length >= BUF_SIZE ? 0 : (NSUInteger) (BUF_SIZE - _pendingData.length);
+                if (needed > available) {
+                    NSUInteger discard = MIN(_pendingData.length, needed - available);
+                    [_pendingData replaceBytesInRange:NSMakeRange(0, discard) withBytes:NULL length:0];
+                }
+            }
+        } else {
+            // The main thread is the only one that can unblock this, so sleeping
+            // here would be a deadlock. The only reason for this to be called on
+            // the main thread is if input is echoed.
+            while (_pendingData.length > BUF_SIZE)
+                wait_for_ignore_signals(&_dataConsumed, &_dataLock, NULL);
+        }
     }
     [_pendingData appendData:[NSData dataWithBytes:buf length:len]];
     [self.refreshTask schedule];
@@ -285,6 +575,12 @@ static void NotifyTerminalRegistryChanged(void) {
 - (void)sendInput:(NSData *)input {
     if (self.tty == NULL)
         return;
+    if (input.length > 0) {
+        uint8_t first = ((const uint8_t *) input.bytes)[0];
+        [self recordLifecycleEvent:@"terminal.sendInput"
+                           details:@{@"bytes": @(input.length),
+                                     @"firstByte": [NSString stringWithFormat:@"%#x", first]}];
+    }
 #if !ISH_LINUX
     tty_input(self.tty, input.bytes, input.length, 0);
 #else
@@ -297,6 +593,12 @@ static void NotifyTerminalRegistryChanged(void) {
         [self.webView evaluateJavaScript:@"exports.setUserGesture()" completionHandler:nil];
         [self.scrollToBottomTask schedule];
     }
+}
+
+- (void)requestRefresh {
+    [self.refreshTask schedule];
+    if (self.loaded)
+        [self.scrollToBottomTask schedule];
 }
 
 - (void)scrollToBottom {
@@ -315,26 +617,69 @@ static void NotifyTerminalRegistryChanged(void) {
 
 #if !ISH_LINUX
     lock(&_dataLock, 0);
+    CFTimeInterval now = ISHTerminalNowMonotonic();
     if (_outputInProgress) {
-        [self.refreshTask schedule];
-        unlock(&_dataLock);
-        return;
+        if (_outputStartedAt > 0 && now - _outputStartedAt > ISHTerminalOutputWatchdogSeconds) {
+            NSData *retryData = self.inFlightData;
+            if (retryData.length > 0) {
+                NSMutableData *restored = [[NSMutableData alloc] initWithCapacity:retryData.length + _pendingData.length];
+                [restored appendData:retryData];
+                [restored appendData:_pendingData];
+                _pendingData = restored;
+            }
+            self.inFlightData = nil;
+            _outputInProgress = NO;
+            _outputStartedAt = 0;
+            self.outputGeneration++;
+            [self recordLifecycleEvent:@"terminal.output.watchdog"
+                               details:@{@"pendingBytes": @(_pendingData.length),
+                                         @"retryBytes": @(retryData.length)}];
+        } else {
+            [self.refreshTask schedule];
+            unlock(&_dataLock);
+            return;
+        }
     }
     NSData *data = _pendingData;
     _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
     _outputInProgress = YES;
+    self.inFlightData = data;
+    _outputStartedAt = now;
+    NSUInteger generation = ++self.outputGeneration;
     notify(&self->_dataConsumed);
     unlock(&_dataLock);
 #else
     NSData *data;
+    NSUInteger generation;
     @synchronized (self) {
         if (_outputInProgress) {
-            [self.refreshTask schedule];
-            return;
+            CFTimeInterval now = ISHTerminalNowMonotonic();
+            if (_outputStartedAt > 0 && now - _outputStartedAt > ISHTerminalOutputWatchdogSeconds) {
+                NSData *retryData = self.inFlightData;
+                if (retryData.length > 0) {
+                    NSMutableData *restored = [[NSMutableData alloc] initWithCapacity:retryData.length + _pendingData.length];
+                    [restored appendData:retryData];
+                    [restored appendData:_pendingData];
+                    _pendingData = restored;
+                }
+                self.inFlightData = nil;
+                _outputInProgress = NO;
+                _outputStartedAt = 0;
+                self.outputGeneration++;
+                [self recordLifecycleEvent:@"terminal.output.watchdog"
+                                   details:@{@"pendingBytes": @(_pendingData.length),
+                                             @"retryBytes": @(retryData.length)}];
+            } else {
+                [self.refreshTask schedule];
+                return;
+            }
         }
         data = _pendingData;
         _pendingData = [[NSMutableData alloc] initWithCapacity:BUF_SIZE];
         _outputInProgress = YES;
+        self.inFlightData = data;
+        _outputStartedAt = ISHTerminalNowMonotonic();
+        generation = ++self.outputGeneration;
         if (self->_tty)
             async_do_in_irq(^{
                 self->_tty->ops->can_output(self->_tty);
@@ -342,22 +687,46 @@ static void NotifyTerminalRegistryChanged(void) {
     }
 #endif
 
-    NSString *dataString = [[NSString alloc] initWithBytes:data.bytes length:data.length encoding:NSISOLatin1StringEncoding];
-    // escape for javascript. only have to worry about the first 256 codepoints, because of the latin-1 encoding.
-    dataString = [dataString stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
-    dataString = [dataString stringByReplacingOccurrencesOfString:@"\r" withString:@"\\r"];
-    dataString = [dataString stringByReplacingOccurrencesOfString:@"\n" withString:@"\\n"];
-    dataString = [dataString stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    if (data.length == 0) {
+#if !ISH_LINUX
+        lock(&_dataLock, 0);
+        if (self.outputGeneration == generation) {
+            _outputInProgress = NO;
+            self.inFlightData = nil;
+            _outputStartedAt = 0;
+        }
+        unlock(&_dataLock);
+#else
+        @synchronized (self) {
+            if (self.outputGeneration == generation) {
+                _outputInProgress = NO;
+                self.inFlightData = nil;
+                _outputStartedAt = 0;
+            }
+        }
+#endif
+        return;
+    }
+
+    NSString *dataString = ISHJavaScriptLiteralForTerminalData(data);
     NSString *jsToEvaluate = [NSString stringWithFormat:@"exports.write(\"%@\")", dataString];
     [self.webView evaluateJavaScript:jsToEvaluate completionHandler:^(id result, NSError *error) {
 #if !ISH_LINUX
         lock(&self->_dataLock, 0);
-        self->_outputInProgress = NO;
+        if (self.outputGeneration == generation) {
+            self->_outputInProgress = NO;
+            self.inFlightData = nil;
+            self->_outputStartedAt = 0;
+        }
         unlock(&self->_dataLock);
 #else
         bool hasPendingData;
         @synchronized (self) {
-            self->_outputInProgress = NO;
+            if (self.outputGeneration == generation) {
+                self->_outputInProgress = NO;
+                self.inFlightData = nil;
+                self->_outputStartedAt = 0;
+            }
             hasPendingData = self->_pendingData.length > 0;
         }
         if (self->_tty != NULL) {
@@ -371,8 +740,19 @@ static void NotifyTerminalRegistryChanged(void) {
 #endif
         if (error != nil) {
             NSLog(@"error sending bytes to the terminal: %@", error);
+            [self recordLifecycleEvent:@"terminal.output.writeFailed"
+                               details:@{@"bytes": @(data.length),
+                                         @"error": error.localizedDescription ?: @"unknown"}];
+            [self recoverTerminalWebViewWithReason:@"writeFailed" error:error];
             return;
         }
+#if !ISH_LINUX
+        lock(&self->_dataLock, 0);
+        bool hasPendingData = self->_pendingData.length > 0;
+        unlock(&self->_dataLock);
+        if (hasPendingData)
+            [self.refreshTask schedule];
+#endif
     }];
 }
 
@@ -429,6 +809,10 @@ static void NotifyTerminalRegistryChanged(void) {
     }
 }
 
+- (void)setPendingDestroyReason:(NSString *)reason {
+    _pendingDestroyReason = [reason copy];
+}
+
 - (int)type {
     return dev_major((dev_t_) self.terminalsKey.unsignedIntValue);
 }
@@ -439,10 +823,28 @@ static void NotifyTerminalRegistryChanged(void) {
 
 - (void)destroy {
     tty_t tty = self.tty;
+    NSString *reason = self.pendingDestroyReason ?: @"unspecified";
+    self.pendingDestroyReason = nil;
+    NSMutableDictionary<NSString *, id> *details = [NSMutableDictionary dictionaryWithDictionary:@{
+        @"reason": reason,
+        @"ttyAttached": ISHStringFromBOOL(tty != NULL),
+    }];
+#if !ISH_LINUX
+    if (tty != NULL) {
+        details[@"ttyHungUp"] = ISHStringFromBOOL(tty->hung_up);
+        details[@"ttyEverOpened"] = ISHStringFromBOOL(tty->ever_opened);
+        details[@"ttySession"] = @(tty->session);
+        details[@"ttyFgGroup"] = @(tty->fg_group);
+    }
+#endif
+    [self recordLifecycleEvent:@"terminal.destroy" details:details];
     if (tty != NULL) {
 #if !ISH_LINUX
         if (tty != NULL) {
             lock(&tty->lock, 0);
+            [self recordLifecycleEvent:@"terminal.destroy.hangup"
+                               details:@{@"reason": reason,
+                                         @"ttyHungUpBefore": ISHStringFromBOOL(tty->hung_up)}];
             tty_hangup(tty);
             unlock(&tty->lock);
         }

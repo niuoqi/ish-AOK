@@ -1,15 +1,25 @@
 #include <string.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "fs/proc.h"
 #include "fs/path.h"
 
+static pthread_once_t proc_tree_once = PTHREAD_ONCE_INIT;
+
+static void proc_init_tree_once(void) {
+    proc_root_init();
+}
+
+static int proc_mount(struct mount *UNUSED(mount)) {
+    pthread_once(&proc_tree_once, proc_init_tree_once);
+    return 0;
+}
+
 static void proc_prepare_child_entry(struct proc_entry *parent, unsigned long index, struct proc_entry *child) {
-    if (child->meta->parent == NULL)
-        child->meta->parent = parent->meta;
-    else
-        assert(child->meta->parent == parent->meta);
+    child->index = index;
+    child->parent = parent->meta;
 }
 
 static int proc_lookup(const char *path, struct proc_entry *entry) {
@@ -63,14 +73,19 @@ static int proc_getpath(struct fd *fd, char *buf) {
     p[0] = '\0';
     struct proc_entry entry = fd->proc.entry;
     while (entry.meta != &proc_root) {
+        if (entry.meta == NULL)
+            return _ENOENT;
         char component[MAX_NAME];
         proc_entry_getname(&entry, component);
         size_t component_len = strlen(component) + 1; // plus one for the slash
+        if ((size_t) (p - buf) < component_len)
+            return _ENAMETOOLONG;
         p -= component_len;
         n += component_len;
         *p = '/';
         memcpy(p + 1, component, component_len - 1);
-        entry.meta = entry.meta->parent;
+        entry.meta = entry.parent;
+        entry.parent = entry.meta != NULL ? entry.meta->parent : NULL;
     }
     memmove(buf, p, n + 1); // plus one for the null
     return 0;
@@ -199,6 +214,7 @@ static int proc_readdir(struct fd *fd, struct dir_entry *entry) {
     proc_prepare_child_entry(&fd->proc.entry, fd->offset, &proc_entry);
     proc_entry_getname(&proc_entry, entry->name);
     entry->inode = proc_entry_inode(&proc_entry);
+    entry->type = dir_entry_type_for_mode(proc_entry_mode(&proc_entry));
     proc_entry_cleanup(&proc_entry);
     return 1;
 }
@@ -266,6 +282,7 @@ void proc_printf(struct proc_data *buf, const char *format, ...) {
 
 const struct fs_ops procfs = {
     .name = "proc", .magic = 0x9fa0,
+    .mount = proc_mount,
     .open = proc_open,
     .getpath = proc_getpath,
     .stat = proc_stat,

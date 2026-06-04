@@ -9,29 +9,66 @@
 #include "misc.h"
 #include "debug.h"
 
+#ifndef IPV6_RECVHOPLIMIT
+#define IPV6_RECVHOPLIMIT 37
+#endif
+
+#ifndef IPV6_HOPLIMIT
+#define IPV6_HOPLIMIT 47
+#endif
+
 extern const struct fd_ops socket_fdops;
 
 int_t sys_socketcall(dword_t call_num, addr_t args_addr);
+int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr);
 
 int_t sys_socket(dword_t domain, dword_t type, dword_t protocol);
 int_t sys_bind(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len);
+int_t sys_bind_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len);
 int_t sys_connect(fd_t sock_fd, addr_t sockaddr_addr, uint_t sockaddr_len);
+int_t sys_connect_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_len);
 int_t sys_listen(fd_t sock_fd, int_t backlog);
 int_t sys_accept(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr);
+int_t sys_accept_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr);
 int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, int_t flags);
+int_t sys_accept4_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr, int_t flags);
 int_t sys_getsockname(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr);
+int_t sys_getsockname_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr);
 int_t sys_getpeername(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr);
+int_t sys_getpeername_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr);
 int_t sys_socketpair(dword_t domain, dword_t type, dword_t protocol, addr_t sockets_addr);
+int_t sys_socketpair_guest(dword_t domain, dword_t type, dword_t protocol, guest_addr_t sockets_addr);
 int_t sys_sendto(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, dword_t sockaddr_len);
+int_t sys_sendto_guest(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags, guest_addr_t sockaddr_addr, dword_t sockaddr_len);
 int_t sys_recvfrom(fd_t sock_fd, addr_t buffer_addr, dword_t len, dword_t flags, addr_t sockaddr_addr, addr_t sockaddr_len_addr);
+int_t sys_recvfrom_guest(fd_t sock_fd, guest_addr_t buffer_addr, dword_t len, dword_t flags, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr);
 int_t sys_shutdown(fd_t sock_fd, dword_t how);
 int_t sys_setsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len);
+int_t sys_setsockopt_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, dword_t value_len);
+int_t sys_setsockopt_amd64(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t value_len);
+int_t sys_setsockopt_amd64_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, dword_t value_len);
 int_t sys_getsockopt(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t len_addr);
+int_t sys_getsockopt_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, guest_addr_t len_addr);
+int_t sys_getsockopt_amd64(fd_t sock_fd, dword_t level, dword_t option, addr_t value_addr, dword_t len_addr);
+int_t sys_getsockopt_amd64_guest(fd_t sock_fd, dword_t level, dword_t option, guest_addr_t value_addr, guest_addr_t len_addr);
 int_t sys_sendmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags);
+int_t sys_sendmsg_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags);
+int_t sys_sendmsg_amd64(fd_t sock_fd, addr_t msghdr_addr, int_t flags);
+int_t sys_sendmsg_amd64_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags);
 int_t sys_recvmsg(fd_t sock_fd, addr_t msghdr_addr, int_t flags);
+int_t sys_recvmsg_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags);
+int_t sys_recvmsg_amd64(fd_t sock_fd, addr_t msghdr_addr, int_t flags);
+int_t sys_recvmsg_amd64_guest(fd_t sock_fd, guest_addr_t msghdr_addr, int_t flags);
 int_t sys_recvmmsg(fd_t sock_fd, addr_t msgvec_addr, uint_t msgvec_len, int_t flags, addr_t timeout_addr);
+int_t sys_recvmmsg_guest(fd_t sock_fd, guest_addr_t msgvec_addr, uint_t msgvec_len, int_t flags, guest_addr_t timeout_addr);
+int_t sys_recvmmsg_amd64(fd_t sock_fd, addr_t msgvec_addr, uint_t msgvec_len, int_t flags, addr_t timeout_addr);
+int_t sys_recvmmsg_amd64_guest(fd_t sock_fd, guest_addr_t msgvec_addr, uint_t msgvec_len, int_t flags, guest_addr_t timeout_addr);
 int_t sys_recvmmsg_time64(fd_t sock_fd, addr_t msgvec_addr, uint_t msgvec_len, int_t flags, addr_t timeout_addr);
+int_t sys_recvmmsg_time64_guest(fd_t sock_fd, guest_addr_t msgvec_addr, uint_t msgvec_len, int_t flags, guest_addr_t timeout_addr);
 int_t sys_sendmmsg(fd_t sock_fd, addr_t msgvec_addr, uint_t msgvec_len, int_t flags);
+int_t sys_sendmmsg_guest(fd_t sock_fd, guest_addr_t msgvec_addr, uint_t msgvec_len, int_t flags);
+int_t sys_sendmmsg_amd64(fd_t sock_fd, addr_t msgvec_addr, uint_t msgvec_len, int_t flags);
+int_t sys_sendmmsg_amd64_guest(fd_t sock_fd, guest_addr_t msgvec_addr, uint_t msgvec_len, int_t flags);
 
 #define SOCKADDR_DATA_MAX 108
 
@@ -48,6 +85,30 @@ size_t sockaddr_size(void *p);
 // result comes from malloc
 struct sockaddr *sockaddr_to_real(void *p);
 
+struct i386_msghdr_ {
+    addr_t msg_name;
+    uint_t msg_namelen;
+    addr_t msg_iov;
+    uint_t msg_iovlen;
+    addr_t msg_control;
+    uint_t msg_controllen;
+    int_t msg_flags;
+};
+static_assert(sizeof(struct i386_msghdr_) == 28, "i386_msghdr size");
+
+struct amd64_msghdr_ {
+    qword_t msg_name;
+    uint_t msg_namelen;
+    uint_t __pad0;
+    qword_t msg_iov;
+    qword_t msg_iovlen;
+    qword_t msg_control;
+    qword_t msg_controllen;
+    int_t msg_flags;
+    uint_t __pad1;
+};
+static_assert(sizeof(struct amd64_msghdr_) == 56, "amd64_msghdr size");
+
 struct msghdr_ {
     addr_t msg_name;
     uint_t msg_namelen;
@@ -58,12 +119,54 @@ struct msghdr_ {
     int_t msg_flags;
 };
 
+struct i386_cmsghdr_ {
+    dword_t len;
+    int_t level;
+    int_t type;
+};
+static_assert(sizeof(struct i386_cmsghdr_) == 12, "i386_cmsghdr size");
+
+struct amd64_cmsghdr_ {
+    qword_t len;
+    int_t level;
+    int_t type;
+};
+static_assert(sizeof(struct amd64_cmsghdr_) == 16, "amd64_cmsghdr size");
+
 struct cmsghdr_ {
     dword_t len;
     int_t level;
     int_t type;
     uint8_t data[];
 };
+
+struct sock_extended_err_ {
+    uint32_t ee_errno;
+    uint8_t ee_origin;
+    uint8_t ee_type;
+    uint8_t ee_code;
+    uint8_t ee_pad;
+    uint32_t ee_info;
+    uint32_t ee_data;
+};
+
+#define SO_EE_ORIGIN_NONE_ 0
+#define SO_EE_ORIGIN_LOCAL_ 1
+#define SO_EE_ORIGIN_ICMP_ 2
+#define SO_EE_ORIGIN_ICMP6_ 3
+
+struct i386_mmsghdr_ {
+    struct i386_msghdr_ hdr;
+    uint_t len;
+};
+static_assert(sizeof(struct i386_mmsghdr_) == 32, "i386_mmsghdr size");
+
+struct amd64_mmsghdr_ {
+    struct amd64_msghdr_ hdr;
+    uint_t len;
+    uint_t __pad0;
+};
+static_assert(sizeof(struct amd64_mmsghdr_) == 64, "amd64_mmsghdr size");
 #define SCM_RIGHTS_ 1
 #define SCM_CREDENTIALS_ 2
 // copied and ported from musl
@@ -111,6 +214,7 @@ static inline int sock_family_from_real(int fake) {
 #define SOCK_STREAM_ 1
 #define SOCK_DGRAM_ 2
 #define SOCK_RAW_ 3
+#define SOCK_SEQPACKET_ 5
 #define SOCK_NONBLOCK_ 0x800
 #define SOCK_CLOEXEC_ 0x80000
 
@@ -142,6 +246,10 @@ static inline int sock_type_to_real(int type, int protocol) {
                     break;
             }
             return SOCK_DGRAM;
+        case SOCK_SEQPACKET_:
+            if (protocol != 0)
+                return -1;
+            return SOCK_SEQPACKET;
     }
     return -1;
 }
@@ -153,6 +261,7 @@ static inline int sock_type_to_real(int type, int protocol) {
 #define MSG_DONTWAIT_ 0x40
 #define MSG_EOR_    0x80
 #define MSG_WAITALL_ 0x100
+#define MSG_ERRQUEUE_ 0x2000
 
 static inline int sock_flags_to_real(int fake) {
     int real = 0;
@@ -163,7 +272,7 @@ static inline int sock_flags_to_real(int fake) {
     if (fake & MSG_DONTWAIT_) real |= MSG_DONTWAIT;
     if (fake & MSG_EOR_) real |= MSG_EOR;
     if (fake & MSG_WAITALL_) real |= MSG_WAITALL;
-    if (fake & ~(MSG_OOB_|MSG_PEEK_|MSG_CTRUNC_|MSG_TRUNC_|MSG_DONTWAIT_|MSG_EOR_|MSG_WAITALL_))
+    if (fake & ~(MSG_OOB_|MSG_PEEK_|MSG_CTRUNC_|MSG_TRUNC_|MSG_DONTWAIT_|MSG_EOR_|MSG_WAITALL_|MSG_ERRQUEUE_))
         TRACE("unimplemented socket flags %d\n", fake);
     return real;
 }
@@ -240,6 +349,8 @@ static inline int sock_flags_from_real(int real) {
 #define IPV6_MTU_ 24
 #define IPV6_UNICAST_HOPS_ 16
 #define IPV6_RECVERR_ 25
+#define IPV6_RECVHOPLIMIT_ 51
+#define IPV6_HOPLIMIT_ 52
 #define IPV6_V6ONLY_ 26
 #define IPV6_TCLASS_ 67
 #define ICMP6_FILTER_ 1
@@ -285,6 +396,7 @@ static inline int sock_opt_to_real(int fake, int level) {
         } break;
         case IPPROTO_IPV6: switch (fake) {
             case IPV6_UNICAST_HOPS_: return IPV6_UNICAST_HOPS;
+            case IPV6_RECVHOPLIMIT_: return IPV6_RECVHOPLIMIT;
             case IPV6_TCLASS_: return IPV6_TCLASS;
             case IPV6_V6ONLY_: return IPV6_V6ONLY;
         } break;

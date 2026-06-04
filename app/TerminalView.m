@@ -10,6 +10,9 @@
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
 #import "NSObject+SaneKVO.h"
+#import "Diagnostics.h"
+#include <stdlib.h>
+#include <string.h>
 
 struct rowcol {
     int row;
@@ -102,11 +105,30 @@ struct rowcol {
 
 static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight", @"newScrollTop", @"openLink"};
 
+static BOOL ISHTerminalViewEventLogEnabled(void) {
+    const char *enabled = getenv("ISH_TRACE_TERMINAL_LIFECYCLE");
+    return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;
+}
+
+static void ISHRecordTerminalViewEvent(NSString *event, Terminal *terminal, NSDictionary<NSString *, id> *details) {
+    NSMutableDictionary<NSString *, id> *payload = [NSMutableDictionary dictionaryWithDictionary:details ?: @{}];
+    payload[@"terminalUUID"] = terminal.uuid.UUIDString ?: @"";
+    payload[@"type"] = @(terminal.type);
+    payload[@"number"] = @(terminal.number);
+    [ISHDiagnosticsStore recordBreadcrumb:event details:payload];
+    if (ISHTerminalViewEventLogEnabled()) {
+        NSLog(@"%@ terminal=%@ type=%d num=%d details=%@",
+              event, terminal.uuid.UUIDString ?: @"", terminal.type, terminal.number, payload);
+    }
+}
+
 - (void)setTerminal:(Terminal *)terminal {
     if (_terminal == terminal)
         return;
 
     if (_terminal) {
+        ISHRecordTerminalViewEvent(@"terminalView.setTerminal.detach", _terminal,
+                                   @{@"reason": @"replace-terminal"} );
         [_terminal removeObserver:self forKeyPath:@"loaded"];
         [self uninstallTerminalView];
     }
@@ -115,6 +137,8 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     if (_terminal == nil)
         return;
 
+    ISHRecordTerminalViewEvent(@"terminalView.setTerminal.attach", _terminal,
+                               @{@"loaded": _terminal.loaded ? @"yes" : @"no"} );
     [_terminal webView];
     [_terminal addObserver:self forKeyPath:@"loaded" options:NSKeyValueObservingOptionInitial context:nil];
     [self installTerminalView];
@@ -124,10 +148,15 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     UIView *superview = self.terminal.webView.superview;
     if (superview != nil) {
         NSAssert(superview == self.scrollbarView, @"installing terminal that is already installed elsewhere");
+        ISHRecordTerminalViewEvent(@"terminalView.install.skip", self.terminal,
+                                   @{@"reason": @"already-installed",
+                                     @"sameSuperview": superview == self.scrollbarView ? @"yes" : @"no"} );
         return;
     }
 
     WKWebView *webView = _terminal.webView;
+    ISHRecordTerminalViewEvent(@"terminalView.install.begin", _terminal,
+                               @{@"loaded": _terminal.loaded ? @"yes" : @"no"} );
     _terminal.enableVoiceOverAnnounce = YES;
     webView.scrollView.scrollEnabled = NO;
     webView.scrollView.delaysContentTouches = NO;
@@ -144,6 +173,9 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
     self.scrollbarView.contentView = webView;
     [self.scrollbarView addSubview:webView];
+    [self syncTerminalFocus];
+    [self.terminal requestRefresh];
+    ISHRecordTerminalViewEvent(@"terminalView.install.end", _terminal, nil);
 }
 
 - (void)uninstallTerminalView {
@@ -151,15 +183,19 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
     UIView *superview = _terminal.webView.superview;
     if (superview != self.scrollbarView) {
         NSAssert(superview == nil, @"uninstalling terminal that is installed elsewhere");
+        ISHRecordTerminalViewEvent(@"terminalView.uninstall.skip", _terminal,
+                                   @{@"reason": superview == nil ? @"already-detached" : @"installed-elsewhere"} );
         return;
     }
 
+    ISHRecordTerminalViewEvent(@"terminalView.uninstall.begin", _terminal, nil);
     [_terminal.webView removeFromSuperview];
     self.scrollbarView.contentView = nil;
     for (int i = 0; i < sizeof(HANDLERS)/sizeof(HANDLERS[0]); i++) {
         [_terminal.webView.configuration.userContentController removeScriptMessageHandlerForName:HANDLERS[i]];
     }
     _terminal.enableVoiceOverAnnounce = NO;
+    ISHRecordTerminalViewEvent(@"terminalView.uninstall.end", _terminal, nil);
 }
 
 #pragma mark Styling
@@ -212,14 +248,19 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 
 - (void)setTerminalFocused:(BOOL)terminalFocused {
     _terminalFocused = terminalFocused;
+    [self syncTerminalFocus];
+}
+
+- (void)syncTerminalFocus {
     if (!self.terminal.loaded)
         return;
-    NSString *script = terminalFocused ? @"exports.setFocused(true)" : @"exports.setFocused(false)";
+    NSString *script = _terminalFocused ? @"exports.setFocused(true)" : @"exports.setFocused(false)";
     [self.terminal.webView evaluateJavaScript:script completionHandler:nil];
 }
 
 - (BOOL)becomeFirstResponder {
     self.terminalFocused = YES;
+    [self.terminal requestRefresh];
     [self reloadInputViews];
     return [super becomeFirstResponder];
 }
@@ -229,6 +270,7 @@ static NSString *const HANDLERS[] = {@"syncFocus", @"focus", @"newScrollHeight",
 }
 - (void)windowDidBecomeKey:(NSNotification *)notif {
     self.terminalFocused = YES;
+    [self.terminal requestRefresh];
 }
 - (void)windowDidResignKey:(NSNotification *)notif {
     self.terminalFocused = NO;
@@ -558,7 +600,7 @@ static const char *viRepeatKeys = "hjkl";
          */
         //if (@available(iOS 15.0, *)) {
         //    [self addFunctionKey:UIKeyInputDelete withName:@"Del" withNormalEscapeSequence:@"\x1b[3~" withShiftEscapeSequence:@"\x1b[3;2~" withControlEscapeSequence:@"\x1b[3;5~"];
-       // } // This breaks the del key.  -mke
+       // } // This breaks the Del key.
         [self addFunctionKey:UIKeyInputPageUp withName:@"PgUp" withNormalEscapeSequence:@"\x1b[5~" withShiftEscapeSequence:@"\x1b[5;2~" withControlEscapeSequence:@"\x1b[5;5~" withAltEscapeSequence:@"\x1b[5;3~"];
         [self addFunctionKey:UIKeyInputPageDown withName:@"PgDn" withNormalEscapeSequence:@"\x1b[6~" withShiftEscapeSequence:@"\x1b[6;2~" withControlEscapeSequence:@"\x1b[6;5~" withAltEscapeSequence:@"\x1b[6;3~"];
         [self addFunctionKey:UIKeyInputHome withName:@"Home" withNormalEscapeSequence:@"\x1bOH" withShiftEscapeSequence:@"\x1b[1;2H" withControlEscapeSequence:@"\x1b[1;5H" withAltEscapeSequence:@"\x1b[1;3H"];

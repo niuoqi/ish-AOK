@@ -30,66 +30,76 @@ static lock_t log_lock = LOCK_INITIALIZER;
 #define SYSLOG_ACTION_SIZE_UNREAD_ 9
 #define SYSLOG_ACTION_SIZE_BUFFER_ 10
 
-static size_t syslog_read(addr_t buf_addr, size_t len, int flags) {
-    if (flags & FIFO_LAST) {
-        if ((size_t) len > log_max_since_clear)
-            len = log_max_since_clear;
-    } else {
-        if ((size_t) len > fifo_capacity(&log_buf))
-            len = fifo_capacity(&log_buf);
+static size_t syslog_read(guest_addr_t buf_addr, size_t len, int flags) {
+    size_t available = fifo_size(&log_buf);
+    if (flags & FIFO_LAST && available > log_max_since_clear)
+        available = log_max_since_clear;
+    if (len > available)
+        len = available;
+    if (len == 0)
+        return 0;
+
+    char *buf = malloc(len);
+    if (buf == NULL)
+        return _ENOMEM;
+    if (fifo_read(&log_buf, buf, len, flags)) {
+        free(buf);
+        return _EIO;
     }
-    char *buf = malloc(len + 1);
-    fifo_read(&log_buf, buf, len, flags);
-    
-    // Here we will split on \n and do one entry per line
-    // Keep printing tokens while one of the
-    // delimiters present
-    addr_t pointer = buf_addr; // Where we are in the buffer
-    char *token = strtok(buf, "\n"); // Get the first line
-    
-    if(user_write(pointer, "\n", 1)) { // Positive return value = fail
+    if (user_write(buf_addr, buf, len)) {
         free(buf);
         return _EFAULT;
     }
-    
-    pointer++;
-    
-    while (token != NULL) {
-        size_t length = strlen(token);
-        if(user_write(pointer, token, length)) { // Positive return value = fail
-            free(buf);
-            return _EFAULT;
-        }
-           
-        pointer += length;
-        
-        if(user_write(pointer, "\n", 1)) { // Positive return value = fail
-            free(buf);
-            return _EFAULT;
-        }
-        
-        pointer++;
-        if(pointer < (buf_addr + (len -1))) {
-            token = strtok(NULL, "\n");  // Grab next token, deal with when back at top of while loop. -mke
-        } else {
-            token = NULL;
-        }
-    }
-
     free(buf);
-    
     return len;
 }
 
-static size_t do_syslog(int type, addr_t buf_addr, int_t len) {
+size_t ish_log_size(void) {
+    lock(&log_lock, 0);
+    size_t size = fifo_size(&log_buf);
+    unlock(&log_lock);
+    return size;
+}
+
+ssize_t ish_log_read_bytes(size_t offset, void *buf, size_t len) {
+    lock(&log_lock, 0);
+    size_t available = fifo_size(&log_buf);
+    if (offset >= available) {
+        unlock(&log_lock);
+        return 0;
+    }
+    if (len > available - offset)
+        len = available - offset;
+    if (len == 0) {
+        unlock(&log_lock);
+        return 0;
+    }
+
+    size_t start = (log_buf.start + offset) % log_buf.capacity;
+    size_t first_copy_size = log_buf.capacity - start;
+    if (first_copy_size > len)
+        first_copy_size = len;
+    memcpy(buf, &log_buf.buf[start], first_copy_size);
+    memcpy((char *) buf + first_copy_size, &log_buf.buf[0], len - first_copy_size);
+    unlock(&log_lock);
+    return (ssize_t) len;
+}
+
+static size_t do_syslog(int type, guest_addr_t buf_addr, int_t len) {
     int res;
     switch (type) {
         case SYSLOG_ACTION_READ_:
+            if (len < 0)
+                return _EINVAL;
             return syslog_read(buf_addr, len, 0);
         case SYSLOG_ACTION_READ_ALL_:
+            if (len < 0)
+                return _EINVAL;
             return syslog_read(buf_addr, len, FIFO_LAST | FIFO_PEEK);
 
         case SYSLOG_ACTION_READ_CLEAR_:
+            if (len < 0)
+                return _EINVAL;
             res = (int)syslog_read(buf_addr, len, FIFO_LAST | FIFO_PEEK);
             if (res < 0)
                 return res;
@@ -114,6 +124,10 @@ static size_t do_syslog(int type, addr_t buf_addr, int_t len) {
     }
 }
 size_t sys_syslog(int_t type, addr_t buf_addr, int_t len) {
+    return sys_syslog_guest(type, buf_addr, len);
+}
+
+size_t sys_syslog_guest(int_t type, guest_addr_t buf_addr, int_t len) {
     lock(&log_lock, 0);
     size_t retval = do_syslog(type, buf_addr, len);
     unlock(&log_lock);
@@ -138,7 +152,7 @@ static void output_line(const char *line) {
      c_time_string[tlen - 1] = '\0'; // Remove trailing newline
 
      char tmpbuff[512];
-     if (snprintf(tmpbuff, 512, "[   %s] %s", c_time_string, line) >= 512) { // Insufficient room, need to terminate at buffer size
+     if (snprintf(tmpbuff, 512, "[%s] %s", c_time_string, line) >= 512) { // Insufficient room, need to terminate at buffer size
          tmpbuff[511] = '\0';
      }
     // send it to stdout or wherever

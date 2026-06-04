@@ -3,16 +3,45 @@
 
 #define REP_LIST once,rep,repnz
 
+.gadget cmc
+    ldrb w8, [_cpu, CPU_cf]
+    eor w8, w8, 1
+    strb w8, [_cpu, CPU_cf]
+    ldr w9, [_cpu, CPU_eflags]
+    bic w9, w9, 1
+    orr w9, w9, w8
+    str w9, [_cpu, CPU_eflags]
+    gret
+
+.gadget clc
+    strb wzr, [_cpu, CPU_cf]
+    ldr w8, [_cpu, CPU_eflags]
+    bic w8, w8, 1
+    str w8, [_cpu, CPU_eflags]
+    gret
+
+.gadget stc
+    mov w8, 1
+    strb w8, [_cpu, CPU_cf]
+    ldr w9, [_cpu, CPU_eflags]
+    orr w9, w9, 1
+    str w9, [_cpu, CPU_eflags]
+    gret
+
 .gadget cld
     ldr w8, [_cpu, CPU_eflags]
     bic w8, w8, DF_FLAG
     str w8, [_cpu, CPU_eflags]
+    mov w8, 1
+    str w8, [_cpu, CPU_df_offset]
     gret
 
 .gadget std
     ldr w8, [_cpu, CPU_eflags]
     orr w8, w8, DF_FLAG
     str w8, [_cpu, CPU_eflags]
+    mov w8, -1
+    str w8, [_cpu, CPU_df_offset]
     gret
 
 # FIXME non 32 bit
@@ -60,7 +89,7 @@
             read_prep \size, \op\size\()_\rep
             ldr\s w8, [_xaddr]
             mov _tmp, eax
-            setf_a src=w8, dst=_tmp
+            setf_a src=w8, dst=_tmp, s=\s
             do_add sub, _tmp, w8, \s
             setf_zsp \s
 
@@ -71,7 +100,7 @@
             mov _addr, edi
             read_prep \size, \op\size\()_\rep\()2
             ldr\s w8, [_xaddr]
-            setf_a src=w8, dst=_tmp
+            setf_a src=w8, dst=_tmp, s=\s
             do_add sub, _tmp, w8, \s
             setf_zsp \s
         .endif N .endif N .endif N .endif N .endif

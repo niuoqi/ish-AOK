@@ -16,6 +16,7 @@
 #include "fs/inode.h"
 #include "fs/poll.h"
 #include "fs/real.h"
+#include "fs/tty.h"
 #define ISH_INTERNAL
 #include "fs/fake.h"
 
@@ -68,6 +69,77 @@ static void fakefs_initctl_statbuf(struct statbuf *stat, ino_t inode) {
 
 static bool fakefs_is_initctl_fd(struct fd *fd) {
     return fd->ops == &initctl_fdops;
+}
+
+static bool fakefs_dpkg_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_DPKG_FAKEFS") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    if (current == NULL)
+        return false;
+    return strcmp(current->comm, "dpkg") == 0 ||
+           strcmp(current->comm, "apt") == 0 ||
+           strcmp(current->comm, "apt-get") == 0;
+}
+
+static void fakefs_apply_stat_override(struct statbuf *stat, ino_t inode, const struct ish_stat *ishstat) {
+    stat->inode = inode;
+    stat->mode = ishstat->mode;
+    stat->uid = ishstat->uid;
+    stat->gid = ishstat->gid;
+    stat->rdev = ishstat->rdev;
+    if (S_ISCHR(stat->mode))
+        tty_stat_rdev(stat->rdev, stat);
+}
+
+static void fakefs_snapshot_fd_stat(struct fd *fd) {
+    if (fd == NULL || fd->mount == NULL || fd->fake_inode == 0)
+        return;
+    struct statbuf real_stat;
+    if (realfs.fstat(fd, &real_stat) < 0)
+        return;
+
+    struct fakefs_db *fs = &fd->mount->fakefs;
+    sqlite3_mutex_enter(fs->lock);
+    struct ish_stat ishstat;
+    bool found = inode_read_stat(fs, fd->fake_inode, &ishstat);
+    sqlite3_mutex_leave(fs->lock);
+    if (!found)
+        return;
+
+    fakefs_apply_stat_override(&real_stat, fd->fake_inode, &ishstat);
+    fd->stat = real_stat;
+}
+
+static void fakefs_trace_symlink_result(struct mount *mount, struct fakefs_db *fs, const char *target, const char *link, int result, int open_errno) {
+    if (!fakefs_dpkg_trace_enabled())
+        return;
+
+    const char *fixed = fix_path(link);
+    struct stat st;
+    int host_err = fstatat(mount->root_fd, fixed, &st, AT_SYMLINK_NOFOLLOW);
+    if (host_err < 0) {
+        printk("ish-dpkg-fakefs:symlink pid=%d comm=%s link=%s fix=%s target=%s result=%d errno=%d host=-1 host_errno=%d\n",
+                current->pid, current->comm, link, fixed, target, result, open_errno, errno);
+    } else {
+        printk("ish-dpkg-fakefs:symlink pid=%d comm=%s link=%s fix=%s target=%s result=%d errno=%d host_mode=%#o host_size=%lld host_ino=%llu\n",
+                current->pid, current->comm, link, fixed, target, result, open_errno,
+                st.st_mode, (long long) st.st_size, (unsigned long long) st.st_ino);
+    }
+
+    struct ish_stat ishstat;
+    inode_t inode;
+    bool found = path_read_stat(fs, link, &ishstat, &inode);
+    if (!found) {
+        printk("ish-dpkg-fakefs:symlink-db pid=%d comm=%s link=%s found=0\n",
+                current->pid, current->comm, link);
+        return;
+    }
+    printk("ish-dpkg-fakefs:symlink-db pid=%d comm=%s link=%s found=1 inode=%llu mode=%#o uid=%u gid=%u rdev=%u\n",
+            current->pid, current->comm, link, (unsigned long long) inode,
+            ishstat.mode, ishstat.uid, ishstat.gid, ishstat.rdev);
 }
 
 static ssize_t initctl_read(struct fd *UNUSED(fd), void *UNUSED(buf), size_t UNUSED(bufsize)) {
@@ -168,7 +240,10 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
     struct fd *fd = realfs.open(mount, path, flags, 0666);
     if (IS_ERR(fd))
         return fd;
-    db_begin(fs);
+    if (flags & O_CREAT_)
+        db_begin_write(fs);
+    else
+        db_begin_read(fs);
     fd->fake_inode = path_get_inode(fs, path);
     if (flags & O_CREAT_) {
         struct ish_stat ishstat;
@@ -188,6 +263,7 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
         fd_close(fd);
         return ERR_PTR(_ENOENT);
     }
+    fakefs_snapshot_fd_stat(fd);
     fd->ops = &fakefs_fdops;
     return fd;
 }
@@ -195,7 +271,7 @@ static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, 
 // WARNING: giant hack, just for file providerws
 struct fd *fakefs_open_inode(struct mount *mount, ino_t inode) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_read(fs);
     sqlite3_stmt *stmt = fs->stmt.path_from_inode;
     sqlite3_bind_int64(stmt, 1, inode);
 step:
@@ -213,14 +289,21 @@ step:
     db_reset(fs, stmt);
     db_commit(fs);
     fd->fake_inode = inode;
+    fakefs_snapshot_fd_stat(fd);
     fd->ops = &fakefs_fdops;
     return fd;
 }
 
 static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     int err = realfs.link(mount, src, dst);
+    if (err == _EEXIST && path_get_inode(fs, dst) == 0) {
+        // Recover from a stale host-side temp path that is missing from fakefs.
+        int cleanup_err = realfs.unlink(mount, dst);
+        if (cleanup_err == 0 || cleanup_err == _ENOENT)
+            err = realfs.link(mount, src, dst);
+    }
     if (err < 0) {
         db_rollback(fs);
         return err;
@@ -232,7 +315,7 @@ static int fakefs_link(struct mount *mount, const char *src, const char *dst) {
 
 static int fakefs_unlink(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     int err = realfs.unlink(mount, path);
     if (err < 0) {
         db_rollback(fs);
@@ -246,7 +329,7 @@ static int fakefs_unlink(struct mount *mount, const char *path) {
 
 static int fakefs_rmdir(struct mount *mount, const char *path) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     int err = realfs.rmdir(mount, path);
     if (err < 0) {
         db_rollback(fs);
@@ -260,7 +343,7 @@ static int fakefs_rmdir(struct mount *mount, const char *path) {
 
 static int fakefs_rename(struct mount *mount, const char *src, const char *dst) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     path_rename(fs, src, dst);
     int err = realfs.rename(mount, src, dst);
     if (err < 0) {
@@ -273,10 +356,14 @@ static int fakefs_rename(struct mount *mount, const char *src, const char *dst) 
 
 static int fakefs_symlink(struct mount *mount, const char *target, const char *link) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
-    // create a file containing the target
+    db_begin_write(fs);
+    // fakefs historically stores symlinks as regular files containing the
+    // link target, with metadata overridden to present them as S_IFLNK.
+    // Restore that behavior to match the working branch semantics used by the
+    // bundled roots and package-manager flows.
     int fd = openat(mount->root_fd, fix_path(link), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd < 0) {
+        fakefs_trace_symlink_result(mount, fs, target, link, -1, errno);
         db_rollback(fs);
         return errno_map();
     }
@@ -297,6 +384,7 @@ static int fakefs_symlink(struct mount *mount, const char *target, const char *l
     ishstat.gid = current->egid;
     ishstat.rdev = 0;
     path_create(fs, link, &ishstat);
+    fakefs_trace_symlink_result(mount, fs, target, link, 0, 0);
     db_commit(fs);
     return 0;
 }
@@ -308,7 +396,7 @@ static int fakefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
         real_mode |= S_IFREG;
     else
         real_mode |= mode & S_IFMT;
-    db_begin(fs);
+    db_begin_write(fs);
     int err = realfs.mknod(mount, path, real_mode, 0);
     if (err < 0) {
         db_rollback(fs);
@@ -350,6 +438,8 @@ static int fakefs_stat(struct mount *mount, const char *path, struct statbuf *fa
     fake_stat->uid = ishstat.uid;
     fake_stat->gid = ishstat.gid;
     fake_stat->rdev = ishstat.rdev;
+    if (S_ISCHR(fake_stat->mode))
+        tty_stat_rdev(fake_stat->rdev, fake_stat);
     return 0;
 }
 
@@ -367,15 +457,13 @@ static int fakefs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     bool found = inode_read_stat(fs, fd->fake_inode, &ishstat);
     sqlite3_mutex_leave(fs->lock);
     if (!found) {
-        // File was deleted while fd was still open - return ENOENT
-        printk("WARNING: inode_read_stat(%llu): missing inode for open fd\n", (unsigned long long) fd->fake_inode);
-        return _ENOENT;
+        // Linux still allows fstat() on an unlinked-but-open file.
+        // Preserve the most recent fake metadata snapshot on the fd.
+        *fake_stat = fd->stat;
+        return 0;
     }
-    fake_stat->inode = fd->fake_inode;
-    fake_stat->mode = ishstat.mode;
-    fake_stat->uid = ishstat.uid;
-    fake_stat->gid = ishstat.gid;
-    fake_stat->rdev = ishstat.rdev;
+    fakefs_apply_stat_override(fake_stat, fd->fake_inode, &ishstat);
+    fd->stat = *fake_stat;
     return 0;
 }
 
@@ -388,7 +476,8 @@ static void fake_stat_setattr(struct ish_stat *ishstat, struct attr attr) {
             ishstat->gid = attr.gid;
             break;
         case attr_mode:
-            ishstat->mode = (ishstat->mode & S_IFMT) | (attr.mode & ~S_IFMT);
+            ishstat->mode = (attr.mode & S_IFMT ? attr.mode & S_IFMT : ishstat->mode & S_IFMT) |
+                (attr.mode & ~S_IFMT);
             break;
     }
 }
@@ -397,7 +486,7 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
     struct fakefs_db *fs = &mount->fakefs;
     if (attr.type == attr_size)
         return realfs.setattr(mount, path, attr);
-    db_begin(fs);
+    db_begin_write(fs);
     struct ish_stat ishstat;
     ino_t inode;
     if (!path_read_stat(fs, path, &ishstat, &inode)) {
@@ -414,13 +503,24 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     struct fakefs_db *fs = &fd->mount->fakefs;
     if (attr.type == attr_size)
         return realfs.fsetattr(fd, attr);
-    db_begin(fs);
+    db_begin_write(fs);
     struct ish_stat ishstat;
     if (!inode_read_stat(fs, fd->fake_inode, &ishstat)) {
-        // File was deleted while fd was still open - return ENOENT
         db_rollback(fs);
-        printk("WARNING: inode_read_stat(%llu): missing inode for open fd in fsetattr\n", (unsigned long long) fd->fake_inode);
-        return _ENOENT;
+        switch (attr.type) {
+            case attr_uid:
+                fd->stat.uid = attr.uid;
+                return 0;
+            case attr_gid:
+                fd->stat.gid = attr.gid;
+                return 0;
+            case attr_mode:
+                fd->stat.mode = (attr.mode & S_IFMT ? attr.mode & S_IFMT : fd->stat.mode & S_IFMT) |
+                    (attr.mode & ~S_IFMT);
+                return 0;
+            default:
+                return _ENOENT;
+        }
     }
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, fd->fake_inode, &ishstat);
@@ -430,7 +530,7 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
 
 static int fakefs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     int err = realfs.mkdir(mount, path, 0777);
     if (err < 0) {
         db_rollback(fs);
@@ -460,7 +560,7 @@ static ssize_t file_readlink(struct mount *mount, const char *path, char *buf, s
 
 static ssize_t fakefs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_read(fs);
     struct ish_stat ishstat;
     if (!path_read_stat(fs, path, &ishstat, NULL)) {
         db_rollback(fs);
@@ -504,13 +604,17 @@ retry:
     }
 
     struct fakefs_db *fs = &fd->mount->fakefs;
-    db_begin(fs);
-    entry->inode = path_get_inode(fs, entry_path);
+    db_begin_read(fs);
+    struct ish_stat ishstat;
+    ino_t inode;
+    bool found = path_read_stat(fs, entry_path, &ishstat, &inode);
     db_commit(fs);
     // it's quite possible that due to some mishap there's no metadata for this file
     // so just skip this entry, instead of crashing the program, so there's hope for recovery
-    if (entry->inode == 0)
+    if (!found || inode == 0)
         goto retry;
+    entry->inode = inode;
+    entry->type = dir_entry_type_for_mode(ishstat.mode);
     return res;
 }
 
@@ -560,7 +664,7 @@ static int fakefs_umount(struct mount *mount) {
 
 static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     struct fakefs_db *fs = &mount->fakefs;
-    db_begin(fs);
+    db_begin_write(fs);
     sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
     db_exec_reset(fs, fs->stmt.try_cleanup_inode);
     db_commit(fs);

@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -10,6 +11,8 @@
 #include <sys/file.h>
 #include <sys/statvfs.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "debug.h"
 #include "kernel/errno.h"
@@ -18,6 +21,271 @@
 #include "fs/dev.h"
 #include "fs/real.h"
 #include "fs/tty.h"
+#include "util/sync.h"
+
+static bool realfs_guest_signal_pending(void) {
+    lock(&current->sighand->lock, 0);
+    bool signal_pending = !!(current->pending & ~current->blocked);
+    unlock(&current->sighand->lock);
+    return signal_pending;
+}
+
+static bool realfs_trace_comm(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_REALFS_IO") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    return current != NULL &&
+        (strcmp(current->comm, "apt") == 0 ||
+         strcmp(current->comm, "apt-get") == 0 ||
+         strncmp(current->comm, "http", 4) == 0);
+}
+
+static bool realfs_dpkg_trace_task(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_DPKG_REALFS") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    return current != NULL &&
+        (strncmp(current->comm, "dpkg", 4) == 0 ||
+         strcmp(current->comm, "tar") == 0);
+}
+
+static bool realfs_dpkg_trace_path(const char *path) {
+    if (current == NULL || path == NULL)
+        return false;
+    if (!realfs_dpkg_trace_task())
+        return false;
+    return strstr(path, ".dpkg-") != NULL ||
+        strncmp(path, "/var/lib/dpkg/tmp.ci", strlen("/var/lib/dpkg/tmp.ci")) == 0;
+}
+
+static void realfs_trace_path_event(const char *op, const char *path, int result, int extra) {
+    if (!realfs_dpkg_trace_path(path))
+        return;
+    fprintf(stderr,
+            "ish-dpkg-realfs:%s pid=%d comm=%s path=%s fix=%s result=%d errno=%d extra=%#x\n",
+            op, current->pid, current->comm, path, fix_path(path), result, errno, extra);
+}
+
+static void realfs_trace_path_stat(const char *op, struct mount *mount, const char *path) {
+    if (!realfs_dpkg_trace_path(path))
+        return;
+
+    struct stat st;
+    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    if (err < 0) {
+        fprintf(stderr,
+                "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
+                op, current->pid, current->comm, path, fix_path(path), err, errno);
+        return;
+    }
+
+    fprintf(stderr,
+            "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s mode=%#o size=%lld ino=%llu nlink=%llu\n",
+            op, current->pid, current->comm, path, fix_path(path),
+            st.st_mode, (long long) st.st_size,
+            (unsigned long long) st.st_ino,
+            (unsigned long long) st.st_nlink);
+}
+
+static void realfs_trace_task_path_event(const char *op, const char *path, int result, int extra) {
+    if (!realfs_dpkg_trace_task() || path == NULL)
+        return;
+    fprintf(stderr,
+            "ish-dpkg-realfs:%s pid=%d comm=%s path=%s fix=%s result=%d errno=%d extra=%#x\n",
+            op, current->pid, current->comm, path, fix_path(path), result, errno, extra);
+}
+
+static void realfs_trace_task_path_stat(const char *op, struct mount *mount, const char *path) {
+    if (!realfs_dpkg_trace_task() || path == NULL)
+        return;
+
+    struct stat st;
+    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    if (err < 0) {
+        fprintf(stderr,
+                "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
+                op, current->pid, current->comm, path, fix_path(path), err, errno);
+        return;
+    }
+
+    fprintf(stderr,
+            "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s mode=%#o size=%lld ino=%llu nlink=%llu\n",
+            op, current->pid, current->comm, path, fix_path(path),
+            st.st_mode, (long long) st.st_size,
+            (unsigned long long) st.st_ino,
+            (unsigned long long) st.st_nlink);
+}
+
+static void realfs_trace_symlink_event(struct mount *mount, const char *target, const char *link, int result) {
+    if (!realfs_dpkg_trace_task())
+        return;
+    fprintf(stderr,
+            "ish-dpkg-realfs:symlink pid=%d comm=%s target=%s link=%s fix=%s result=%d errno=%d\n",
+            current->pid, current->comm,
+            target != NULL ? target : "<null>",
+            link != NULL ? link : "<null>",
+            link != NULL ? fix_path(link) : "<null>",
+            result, errno);
+    realfs_trace_task_path_stat("symlink-link", mount, link);
+}
+
+static void realfs_trace_io(const char *op, struct fd *fd, size_t size, ssize_t res, const void *buf) {
+    if (!realfs_trace_comm() || fd == NULL || !is_adhoc_fd(fd))
+        return;
+    char preview[81];
+    size_t preview_len = 0;
+    if (res > 0 && buf != NULL) {
+        size_t limit = (size_t) res < 24 ? (size_t) res : 24;
+        const unsigned char *bytes = buf;
+        for (size_t i = 0; i < limit && preview_len + 4 < sizeof(preview); i++) {
+            unsigned char ch = bytes[i];
+            if (ch >= 32 && ch < 127 && ch != '\\') {
+                preview[preview_len++] = (char) ch;
+            } else {
+                int wrote = snprintf(preview + preview_len, sizeof(preview) - preview_len, "\\x%02x", ch);
+                if (wrote < 0)
+                    break;
+                preview_len += (size_t) wrote;
+            }
+        }
+    }
+    preview[preview_len] = '\0';
+    bool has_config = false;
+    bool has_uri_request = false;
+    bool has_uri_key = false;
+    bool ends_blank = false;
+    int blank_lines = 0;
+    ptrdiff_t uri_offset = -1;
+    char tail[17];
+    char around_uri[97];
+    tail[0] = '\0';
+    around_uri[0] = '\0';
+    if (res > 0 && buf != NULL) {
+        const char *text = buf;
+        size_t text_len = (size_t) res;
+        has_config = memmem(text, text_len, "601 Configuration", strlen("601 Configuration")) != NULL;
+        const char *uri_ptr = memmem(text, text_len, "600 URI Acquire", strlen("600 URI Acquire"));
+        has_uri_request = uri_ptr != NULL;
+        if (uri_ptr != NULL)
+            uri_offset = uri_ptr - text;
+        has_uri_key = memmem(text, text_len, "URI:", strlen("URI:")) != NULL;
+        ends_blank = text_len >= 2 && text[text_len - 1] == '\n' && text[text_len - 2] == '\n';
+        for (size_t i = 1; i < text_len; i++) {
+            if (text[i - 1] == '\n' && text[i] == '\n')
+                blank_lines++;
+        }
+        size_t tail_len = text_len < 16 ? text_len : 16;
+        size_t start = text_len - tail_len;
+        for (size_t i = 0; i < tail_len; i++) {
+            unsigned char ch = (unsigned char) text[start + i];
+            tail[i] = (ch >= 32 && ch < 127) ? (char) ch : '.';
+        }
+        tail[tail_len] = '\0';
+        if (uri_ptr != NULL) {
+            size_t begin = uri_offset > 16 ? (size_t) uri_offset - 16 : 0;
+            size_t end = (size_t) uri_offset + 64;
+            if (end > text_len)
+                end = text_len;
+            size_t pos = 0;
+            for (size_t i = begin; i < end && pos + 1 < sizeof(around_uri); i++) {
+                unsigned char ch = (unsigned char) text[i];
+                around_uri[pos++] = (ch >= 32 && ch < 127) ? (char) ch : '.';
+            }
+            around_uri[pos] = '\0';
+        }
+    }
+    fprintf(stderr, "ish-realfs-%s: pid=%d comm=%s real=%d mode=%#x req=%zu res=%zd config=%d uri_req=%d uri_key=%d uri_off=%td blanks=%d ends_blank=%d tail=%s uri_ctx=%s preview=%s\n",
+            op, current != NULL ? current->pid : -1,
+            current != NULL ? current->comm : "?",
+            fd->real_fd, fd->stat.mode, size, res,
+            has_config, has_uri_request, has_uri_key, uri_offset, blank_lines, ends_blank, tail,
+            around_uri,
+            preview_len != 0 ? preview : "\"\"");
+}
+
+static void realfs_trace_io_enter(const char *op, struct fd *fd, size_t size) {
+    if (!realfs_trace_comm() || fd == NULL || !is_adhoc_fd(fd))
+        return;
+    fprintf(stderr, "ish-realfs-%s-enter: pid=%d comm=%s real=%d mode=%#x req=%zu\n",
+            op, current != NULL ? current->pid : -1,
+            current != NULL ? current->comm : "?",
+            fd->real_fd, fd->stat.mode, size);
+}
+
+static ssize_t realfs_write_host(int real_fd, const void *buf, size_t size) {
+    return write(real_fd, buf, size);
+}
+
+static void realfs_maybe_dump_apt_http_request(struct fd *fd, const void *buf, size_t size) {
+    static int enabled = -1;
+    static bool dumped = false;
+    if (enabled < 0)
+        enabled = getenv("ISH_DUMP_APT_HTTP_REQUEST") != NULL ? 1 : 0;
+    if (!enabled)
+        return;
+    if (dumped || current == NULL || fd == NULL || buf == NULL)
+        return;
+    if (strcmp(current->comm, "apt-get") != 0)
+        return;
+    if (!is_adhoc_fd(fd) || !S_ISFIFO(fd->stat.mode))
+        return;
+    const char *text = buf;
+    if (memmem(text, size, "600 URI Acquire", strlen("600 URI Acquire")) == NULL)
+        return;
+    FILE *f = fopen("/tmp/ish-apt-http-request.bin", "wb");
+    if (f == NULL)
+        return;
+    if (fwrite(buf, 1, size, f) == size)
+        dumped = true;
+    fclose(f);
+}
+
+static int realfs_wait_readable(int real_fd) {
+    const int poll_timeout_ms = 100;
+    for (;;) {
+        struct pollfd pfd = {
+            .fd = real_fd,
+            .events = POLLIN | POLLERR | POLLHUP,
+        };
+        sigset_t sigusr1, oldmask;
+        sigemptyset(&sigusr1);
+        sigaddset(&sigusr1, SIGUSR1);
+        pthread_sigmask(SIG_BLOCK, &sigusr1, &oldmask);
+
+        if (sigunwind_start()) {
+            pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+            errno = EINTR;
+            return errno_map();
+        }
+
+        if (realfs_guest_signal_pending()) {
+            sigunwind_end();
+            pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+            errno = EINTR;
+            return errno_map();
+        }
+
+        pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+        int res = poll(&pfd, 1, poll_timeout_ms);
+        sigunwind_end();
+        if (res > 0)
+            return res;
+        if (res == 0) {
+            if (realfs_guest_signal_pending()) {
+                errno = EINTR;
+                return errno_map();
+            }
+            continue;
+        }
+        if (errno == EINTR && !realfs_guest_signal_pending())
+            continue;
+        return errno_map();
+    }
+}
 
 static int getpath(int fd, char *buf) {
 #if defined(__linux__)
@@ -72,8 +340,12 @@ static int open_flags_fake_from_real(int flags) {
 struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mode) {
     int real_flags = open_flags_real_from_fake(flags);
     int fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
-    if (fd_no < 0)
+    if (fd_no < 0) {
+        realfs_trace_path_event("open", path, -1, flags);
         return ERR_PTR(errno_map());
+    }
+    realfs_trace_path_event("open", path, fd_no, flags);
+    realfs_trace_path_stat("open", mount, path);
     struct fd *fd = fd_create(&realfs_fdops);
     fd->real_fd = fd_no;
     fd->dir = NULL;
@@ -131,16 +403,64 @@ int realfs_fstat(struct fd *fd, struct statbuf *fake_stat) {
 }
 
 ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
-    ssize_t res = read(fd->real_fd, buf, bufsize);
-    if (res < 0)
-        return errno_map();
-    return res;
+    if (bufsize == 0)
+        return 0;
+    size_t read_size = bufsize;
+
+    if (fd->flags & O_NONBLOCK_) {
+        realfs_trace_io_enter("read", fd, read_size);
+        ssize_t res = read(fd->real_fd, buf, read_size);
+        if (res < 0)
+            return errno_map();
+        if (res > 0 && is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
+            fd->realfs_fifo_had_data = true;
+        realfs_trace_io("read", fd, read_size, res, buf);
+        return res;
+    }
+
+    int saved_flags = fcntl(fd->real_fd, F_GETFL, 0);
+    bool forced_nonblock = false;
+    if (saved_flags >= 0 && !(saved_flags & O_NONBLOCK) &&
+            fcntl(fd->real_fd, F_SETFL, saved_flags | O_NONBLOCK) == 0) {
+        forced_nonblock = true;
+    }
+
+    for (;;) {
+        realfs_trace_io_enter("read", fd, read_size);
+        int wait_res = realfs_wait_readable(fd->real_fd);
+        if (wait_res < 0) {
+            if (forced_nonblock)
+                (void) fcntl(fd->real_fd, F_SETFL, saved_flags);
+            return wait_res;
+        }
+
+        ssize_t res = read(fd->real_fd, buf, read_size);
+        if (res >= 0) {
+            if (forced_nonblock)
+                (void) fcntl(fd->real_fd, F_SETFL, saved_flags);
+            if (res > 0 && is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
+                fd->realfs_fifo_had_data = true;
+            realfs_trace_io("read", fd, read_size, res, buf);
+            return res;
+        }
+        if ((errno == EAGAIN || errno == EWOULDBLOCK) ||
+                (errno == EINTR && !realfs_guest_signal_pending())) {
+            continue;
+        }
+        int err = errno_map();
+        if (forced_nonblock)
+            (void) fcntl(fd->real_fd, F_SETFL, saved_flags);
+        return err;
+    }
 }
 
 ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
-    ssize_t res = write(fd->real_fd, buf, bufsize);
+    ssize_t res = realfs_write_host(fd->real_fd, buf, bufsize);
     if (res < 0)
         return errno_map();
+    if (res > 0)
+        realfs_maybe_dump_apt_http_request(fd, buf, (size_t) res);
+    realfs_trace_io("write", fd, bufsize, res, buf);
     return res;
 }
 
@@ -178,6 +498,7 @@ int realfs_readdir(struct fd *fd, struct dir_entry *entry) {
             return 0;
     }
     entry->inode = dirent->d_ino;
+    entry->type = dirent->d_type;
     strcpy(entry->name, dirent->d_name);
     return 1;
 }
@@ -213,7 +534,14 @@ off_t realfs_lseek(struct fd *fd, off_t offset, int whence) {
 }
 
 int realfs_poll(struct fd *fd) {
-    struct pollfd p = {.fd = fd->real_fd, .events = POLLPRI};
+    struct pollfd p = {.fd = fd->real_fd, .events = 0};
+#if defined(__APPLE__)
+    bool is_fifo = is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode);
+    if (!is_fifo)
+        p.events |= POLLPRI;
+#else
+    p.events |= POLLPRI;
+#endif
     // prevent POLLNVAL
     int flags = fcntl(fd->real_fd, F_GETFL, 0);
     if ((flags & O_ACCMODE) != O_WRONLY)
@@ -226,11 +554,15 @@ int realfs_poll(struct fd *fd) {
 #if defined(__APPLE__)
     // this is the "WTF is apple smoking" section
 
+    if (is_fifo && !fd->realfs_fifo_had_data && (p.revents & POLLHUP))
+        p.revents &= ~(POLLIN | POLLHUP | POLLOUT);
+
     // https://github.com/apple/darwin-xnu/blob/a449c6a3b8014d9406c2ddbdc81795da24aa7443/bsd/kern/sys_generic.c#L1856
     if (p.revents & POLLHUP)
         p.revents |= POLLOUT;
-    // apparently you can sometimes get POLLPRI on a pipe??? please ignore how much of a mess this condition is
-    if (is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
+    // Darwin can report spurious POLLPRI on pipes/FIFOs; avoid requesting it
+    // there and scrub any residual bit if the host still returns one.
+    if (is_fifo)
         p.revents &= ~POLLPRI;
 
     if (p.revents & POLLNVAL) {
@@ -257,17 +589,58 @@ int realfs_poll(struct fd *fd) {
 }
 
 int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off_t offset, int prot, int flags) {
+    enum { AMD64_REALFS_MMAP_TRACE_BUDGET = 32 };
+    static unsigned amd64_realfs_mmap_trace_count;
     int mmap_flags = 0;
     if (flags & MMAP_PRIVATE) mmap_flags |= MAP_PRIVATE;
     if (flags & MMAP_SHARED) mmap_flags |= MAP_SHARED;
     int mmap_prot = PROT_READ;
     if (prot & P_WRITE) mmap_prot |= PROT_WRITE;
+    // Host VM protections operate at host-page granularity. On 16K-page iOS
+    // devices, a single host page can cover multiple 4K guest pages with
+    // different guest permissions. In that configuration we cannot safely use
+    // host protections to enforce guest writability for private file-backed
+    // mappings, because a guest-writable page can share a host page with a
+    // guest-readonly mapping and fault on the host despite the guest page
+    // table allowing the write. Fall back to a writable host mapping and let
+    // the guest page tables enforce access.
+    if (real_page_size != PAGE_SIZE && (mmap_flags & MAP_PRIVATE))
+        mmap_prot |= PROT_WRITE;
 
     off_t real_offset = (offset / real_page_size) * real_page_size;
     off_t correction = offset - real_offset;
     char *memory = mmap(NULL, (pages * PAGE_SIZE) + correction,
             mmap_prot, mmap_flags, fd->real_fd, real_offset);
-    return pt_map(mem, start, pages, memory, correction, prot);
+    if (memory == MAP_FAILED && current != NULL && current->abi == GUEST_ABI_AMD64 &&
+            amd64_realfs_mmap_trace_count < AMD64_REALFS_MMAP_TRACE_BUDGET) {
+        amd64_realfs_mmap_trace_count++;
+        char path[MAX_PATH];
+        int path_err = generic_getpath(fd, path);
+        printk("amd64 realfs mmap fail: pid=%d comm=%s real_fd=%d path=%s pages=%#x guest_off=%#llx real_off=%#llx corr=%#llx prot=%#x flags=%#x errno=%d\n",
+               current->pid, current->comm, fd->real_fd,
+               path_err == 0 ? path : "<path err>",
+               (unsigned) pages,
+               (unsigned long long) offset,
+               (unsigned long long) real_offset,
+               (unsigned long long) correction,
+               prot, flags, errno);
+    }
+    int err = pt_map(mem, start, pages, memory, correction, prot);
+    if (err < 0 && current != NULL && current->abi == GUEST_ABI_AMD64 &&
+            amd64_realfs_mmap_trace_count < AMD64_REALFS_MMAP_TRACE_BUDGET) {
+        amd64_realfs_mmap_trace_count++;
+        char path[MAX_PATH];
+        int path_err = generic_getpath(fd, path);
+        printk("amd64 realfs mmap maperr: pid=%d comm=%s real_fd=%d path=%s pages=%#x guest_off=%#llx real_off=%#llx corr=%#llx prot=%#x flags=%#x err=%d\n",
+               current->pid, current->comm, fd->real_fd,
+               path_err == 0 ? path : "<path err>",
+               (unsigned) pages,
+               (unsigned long long) offset,
+               (unsigned long long) real_offset,
+               (unsigned long long) correction,
+               prot, flags, err);
+    }
+    return err;
 }
 
 ssize_t realfs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
@@ -290,15 +663,29 @@ int realfs_getpath(struct fd *fd, char *buf) {
 
 int realfs_link(struct mount *mount, const char *src, const char *dst) {
     int res = linkat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst), 0);
-    if (res < 0)
+    if (res < 0) {
+        realfs_trace_task_path_event("link-src", src, res, 0);
+        realfs_trace_task_path_event("link-dst", dst, res, 0);
+        realfs_trace_task_path_stat("link-src", mount, src);
+        realfs_trace_task_path_stat("link-dst", mount, dst);
         return errno_map();
+    }
+    realfs_trace_task_path_event("link-src", src, res, 0);
+    realfs_trace_task_path_event("link-dst", dst, res, 0);
+    realfs_trace_task_path_stat("link-src", mount, src);
+    realfs_trace_task_path_stat("link-dst", mount, dst);
     return res;
 }
 
 int realfs_unlink(struct mount *mount, const char *path) {
     int res = unlinkat(mount->root_fd, fix_path(path), 0);
-    if (res < 0)
+    if (res < 0) {
+        realfs_trace_path_event("unlink", path, res, 0);
+        realfs_trace_path_stat("unlink", mount, path);
         return errno_map();
+    }
+    realfs_trace_path_event("unlink", path, res, 0);
+    realfs_trace_path_stat("unlink", mount, path);
     return res;
 }
 
@@ -311,15 +698,25 @@ int realfs_rmdir(struct mount *mount, const char *path) {
 
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
     int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
-    if (err < 0)
+    if (err < 0) {
+        realfs_trace_path_event("rename-src", src, err, 0);
+        realfs_trace_path_event("rename-dst", dst, err, 0);
         return errno_map();
+    }
+    realfs_trace_path_event("rename-src", src, err, 0);
+    realfs_trace_path_event("rename-dst", dst, err, 0);
+    realfs_trace_path_stat("rename-src", mount, src);
+    realfs_trace_path_stat("rename-dst", mount, dst);
     return err;
 }
 
 int realfs_symlink(struct mount *mount, const char *target, const char *link) {
-    int err = symlinkat(target, mount->root_fd, link);
-    if (err < 0)
+    int err = symlinkat(target, mount->root_fd, fix_path(link));
+    if (err < 0) {
+        realfs_trace_symlink_event(mount, target, link, err);
         return errno_map();
+    }
+    realfs_trace_symlink_event(mount, target, link, err);
     return err;
 }
 
@@ -399,11 +796,18 @@ int realfs_fsetattr(struct fd *fd, struct attr attr) {
     return err;
 }
 
-int realfs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime) {
+int realfs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime, bool follow_links) {
     struct timespec times[2] = {atime, mtime};
-    int err = utimensat(mount->root_fd, fix_path(path), times, 0);
-    if (err < 0)
+    int flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+    realfs_trace_path_stat("utime-before", mount, path);
+    int err = utimensat(mount->root_fd, fix_path(path), times, flags);
+    if (err < 0) {
+        realfs_trace_path_event("utime", path, err, 0);
+        realfs_trace_path_stat("utime-after", mount, path);
         return errno_map();
+    }
+    realfs_trace_path_event("utime", path, err, 0);
+    realfs_trace_path_stat("utime-after", mount, path);
     return 0;
 }
 
@@ -468,6 +872,7 @@ int realfs_setflags(struct fd *fd, dword_t flags) {
     int ret = fcntl(fd->real_fd, F_SETFL, open_flags_real_from_fake(flags));
     if (ret < 0)
         return errno_map();
+    fd->flags = (fd->flags & ~(O_APPEND_ | O_NONBLOCK_)) | (flags & (O_APPEND_ | O_NONBLOCK_));
     return 0;
 }
 

@@ -16,6 +16,7 @@
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "util/sync.h"
+#include <dlfcn.h>
 
 // The Evil global lock.  Use sparingly or not at all
 extern pthread_mutex_t multicore_lock;
@@ -27,19 +28,244 @@ extern pthread_mutex_t extra_lock;
 extern dword_t extra_lock_pid;
 extern const char extra_lock_comm;
 
+static bool amd64_jit_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1)
+        enabled = getenv("ISH_TRACE_AMD64_JIT") != NULL ? 1 : 0;
+    return enabled == 1;
+}
+
 // increment the change count
 static void mem_changed(struct mem *mem);
 static struct mmu_ops mem_mmu_ops;
+static _Atomic uint64_t next_mem_change_id = 1;
+#define PGDIR_ROOT_INDEX(page) ((page) >> (MEM_PTDIR_BITS + MEM_PGDIR_MID_BITS))
+#define PGDIR_MID_INDEX(page) (((page) >> MEM_PTDIR_BITS) & (MEM_PGDIR_MID_SIZE - 1))
+#define PGDIR_LEAF_INDEX(page) ((page) & (MEM_PTDIR_SIZE - 1))
+#define PGDIR_LEAF_BASE(root, mid) ((((page_t) (root) << MEM_PGDIR_MID_BITS) | (page_t) (mid)) << MEM_PTDIR_BITS)
+
+struct pt_directory_chunk {
+    _Atomic(struct pt_entry *) leaves[MEM_PGDIR_MID_SIZE];
+};
+
+static struct pt_directory_chunk *mem_pgdir_chunk_get(struct mem *mem, page_t page) {
+    if (page >= mem->page_limit)
+        return NULL;
+    return atomic_load_explicit(&mem->pgdir_root[PGDIR_ROOT_INDEX(page)], memory_order_acquire);
+}
+
+static struct pt_directory_chunk *mem_pgdir_chunk_new(struct mem *mem, page_t page) {
+    struct pt_directory_chunk *chunk = mem_pgdir_chunk_get(mem, page);
+    if (chunk != NULL)
+        return chunk;
+
+    chunk = calloc(1, sizeof(*chunk));
+    if (chunk == NULL)
+        return NULL;
+    atomic_store_explicit(&mem->pgdir_root[PGDIR_ROOT_INDEX(page)], chunk, memory_order_release);
+    return chunk;
+}
+
+static struct pt_entry *mem_pt_leaf_get(struct mem *mem, page_t page) {
+    struct pt_directory_chunk *chunk = mem_pgdir_chunk_get(mem, page);
+    if (chunk == NULL)
+        return NULL;
+    return atomic_load_explicit(&chunk->leaves[PGDIR_MID_INDEX(page)], memory_order_acquire);
+}
+
+static struct pt_entry *mem_pt_leaf_new(struct mem *mem, page_t page) {
+    struct pt_directory_chunk *chunk = mem_pgdir_chunk_new(mem, page);
+    if (chunk == NULL)
+        return NULL;
+
+    _Atomic(struct pt_entry *) *slot = &chunk->leaves[PGDIR_MID_INDEX(page)];
+    struct pt_entry *entries = atomic_load_explicit(slot, memory_order_acquire);
+    if (entries != NULL)
+        return entries;
+
+    entries = calloc(MEM_PTDIR_SIZE, sizeof(*entries));
+    if (entries == NULL)
+        return NULL;
+    atomic_store_explicit(slot, entries, memory_order_release);
+    return entries;
+}
+
+static struct pt_entry *mem_pt_raw(struct mem *mem, page_t page) {
+    if (page >= mem->page_limit)
+        return NULL;
+    struct pt_entry *entries = mem_pt_leaf_get(mem, page);
+    if (entries == NULL)
+        return NULL;
+    return &entries[PGDIR_LEAF_INDEX(page)];
+}
+
+static bool mem_page_range_valid(struct mem *mem, page_t start, pages_t pages) {
+    if (pages == 0)
+        return true;
+    if (start >= mem->page_limit)
+        return false;
+    return pages <= mem->page_limit - start;
+}
+
+static bool mem_can_mirror_host_page_protections(void) {
+    // mprotect() works at host-page granularity. Guest page flags can only be
+    // mirrored into host page protections when one guest page maps exactly one
+    // host page. On iOS, host pages are commonly 16K while guest pages are 4K,
+    // so the emulator must rely on guest page-table checks instead.
+    return real_page_size == PAGE_SIZE;
+}
+
+static bool mem_host_page_mirroring_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char *forced = getenv("ISH_ENABLE_HOST_PAGE_MIRROR");
+        const char *disabled = getenv("ISH_DISABLE_HOST_PAGE_MIRROR");
+        if (forced != NULL && forced[0] != '\0' && forced[0] != '0') {
+            enabled = 1;
+        } else if (disabled != NULL && disabled[0] != '\0' && disabled[0] != '0') {
+            enabled = 0;
+        } else {
+#if __APPLE__
+            enabled = 0;
+#else
+            enabled = 1;
+#endif
+        }
+    }
+    return enabled == 1;
+}
+
+static bool mem_uses_host_page_mirroring(void) {
+    return mem_can_mirror_host_page_protections() && mem_host_page_mirroring_enabled();
+}
+
+static void *mem_host_page_addr(struct pt_entry *entry) {
+    if (entry == NULL || entry->data == NULL || entry->data->data == NULL)
+        return NULL;
+    void *data = (char *) entry->data->data + entry->offset;
+    return (void *) ((uintptr_t) data & ~(real_page_size - 1));
+}
+
+static size_t mem_host_page_index(struct pt_entry *entry) {
+    if (entry == NULL || entry->data == NULL || entry->data->data == NULL)
+        return 0;
+    uintptr_t base = (uintptr_t) entry->data->data;
+    uintptr_t addr = (uintptr_t) entry->data->data + entry->offset;
+    return (addr - base) / real_page_size;
+}
+
+static int mem_mirror_host_page_protection(struct pt_entry *entry, int flags) {
+    if (!mem_uses_host_page_mirroring())
+        return 0;
+    void *data = mem_host_page_addr(entry);
+    if (data == NULL)
+        return 0;
+    uint8_t desired = P_READ;
+    if (flags & P_WRITE)
+        desired |= P_WRITE;
+    if (entry->data->host_page_prot != NULL) {
+        size_t idx = mem_host_page_index(entry);
+        if (entry->data->host_page_prot[idx] == desired)
+            return 0;
+    }
+    int prot = PROT_READ;
+    if (flags & P_WRITE)
+        prot |= PROT_WRITE;
+    if (mprotect(data, real_page_size, prot) < 0)
+        return errno_map();
+    if (entry->data->host_page_prot != NULL) {
+        size_t idx = mem_host_page_index(entry);
+        entry->data->host_page_prot[idx] = desired;
+    }
+    return 0;
+}
+
+static int mem_ensure_host_writable(struct pt_entry *entry) {
+    return mem_mirror_host_page_protection(entry, P_READ | P_WRITE);
+}
+
+static page_t mem_next_allocated_leaf_base(struct mem *mem, page_t page) {
+    if (page >= mem->page_limit)
+        return BAD_PAGE;
+
+    page_t root = PGDIR_ROOT_INDEX(page);
+    page_t mid = PGDIR_MID_INDEX(page);
+    for (; root < MEM_PGDIR_ROOT_SIZE; root++) {
+        struct pt_directory_chunk *chunk =
+            atomic_load_explicit(&mem->pgdir_root[root], memory_order_acquire);
+        if (chunk == NULL) {
+            mid = 0;
+            continue;
+        }
+        for (; mid < MEM_PGDIR_MID_SIZE; mid++) {
+            struct pt_entry *entries =
+                atomic_load_explicit(&chunk->leaves[mid], memory_order_acquire);
+            if (entries == NULL)
+                continue;
+            page_t base = PGDIR_LEAF_BASE(root, mid);
+            return base < mem->page_limit ? base : BAD_PAGE;
+        }
+        mid = 0;
+    }
+    return BAD_PAGE;
+}
+
+static page_t mem_next_mapped_page(struct mem *mem, page_t page) {
+    if (page >= mem->page_limit)
+        return BAD_PAGE;
+
+    page_t leaf_base = page - PGDIR_LEAF_INDEX(page);
+    while (leaf_base < mem->page_limit) {
+        struct pt_entry *entries = mem_pt_leaf_get(mem, leaf_base);
+        if (entries == NULL) {
+            leaf_base = mem_next_allocated_leaf_base(mem, page);
+            if (leaf_base == BAD_PAGE)
+                return BAD_PAGE;
+            entries = mem_pt_leaf_get(mem, leaf_base);
+            if (entries == NULL) {
+                page = leaf_base + MEM_PTDIR_SIZE;
+                leaf_base = page;
+                continue;
+            }
+        }
+
+        int start_index = leaf_base == page - PGDIR_LEAF_INDEX(page) ?
+            (int) PGDIR_LEAF_INDEX(page) : 0;
+        for (int i = start_index; i < MEM_PTDIR_SIZE; i++) {
+            if (entries[i].data == NULL)
+                continue;
+            page_t mapped = leaf_base + (page_t) i;
+            return mapped < mem->page_limit ? mapped : BAD_PAGE;
+        }
+
+        page = leaf_base + MEM_PTDIR_SIZE;
+        if (page >= mem->page_limit)
+            break;
+        leaf_base = mem_next_allocated_leaf_base(mem, page);
+        if (leaf_base == BAD_PAGE)
+            break;
+    }
+    return BAD_PAGE;
+}
 
 void mem_init(struct mem *mem) {
-    mem->pgdir = calloc(MEM_PGDIR_SIZE, sizeof(struct pt_entry *));
-    mem->pgdir_used = 0;
+    mem->pgdir_root = calloc(MEM_PGDIR_ROOT_SIZE, sizeof(*mem->pgdir_root));
+    if (mem->pgdir_root == NULL)
+        die("calloc pgdir_root failed");
+    mem->page_limit = MEM_DEFAULT_PAGE_LIMIT;
+    mem->mmap_floor = MEM_DEFAULT_MMAP_FLOOR;
+    mem->mmap_ceiling = MEM_DEFAULT_MMAP_CEILING;
+    atomic_init(&mem->quiesce_requested, 0);
     mem->mmu.ops = &mem_mmu_ops;
+    mem->mmu.requires_write_revalidate = mem_uses_host_page_mirroring();
 #if ENGINE_JIT
     mem->mmu.jit = jit_new(&mem->mmu);
 #endif
-    mem->mmu.changes = 0;
+    // Seed each new address space with a unique change id so a per-thread TLB
+    // flushes even if malloc reuses the same mmu address after exec/exit.
+    mem->mmu.changes = atomic_fetch_add_explicit(&next_mem_change_id, 1, memory_order_relaxed);
     wrlock_init(&mem->lock);
+    strlcpy(mem->lock.lname, "mem", sizeof(mem->lock.lname));
     mem->reference.count = 0;
     mem->reference.ready_to_be_freed = false;
     int rc = pthread_mutex_init(&mem->reference.lock, NULL);
@@ -50,93 +276,138 @@ void mem_init(struct mem *mem) {
 
 void mem_destroy(struct mem *mem) {
     write_lock(&mem->lock);
-    pt_unmap_always(mem, 0, MEM_PAGES);
+    pt_unmap_always(mem, 0, mem->page_limit);
 
 #if ENGINE_JIT
     jit_free(mem->mmu.jit);
 #endif
-    for (int i = 0; i < MEM_PGDIR_SIZE; i++) {
-        if (mem->pgdir[i] != NULL)
-            free(mem->pgdir[i]);
+    for (size_t root = 0; root < MEM_PGDIR_ROOT_SIZE; root++) {
+        struct pt_directory_chunk *chunk =
+            atomic_load_explicit(&mem->pgdir_root[root], memory_order_acquire);
+        if (chunk == NULL)
+            continue;
+        for (size_t mid = 0; mid < MEM_PGDIR_MID_SIZE; mid++) {
+            struct pt_entry *entries =
+                atomic_load_explicit(&chunk->leaves[mid], memory_order_acquire);
+            free(entries);
+        }
+        free(chunk);
     }
+    free(mem->pgdir_root);
+    mem->pgdir_root = NULL;
 
-    free(mem->pgdir);
-    
-    mem->pgdir = NULL; //mkemkemke Trying something here
-    
     write_unlock_and_destroy(&mem->lock);
-    
 }
 
-#define PGDIR_TOP(page) ((page) >> 10)
-#define PGDIR_BOTTOM(page) ((page) & (MEM_PGDIR_SIZE - 1))
+void mem_set_page_limit(struct mem *mem, page_t limit) {
+    if (limit > MEM_MAX_PAGE_LIMIT)
+        limit = MEM_MAX_PAGE_LIMIT;
+    mem->page_limit = limit;
+}
+
+void mem_set_mmap_window(struct mem *mem, page_t floor, page_t ceiling) {
+    mem->mmap_floor = floor;
+    mem->mmap_ceiling = ceiling;
+}
 
 static struct pt_entry *mem_pt_new(struct mem *mem, page_t page) {
-    struct pt_entry *pgdir = mem->pgdir[PGDIR_TOP(page)];
-    if (pgdir == NULL) {
-        pgdir = calloc(MEM_PGDIR_SIZE, sizeof(struct pt_entry));
-        if (pgdir == NULL)
-            return NULL;
-        mem->pgdir[PGDIR_TOP(page)] = pgdir;
-        mem->pgdir_used++;
-    }
-    return &pgdir[PGDIR_BOTTOM(page)];
+    if (page >= mem->page_limit)
+        return NULL;
+    struct pt_entry *entries = mem_pt_leaf_new(mem, page);
+    if (entries == NULL)
+        return NULL;
+    return &entries[PGDIR_LEAF_INDEX(page)];
 }
 
 struct pt_entry *mem_pt(struct mem *mem, page_t page) {
-
-    if (mem->pgdir[PGDIR_TOP(page)] != NULL) { // Check if defined.  Likely still leaves a potential race condition as no locking currently. -MKE FIXME
-        struct pt_entry *pgdir = mem->pgdir[PGDIR_TOP(page)];
-        if (pgdir == NULL) {
-            return NULL;
-        }
-        
-        struct pt_entry *entry = &pgdir[PGDIR_BOTTOM(page)];
-        if (entry->data == NULL) {
-            return NULL;
-        }
-        
-        return entry;
-    } else {
-        mem->pgdir[PGDIR_TOP(page)] = NULL;
+    struct pt_entry *entry = mem_pt_raw(mem, page);
+    if (entry == NULL || entry->data == NULL)
         return NULL;
-    }
-    
+    return entry;
 }
 
 static void mem_pt_del(struct mem *mem, page_t page) {
-    struct pt_entry *entry = mem_pt(mem, page);
-    if (entry != NULL) {
-        entry->data = NULL;
-    }
+    struct pt_entry *entry = mem_pt_raw(mem, page);
+    if (entry == NULL)
+        return;
+    entry->data = NULL;
 }
 
 void mem_next_page(struct mem *mem, page_t *page) {
     (*page)++;
-    if (*page >= MEM_PAGES)
+    if (*page >= mem->page_limit) {
+        *page = mem->page_limit;
         return;
-    while (*page < MEM_PAGES && mem->pgdir[PGDIR_TOP(*page)] == NULL)
-        *page = (*page - PGDIR_BOTTOM(*page)) + MEM_PGDIR_SIZE;
+    }
+    if (mem_pt_leaf_get(mem, *page) != NULL)
+        return;
+    page_t next = mem_next_allocated_leaf_base(mem, *page);
+    if (next == BAD_PAGE) {
+        *page = mem->page_limit;
+        return;
+    }
+    *page = next;
+}
+
+size_t mem_mapped_page_count(struct mem *mem) {
+    if (mem == NULL)
+        return 0;
+
+    size_t count = 0;
+    for (size_t root = 0; root < MEM_PGDIR_ROOT_SIZE; root++) {
+        struct pt_directory_chunk *chunk =
+            atomic_load_explicit(&mem->pgdir_root[root], memory_order_acquire);
+        if (chunk == NULL)
+            continue;
+        for (size_t mid = 0; mid < MEM_PGDIR_MID_SIZE; mid++) {
+            struct pt_entry *entries =
+                atomic_load_explicit(&chunk->leaves[mid], memory_order_acquire);
+            if (entries == NULL)
+                continue;
+            page_t base = PGDIR_LEAF_BASE(root, mid);
+            if (base >= mem->page_limit)
+                return count;
+            size_t limit = MEM_PTDIR_SIZE;
+            if (base + MEM_PTDIR_SIZE > mem->page_limit)
+                limit = (size_t) (mem->page_limit - base);
+            for (size_t i = 0; i < limit; i++) {
+                if (entries[i].data != NULL)
+                    count++;
+            }
+        }
+    }
+    return count;
 }
 
 page_t pt_find_hole(struct mem *mem, pages_t size) {
-    page_t hole_end = 0; // this can never be used before initializing but gcc doesn't realize
-    bool in_hole = false;
-    for (page_t page = 0xf7ffd; page > 0x40000; page--) {
-        // I don't know how this works but it does
-        if (!in_hole && mem_pt(mem, page) == NULL) {
-            in_hole = true;
-            hole_end = page + 1;
+    if (size == 0 || mem->mmap_ceiling <= mem->mmap_floor)
+        return BAD_PAGE;
+    if (size > mem->mmap_ceiling - mem->mmap_floor)
+        return BAD_PAGE;
+
+    page_t best = BAD_PAGE;
+    page_t prev_end = mem->mmap_floor;
+    page_t page = mem_next_mapped_page(mem, mem->mmap_floor);
+    while (page != BAD_PAGE && page < mem->mmap_ceiling) {
+        if (page > prev_end && page - prev_end >= size)
+            best = page - size;
+
+        page_t region_end = page + 1;
+        while (region_end < mem->mmap_ceiling &&
+               mem_next_mapped_page(mem, region_end) == region_end) {
+            region_end++;
         }
-        if (mem_pt(mem, page) != NULL)
-            in_hole = false;
-        else if (hole_end - page == size)
-            return page;
+        prev_end = region_end;
+        page = mem_next_mapped_page(mem, region_end);
     }
-    return BAD_PAGE;
+    if (mem->mmap_ceiling - prev_end >= size)
+        best = mem->mmap_ceiling - size;
+    return best;
 }
 
 bool pt_is_hole(struct mem *mem, page_t start, pages_t pages) {
+    if (!mem_page_range_valid(mem, start, pages))
+        return false;
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) != NULL)
             return false;
@@ -145,11 +416,13 @@ bool pt_is_hole(struct mem *mem, page_t start, pages_t pages) {
 }
 
 int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t offset, unsigned flags) {
+    if (!mem_page_range_valid(mem, start, pages))
+        return _ENOMEM;
     if (memory == MAP_FAILED)
         return errno_map();
 
     // If this fails, the munmap in pt_unmap would probably fail.
-    assert((uintptr_t) memory % real_page_size == 0 || memory == vdso_data);
+    assert(memory == NULL || (uintptr_t) memory % real_page_size == 0 || memory == vdso_data);
 
     struct data *data = malloc(sizeof(struct data));
     if (data == NULL)
@@ -157,12 +430,22 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
     *data = (struct data) {
         .data = memory,
         .size = pages * PAGE_SIZE + offset,
+        .shared_key = 0,
 
 #if LEAK_DEBUG
         .pid = current ? current->pid : 0,
         .dest = start << PAGE_BITS,
 #endif
     };
+    if (mem_uses_host_page_mirroring() && memory != NULL && memory != vdso_data) {
+        size_t host_pages = (data->size + real_page_size - 1) / real_page_size;
+        data->host_page_prot = malloc(host_pages);
+        if (data->host_page_prot == NULL) {
+            free(data);
+            return _ENOMEM;
+        }
+        memset(data->host_page_prot, P_READ | P_WRITE, host_pages);
+    }
 
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) != NULL)
@@ -179,10 +462,13 @@ int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t of
         pt->offset = ((page - start) << PAGE_BITS) + offset;
         pt->flags = flags;
     }
+    mem_changed(mem);
     return 0;
 }
 
 int pt_unmap(struct mem *mem, page_t start, pages_t pages) {
+    if (!mem_page_range_valid(mem, start, pages))
+        return -1;
     for (page_t page = start; page < start + pages; page++)
         if (mem_pt(mem, page) == NULL)
             return -1;
@@ -190,7 +476,12 @@ int pt_unmap(struct mem *mem, page_t start, pages_t pages) {
 }
 
 int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
-    for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
+    if (!mem_page_range_valid(mem, start, pages))
+        return -1;
+    page_t end = start + pages;
+    for (page_t page = mem_next_mapped_page(mem, start);
+         page != BAD_PAGE && page < end;
+         page = mem_next_mapped_page(mem, page + 1)) {
         struct pt_entry *pt = mem_pt(mem, page);
         if (pt == NULL)
             continue;
@@ -201,7 +492,7 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
         mem_pt_del(mem, page);
         if (--data->refcount == 0) {
             // vdso wasn't allocated with mmap, it's just in our data segment
-            if (data->data != vdso_data) {
+            if (data->data != NULL && data->data != vdso_data) {
                 int err = munmap(data->data, data->size);
                 if (err != 0)
                     die("munmap(%p, %lu) failed: %s", data->data, data->size, strerror(errno));
@@ -209,6 +500,7 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
             if (data->fd != NULL) {
                 fd_close(data->fd);
             }
+            free(data->host_page_prot);
             free(data);
         }
     }
@@ -218,28 +510,83 @@ int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
 
 int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags) {
     if (pages == 0) return 0;
+    if (pages > SIZE_MAX / PAGE_SIZE)
+        return _ENOMEM;
+    if ((flags & P_RWX) == 0)
+        return pt_map(mem, start, pages, NULL, 0, flags | P_ANONYMOUS);
+    int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    // Guest anonymous mappings are often just virtual reservations
+    // (for example PROT_NONE arenas). Do not force the host to reserve
+    // backing store up front for the entire range.
+    mmap_flags |= MAP_NORESERVE;
+#endif
     void *memory = mmap(NULL, pages * PAGE_SIZE,
-            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+            PROT_READ | PROT_WRITE, mmap_flags, 0, 0);
     return pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
 }
 
+int pt_move(struct mem *mem, page_t old_start, page_t new_start, pages_t pages) {
+    if (!mem_page_range_valid(mem, old_start, pages) ||
+            !mem_page_range_valid(mem, new_start, pages))
+        return _ENOMEM;
+    if (!pt_is_hole(mem, new_start, pages))
+        return _ENOMEM;
+    for (page_t page = old_start; page < old_start + pages; page++)
+        if (mem_pt(mem, page) == NULL)
+            return _EFAULT;
+
+    pages_t mapped = 0;
+    for (; mapped < pages; mapped++) {
+        struct pt_entry *src = mem_pt(mem, old_start + mapped);
+        struct pt_entry *dst = mem_pt_new(mem, new_start + mapped);
+        if (dst == NULL) {
+            pt_unmap_always(mem, new_start, mapped);
+            return _ENOMEM;
+        }
+        src->data->refcount++;
+        dst->data = src->data;
+        dst->offset = src->offset;
+        dst->flags = src->flags;
+    }
+
+    int err = pt_unmap(mem, old_start, pages);
+    if (err < 0) {
+        pt_unmap_always(mem, new_start, pages);
+        return err;
+    }
+    mem_changed(mem);
+    return 0;
+}
+
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
+    if (!mem_page_range_valid(mem, start, pages))
+        return _ENOMEM;
     for (page_t page = start; page < start + pages; page++)
         if (mem_pt(mem, page) == NULL)
             return _ENOMEM;
     for (page_t page = start; page < start + pages; page++) {
         struct pt_entry *entry = mem_pt(mem, page);
         int old_flags = entry->flags;
-        entry->flags = flags;
-        // check if protection is increasing
-        if ((flags & ~old_flags) & (P_READ|P_WRITE)) {
-            void *data = (char *) entry->data->data + entry->offset;
-            // force to be page aligned
-            data = (void *) ((uintptr_t) data & ~(real_page_size - 1));
-            int prot = PROT_READ;
-            if (flags & P_WRITE) prot |= PROT_WRITE;
-            if (mprotect(data, real_page_size, prot) < 0)
-                return errno_map();
+        int keep_flags = old_flags & ~(P_READ | P_WRITE | P_EXEC);
+        int new_flags = keep_flags | flags;
+
+        // Reserve guest PROT_NONE anonymous mappings without host backing.
+        // If they later become accessible, allocate a real host page here.
+        if (entry->data->data == NULL && (new_flags & P_RWX) != 0) {
+            void *memory = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+            int err = pt_map(mem, page, 1, memory, 0, new_flags);
+            if (err < 0)
+                return err;
+            continue;
+        }
+
+        entry->flags = new_flags;
+        if (((new_flags ^ old_flags) & (P_READ | P_WRITE))) {
+            int err = mem_mirror_host_page_protection(entry, new_flags);
+            if (err < 0)
+                return err;
         }
     }
     mem_changed(mem);
@@ -247,9 +594,12 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
 }
 
 int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages) {
-    mem_ref_cnt_mod(src, 1);
-    mem_ref_cnt_mod(dst, 1);
-    for (page_t page = start; page < start + pages; mem_next_page(src, &page)) {
+    if (!mem_page_range_valid(src, start, pages) || !mem_page_range_valid(dst, start, pages))
+        return -1;
+    page_t end = start + pages;
+    for (page_t page = mem_next_mapped_page(src, start);
+         page != BAD_PAGE && page < end;
+         page = mem_next_mapped_page(src, page + 1)) {
         struct pt_entry *entry = mem_pt(src, page);
         if (entry == NULL)
             continue;
@@ -269,8 +619,6 @@ int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t page
     }
     mem_changed(src);
     mem_changed(dst);
-    mem_ref_cnt_mod(src, -1);
-    mem_ref_cnt_mod(dst, -1);
     
     return 0;
 }
@@ -281,16 +629,18 @@ static void mem_changed(struct mem *mem) {
 
 // This version will return NULL instead of making necessary pagetable changes.
 // Used by the emulator to avoid deadlocks.
-static void *mem_ptr_nofault(struct mem *mem, addr_t addr, int type) {
+static void *mem_ptr_nofault(struct mem *mem, guest_addr_t addr, int type) {
     struct pt_entry *entry = mem_pt(mem, PAGE(addr));
     if (entry == NULL)
         return NULL;
     if (type == MEM_WRITE && !P_WRITABLE(entry->flags))
         return NULL;
+    if (entry->data->data == NULL)
+        return NULL;
     return entry->data->data + entry->offset + PGOFFSET(addr);
 }
 
-void *mem_ptr(struct mem *mem, addr_t addr, int type) {
+void *mem_ptr(struct mem *mem, guest_addr_t addr, int type) {
     void *old_ptr = mem_ptr_nofault(mem, addr, type); // just for an assert
 
     page_t page = PAGE(addr);
@@ -300,9 +650,8 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
         // page does not exist
         // look to see if the next VM region is willing to grow down
         page_t p = page + 1;
-        while (p < MEM_PAGES && mem_pt(mem, p) == NULL)
-            p++;
-        if (p >= MEM_PAGES)
+        p = mem_next_mapped_page(mem, p);
+        if (p == BAD_PAGE || p >= mem->page_limit)
             return NULL;
         if (!(mem_pt(mem, p)->flags & P_GROWSDOWN))
             return NULL;
@@ -344,13 +693,35 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
                 locked_general_lock = true;
             }
             read_to_write_lock(&mem->lock);
+            entry = mem_pt(mem, page);
+            if (entry == NULL) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_to_read_lock(&mem->lock);
+                return NULL;
+            }
+            if (type != MEM_WRITE_PTRACE && !(entry->flags & P_WRITE)) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_to_read_lock(&mem->lock);
+                return NULL;
+            }
+            if (!(entry->flags & P_COW)) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_to_read_lock(&mem->lock);
+                goto done_write_fault;
+            }
             void *copy = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
             void *data = (char *) entry->data->data + entry->offset;
 
-            // copy/paste from above
-            mem_ref_cnt_mod(mem, 1);
-            memcpy(copy, data, PAGE_SIZE);  //mkemkemke  Crashes here a lot when running both the go and parallel make test. 01 June 2022
-            mem_ref_cnt_mod(mem, -1);
+            if (copy == MAP_FAILED) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_to_read_lock(&mem->lock);
+                return NULL;
+            }
+            memcpy(copy, data, PAGE_SIZE);
             pt_map(mem, page, 1, copy, 0, entry->flags &~ P_COW);
             if (locked_general_lock)
                 unlock(&current->general_lock);
@@ -360,20 +731,149 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
         
     }
 
+done_write_fault:
+    if (entry != NULL && type != MEM_WRITE_PTRACE && (entry->flags & P_WRITE)) {
+        int host_err = mem_ensure_host_writable(entry);
+        if (host_err < 0)
+            return NULL;
+    }
     void *ptr = mem_ptr_nofault(mem, addr, type);
     assert(old_ptr == NULL || old_ptr == ptr || type == MEM_WRITE_PTRACE);
     return ptr;
 }
 
-static void *mem_mmu_translate(struct mmu *mmu, addr_t addr, int type) {
-    return mem_ptr_nofault(container_of(mmu, struct mem, mmu), addr, type);
+void *mem_ptr_fault(struct mem *mem, guest_addr_t addr, int type) {
+    page_t page = PAGE(addr);
+    write_lock(&mem->lock);
+
+    struct pt_entry *entry = mem_pt(mem, page);
+    if (entry == NULL) {
+        page_t p = page + 1;
+        p = mem_next_mapped_page(mem, p);
+        if (p == BAD_PAGE || p >= mem->page_limit) {
+            write_unlock(&mem->lock);
+            return NULL;
+        }
+        struct pt_entry *next = mem_pt(mem, p);
+        if (next == NULL || !(next->flags & P_GROWSDOWN)) {
+            write_unlock(&mem->lock);
+            return NULL;
+        }
+        pt_map_nothing(mem, page, 1, P_WRITE | P_GROWSDOWN);
+        entry = mem_pt(mem, page);
+    }
+
+    if (entry != NULL && (type == MEM_WRITE || type == MEM_WRITE_PTRACE)) {
+        if (type != MEM_WRITE_PTRACE && !(entry->flags & P_WRITE)) {
+            write_unlock(&mem->lock);
+            return NULL;
+        }
+        if (type == MEM_WRITE_PTRACE)
+            entry->flags |= P_WRITE | P_COW;
+#if ENGINE_JIT
+        jit_invalidate_page(mem->mmu.jit, page);
+#endif
+        if (entry->flags & P_COW) {
+            bool locked_general_lock = false;
+            if (current != NULL && !pthread_equal(current->general_lock.owner, pthread_self())) {
+                lock(&current->general_lock, 0);
+                locked_general_lock = true;
+            }
+            entry = mem_pt(mem, page);
+            if (entry == NULL) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_unlock(&mem->lock);
+                return NULL;
+            }
+            if (type != MEM_WRITE_PTRACE && !(entry->flags & P_WRITE)) {
+                if (locked_general_lock)
+                    unlock(&current->general_lock);
+                write_unlock(&mem->lock);
+                return NULL;
+            }
+            if (entry->flags & P_COW) {
+                void *copy = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+                void *data = (char *) entry->data->data + entry->offset;
+                if (copy == MAP_FAILED) {
+                    if (locked_general_lock)
+                        unlock(&current->general_lock);
+                    write_unlock(&mem->lock);
+                    return NULL;
+                }
+                memcpy(copy, data, PAGE_SIZE);
+                pt_map(mem, page, 1, copy, 0, entry->flags & ~P_COW);
+                entry = mem_pt(mem, page);
+            }
+            if (locked_general_lock)
+                unlock(&current->general_lock);
+        }
+    }
+
+    if (entry != NULL && type != MEM_WRITE_PTRACE && (entry->flags & P_WRITE)) {
+        int host_err = mem_ensure_host_writable(entry);
+        if (host_err < 0) {
+            write_unlock(&mem->lock);
+            return NULL;
+        }
+    }
+
+    void *ptr = mem_ptr_nofault(mem, addr, type);
+    write_unlock(&mem->lock);
+    return ptr;
+}
+
+static void *mem_mmu_translate(struct mmu *mmu, guest_addr_t addr, int type) {
+    struct mem *mem = container_of(mmu, struct mem, mmu);
+    void *ptr = mem_ptr_nofault(mem, addr, type);
+    if (ptr == NULL && type == MEM_READ && current != NULL &&
+            current->abi == GUEST_ABI_AMD64 && amd64_jit_debug_enabled()) {
+        enum { AMD64_JIT_TRANSLATE_TRACE_BUDGET = 64 };
+        static unsigned amd64_jit_translate_trace_count;
+        if (amd64_jit_translate_trace_count < AMD64_JIT_TRANSLATE_TRACE_BUDGET) {
+            amd64_jit_translate_trace_count++;
+            struct pt_entry *entry = mem_pt(mem, PAGE(addr));
+            if (entry == NULL) {
+                fprintf(stderr,
+                        "[amd64-jit] mmu miss addr=%#llx page=%#llx page_limit=%#llx mmap=[%#llx,%#llx) mem=%p current_mem=%p no-entry\n",
+                        (unsigned long long) addr,
+                        (unsigned long long) PAGE(addr),
+                        (unsigned long long) mem->page_limit,
+                        (unsigned long long) mem->mmap_floor,
+                        (unsigned long long) mem->mmap_ceiling,
+                        (void *) mem,
+                        current != NULL ? (void *) current->mem : NULL);
+            } else {
+                fprintf(stderr,
+                        "[amd64-jit] mmu miss addr=%#llx page=%#llx flags=%#x data=%p off=%zu type=%d mem=%p current_mem=%p\n",
+                        (unsigned long long) addr,
+                        (unsigned long long) PAGE(addr),
+                        entry->flags,
+                        entry->data != NULL ? entry->data->data : NULL,
+                        entry->offset,
+                        type,
+                        (void *) mem,
+                        current != NULL ? (void *) current->mem : NULL);
+            }
+        }
+    }
+    if (ptr == NULL || type != MEM_WRITE)
+        return ptr;
+
+    struct pt_entry *entry = mem_pt(mem, PAGE(addr));
+    if (entry == NULL)
+        return NULL;
+    if (mem_ensure_host_writable(entry) < 0)
+        return NULL;
+    return ptr;
 }
 
 static struct mmu_ops mem_mmu_ops = {
     .translate = mem_mmu_translate,
 };
 
-int mem_segv_reason(struct mem *mem, addr_t addr) {
+int mem_segv_reason(struct mem *mem, guest_addr_t addr) {
     struct pt_entry *pt = mem_pt(mem, PAGE(addr));
     if (pt == NULL)
         return SEGV_MAPERR_;
@@ -397,11 +897,15 @@ void mem_coredump(struct mem *mem, const char *file) {
     }
 
     int pages = 0;
-    for (page_t page = 0; page < MEM_PAGES; page++) {
+    for (page_t page = mem_next_mapped_page(mem, 0);
+         page != BAD_PAGE && page < mem->page_limit;
+         page = mem_next_mapped_page(mem, page + 1)) {
         struct pt_entry *entry = mem_pt(mem, page);
         if (entry == NULL)
             continue;
         pages++;
+        if (entry->data->data == NULL)
+            continue;
         if (lseek(fd, page << PAGE_BITS, SEEK_SET) < 0) {
             perror("lseek");
             return;
@@ -415,20 +919,34 @@ void mem_coredump(struct mem *mem, const char *file) {
     close(fd);
 }
 
-void mem_ref_cnt_mod(struct mem *mem, int value) { // value Should only be -1 or 1.  -mke
+void mem_ref_cnt_mod(struct mem *mem, int value) { // value should only be -1 or 1.
     // Keep track of how many threads are referencing this task
-    if(!doEnableExtraLocking) {// If they want to fly by the seat of their pants...  -mke
+    if(!doEnableExtraLocking) {
         return;
     }
     
     if(mem == NULL) {
             return;
     }
+
+    if (value != 1 && value != -1) {
+        printk("ERROR: invalid mem refcount delta %d\n", value);
+        return;
+    }
     
     pthread_mutex_lock(&mem->reference.lock);
     
-    if(((mem->reference.count + value) < 0)) { // Prevent our unsigned value attempting to go negative.  -mke
-        printk("ERROR: Attempt to decrement mem reference count to be negative, ignoring(%d:%d)\n", mem->reference.count, value);
+    if(((mem->reference.count + value) < 0)) { // Prevent the count from going negative.
+        void *caller = __builtin_return_address(0);
+        Dl_info caller_info = {};
+        const char *caller_name = "?";
+        ptrdiff_t caller_offset = 0;
+        if (caller != NULL && dladdr(caller, &caller_info) != 0 && caller_info.dli_sname != NULL) {
+            caller_name = caller_info.dli_sname;
+            caller_offset = (char *) caller - (char *) caller_info.dli_saddr;
+        }
+        printk("ERROR: Attempt to decrement mem reference count to be negative, ignoring(%d:%d) caller=%s+%td addr=%p mem=%p\n",
+               mem->reference.count, value, caller_name, caller_offset, caller, mem);
         pthread_mutex_unlock(&mem->reference.lock);
         return;
     }

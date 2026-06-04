@@ -54,8 +54,8 @@ struct jit {
 #define JIT_BLOCK_INITIAL_CAPACITY 16
 
 struct jit_block {
-    addr_t addr;
-    addr_t end_addr;
+    guest_addr_t addr;
+    guest_addr_t end_addr;
     size_t used;
 
     // pointers to the ip values in the last gadget
@@ -88,6 +88,21 @@ void jit_free(struct jit *jit);
 void jit_invalidate_range(struct jit *jit, page_t start, page_t end);
 void jit_invalidate_page(struct jit *jit, page_t page);
 void jit_invalidate_all(struct jit *jit);
+
+bool amd64_jit_is_enabled(void);
+void amd64_jit_set_enabled(bool enabled);
+bool i386_single_step_comm_matches(const char *comm);
+void i386_single_step_comm_set(const char *comm);
+void i386_single_step_comm_get(char *buf, size_t bufsize);
+bool i386_no_cache_comm_matches(const char *comm);
+void i386_no_cache_comm_set(const char *comm);
+void i386_no_cache_comm_get(char *buf, size_t bufsize);
+void i386_special_trace_reset(pid_t_ tgid, const char *comm);
+void i386_trace_special_op(const char *op, addr_t ip);
+void i386_trace_special_reg_op(const char *op, addr_t ip, int reg);
+struct cpu_state;
+void dump_amd64_cc1_jit_trace(const struct cpu_state *cpu);
+void jit_cleanup_jetsam_after_interrupt(struct cpu_state *cpu);
 
 #endif
 

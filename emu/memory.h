@@ -12,9 +12,14 @@
 struct jit;
 #endif
 
+struct pt_directory_chunk;
+
 struct mem {
-    struct pt_entry **pgdir;
-    int pgdir_used;
+    _Atomic(struct pt_directory_chunk *) *pgdir_root;
+    page_t page_limit;
+    page_t mmap_floor;
+    page_t mmap_ceiling;
+    _Atomic int quiesce_requested;
 
 #if ENGINE_JIT
     struct jit *jit;
@@ -28,18 +33,50 @@ struct mem {
 
     wrlock_t lock;
 };
-#define MEM_PAGES (1 << 20) // at least on 32-bit
-#define MEM_PGDIR_SIZE (1 << 10)
+
+static inline void mem_read_lock_quiesce_aware(struct mem *mem) {
+    if (mem == NULL)
+        return;
+    while (true) {
+        while (atomic_load_explicit(&mem->quiesce_requested, memory_order_acquire) > 0)
+            nanosleep(&lock_pause, NULL);
+        read_lock(&mem->lock);
+        if (atomic_load_explicit(&mem->quiesce_requested, memory_order_acquire) == 0)
+            return;
+        read_unlock(&mem->lock);
+        nanosleep(&lock_pause, NULL);
+    }
+}
+
+static inline void mem_read_unlock_quiesce_aware(struct mem *mem) {
+    if (mem != NULL)
+        read_unlock(&mem->lock);
+}
+
+#define MEM_DEFAULT_PAGE_LIMIT ((page_t) 1 << 20)
+#define MEM_DEFAULT_MMAP_FLOOR ((page_t) 0x40000)
+#define MEM_DEFAULT_MMAP_CEILING ((page_t) 0xf7ffe)
+#define MEM_PTDIR_BITS 10
+#define MEM_PTDIR_SIZE (1 << MEM_PTDIR_BITS)
+#define MEM_PGDIR_MID_BITS 13
+#define MEM_PGDIR_MID_SIZE (1 << MEM_PGDIR_MID_BITS)
+#define MEM_PGDIR_ROOT_BITS 12
+#define MEM_PGDIR_ROOT_SIZE (1 << MEM_PGDIR_ROOT_BITS)
+#define MEM_MAX_PAGE_LIMIT ((page_t) 1 << (MEM_PTDIR_BITS + MEM_PGDIR_MID_BITS + MEM_PGDIR_ROOT_BITS))
 
 // Initialize the address space
 void mem_init(struct mem *mem);
 // Uninitialize the address space
 void mem_destroy(struct mem *mem);
+void mem_set_page_limit(struct mem *mem, page_t limit);
+void mem_set_mmap_window(struct mem *mem, page_t floor, page_t ceiling);
 // Return the pagetable entry for the given page
 struct pt_entry *mem_pt(struct mem *mem, page_t page);
 // Increment *page, skipping over unallocated page directories. Intended to be
 // used as the incremenent in a for loop to traverse mappings.
 void mem_next_page(struct mem *mem, page_t *page);
+size_t mem_mapped_page_count(struct mem *mem);
+void *mem_ptr_fault(struct mem *mem, guest_addr_t addr, int type);
 
 #define BYTES_ROUND_DOWN(bytes) (PAGE(bytes) << PAGE_BITS)
 #define BYTES_ROUND_UP(bytes) (PAGE_ROUND_UP(bytes) << PAGE_BITS)
@@ -50,6 +87,8 @@ struct data {
     void *data; // immutable
     size_t size; // also immutable
     atomic_uint refcount;
+    uintptr_t shared_key;
+    uint8_t *host_page_prot; // cached mirrored host protections, one per host page
 
     // for display in /proc/pid/maps
     struct fd *fd;
@@ -57,7 +96,7 @@ struct data {
     const char *name;
 #if LEAK_DEBUG
     int pid;
-    addr_t dest;
+    guest_addr_t dest;
 #endif
 };
 struct pt_entry {
@@ -93,6 +132,8 @@ page_t pt_find_hole(struct mem *mem, pages_t size);
 int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t offset, unsigned flags);
 // Map empty space into fake memory
 int pt_map_nothing(struct mem *mem, page_t page, pages_t pages, unsigned flags);
+// Move an existing mapped range into a hole.
+int pt_move(struct mem *mem, page_t old_start, page_t new_start, pages_t pages);
 // Unmap fake memory, return -1 if any part of the range isn't mapped and 0 otherwise
 int pt_unmap(struct mem *mem, page_t start, pages_t pages);
 // like pt_unmap but doesn't care if part of the range isn't mapped
@@ -103,8 +144,8 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags);
 int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages);
 
 // Must call with mem read-locked.
-void *mem_ptr(struct mem *mem, addr_t addr, int type);
-int mem_segv_reason(struct mem *mem, addr_t addr);
+void *mem_ptr(struct mem *mem, guest_addr_t addr, int type);
+int mem_segv_reason(struct mem *mem, guest_addr_t addr);
 
 // Reference counting is important
 void mem_ref_cnt_mod(struct mem *mem, int value);

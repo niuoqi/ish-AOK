@@ -32,7 +32,7 @@
 		497F6CF5254E5EA500C82F46 /* float80-test.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C5A254E5C7E00C82F46 /* float80-test.c */; };
 		497F6CF6254E5EA500C82F46 /* float80.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C66254E5C7F00C82F46 /* float80.c */; };
 		497F6CF7254E5EA500C82F46 /* fpu.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C5D254E5C7E00C82F46 /* fpu.c */; };
-		497F6CF8254E5EA500C82F46 /* interp.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C67254E5C7F00C82F46 /* interp.c */; };
+		497F6CF8254E5EA500C82F46 /* amd64_interp.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C67254E5C7F00C82F46 /* amd64_interp.c */; };
 		497F6CF9254E5EA500C82F46 /* memory.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C60254E5C7F00C82F46 /* memory.c */; };
 		497F6CFA254E5EA500C82F46 /* tlb.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C59254E5C7E00C82F46 /* tlb.c */; };
 		497F6CFB254E5EA500C82F46 /* vec.c in Sources */ = {isa = PBXBuildFile; fileRef = 497F6C64254E5C7F00C82F46 /* vec.c */; };
@@ -265,6 +265,8 @@
 		C0A000022E00000200000005 /* tests/audio/test-tone-48k-s16le-stereo.raw in Resources */ = {isa = PBXBuildFile; fileRef = C0A000022E00000200000007 /* tests/audio/test-tone-48k-s16le-stereo.raw */; };
 		C0A000022E00000200000006 /* tests/audio/test-tone-48k-s16le-stereo.wav in Resources */ = {isa = PBXBuildFile; fileRef = C0A000022E00000200000008 /* tests/audio/test-tone-48k-s16le-stereo.wav */; };
 		C0A000032E00000300000001 /* WorkspaceViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = C0A000032E00000300000003 /* WorkspaceViewController.m */; };
+		C0A000042E00000400000001 /* tools/iSH_benchmark.tgz in Resources */ = {isa = PBXBuildFile; fileRef = C0A000042E00000400000003 /* tools/iSH_benchmark.tgz */; };
+		C0A000042E00000400000002 /* tools/iSH_benchmark.tgz in Resources */ = {isa = PBXBuildFile; fileRef = C0A000042E00000400000003 /* tools/iSH_benchmark.tgz */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXBuildRule section */
@@ -544,7 +546,7 @@
 		497F6C64254E5C7F00C82F46 /* vec.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = vec.c; sourceTree = "<group>"; };
 		497F6C65254E5C7F00C82F46 /* regid.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = regid.h; sourceTree = "<group>"; };
 		497F6C66254E5C7F00C82F46 /* float80.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = float80.c; sourceTree = "<group>"; };
-		497F6C67254E5C7F00C82F46 /* interp.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = interp.c; sourceTree = "<group>"; };
+		497F6C67254E5C7F00C82F46 /* amd64_interp.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = amd64_interp.c; sourceTree = "<group>"; };
 		497F6C69254E5C7F00C82F46 /* fpu.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = fpu.h; sourceTree = "<group>"; };
 		497F6C6A254E5C7F00C82F46 /* modrm.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = modrm.h; sourceTree = "<group>"; };
 		497F6C6B254E5C7F00C82F46 /* tlb.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = tlb.h; sourceTree = "<group>"; };
@@ -791,6 +793,7 @@
 		C0A000022E00000200000008 /* tests/audio/test-tone-48k-s16le-stereo.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = "tests/audio/test-tone-48k-s16le-stereo.wav"; sourceTree = SOURCE_ROOT; };
 		C0A000032E00000300000002 /* WorkspaceViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WorkspaceViewController.h; sourceTree = "<group>"; };
 		C0A000032E00000300000003 /* WorkspaceViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WorkspaceViewController.m; sourceTree = "<group>"; };
+		C0A000042E00000400000003 /* tools/iSH_benchmark.tgz */ = {isa = PBXFileReference; lastKnownFileType = archive.gzip; path = tools/iSH_benchmark.tgz; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -1141,6 +1144,7 @@
 				BB41591D255EF9E300E0950C /* UITests */,
 				C0A000022E00000200000007 /* tests/audio/test-tone-48k-s16le-stereo.raw */,
 				C0A000022E00000200000008 /* tests/audio/test-tone-48k-s16le-stereo.wav */,
+				C0A000042E00000400000003 /* tools/iSH_benchmark.tgz */,
 				5D8CFA842B1198B300D50E57 /* RTCDevice.m */,
 				5D8CFA882B1198DB00D50E57 /* RTCDevice.h */,
 			);
@@ -1304,7 +1308,7 @@
 				497F6C5D254E5C7E00C82F46 /* fpu.c */,
 				497F6C63254E5C7F00C82F46 /* fpu.h */,
 				497F6C68254E5C7F00C82F46 /* interp */,
-				497F6C67254E5C7F00C82F46 /* interp.c */,
+				497F6C67254E5C7F00C82F46 /* amd64_interp.c */,
 				497F6C5C254E5C7E00C82F46 /* interrupt.h */,
 				497F6C60254E5C7F00C82F46 /* memory.c */,
 				497F6C61254E5C7F00C82F46 /* memory.h */,
@@ -1559,6 +1563,7 @@
 				BB034E8C263643C10000A498 /* Generate APK Repositories File */,
 				BB4A53AC1FAA49CA00A72ACE /* Compile JavaScript */,
 				BB792B4E1F96D90D00FFB7A4 /* Resources */,
+				C0A200012F2F100100000001 /* Copy Alternate Icon Sizes */,
 				BB88F4A32154760800A341FD /* Embed Foundation Extensions */,
 			);
 			buildRules = (
@@ -1839,6 +1844,7 @@
 				BB38599727BCEE6B000A1082 /* freeiosterminal.png in Resources */,
 				C0A000022E00000200000003 /* tests/audio/test-tone-48k-s16le-stereo.raw in Resources */,
 				C0A000022E00000200000004 /* tests/audio/test-tone-48k-s16le-stereo.wav in Resources */,
+				C0A000042E00000400000001 /* tools/iSH_benchmark.tgz in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1887,6 +1893,7 @@
 				BB38598127BCEC78000A1082 /* freeiosterminal.png in Resources */,
 				C0A000022E00000200000005 /* tests/audio/test-tone-48k-s16le-stereo.raw in Resources */,
 				C0A000022E00000200000006 /* tests/audio/test-tone-48k-s16le-stereo.wav in Resources */,
+				C0A000042E00000400000002 /* tools/iSH_benchmark.tgz in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1974,6 +1981,7 @@
 			);
 			inputPaths = (
 				"$(SRCROOT)/app/Icons/Icons.plist",
+				"$(SRCROOT)/tools/generate-ios-alt-icons.py",
 			);
 			name = "Add icons to Info.plist";
 			outputFileListPaths = (
@@ -1983,7 +1991,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "python3 - \"${SRCROOT}/app/Icons/Icons.plist\" \"${BUILT_PRODUCTS_DIR}/infoplisticons.h\" <<END\nimport plistlib\nimport sys\nwith open(sys.argv[1], 'rb') as plist:\n    icons = plistlib.load(plist)\nalt_icons = '<key>CFBundleAlternateIcons</key><dict>'\nfor icon in icons.keys():\n    if icon == '': continue\n    alt_icons += '''<key>{0}</key>\n<dict>\n<key>CFBundleIconFiles</key>\n<array><string>{0}</string></array>\n</dict>'''.format(icon)\nalt_icons += '</dict>'\nicon_stuff = '''</string>\n<key>CFBundleIcons</key><dict>{0}</dict>\n<key>CFBundleIcons~ipad</key><dict>{0}</dict>\n<key>kxcode</key><string>'''.format(alt_icons)\nicon_define = '#define ICON_STUFF ' + icon_stuff.replace('\\n', '')\nwith open(sys.argv[2], 'w') as output:\n    output.write(icon_define)\nEND\n";
+			shellScript = "python3 \"$SRCROOT/tools/generate-ios-alt-icons.py\" \\\n  --icons-plist \"$SRCROOT/app/Icons/Icons.plist\" \\\n  --info-header \"$BUILT_PRODUCTS_DIR/infoplisticons.h\"\n";
 		};
 		BBECF3B2269136E100DEC937 /* ShellScript */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -2007,17 +2015,17 @@
 			files = (
 			);
 			inputPaths = (
+				"$(SRCROOT)/alpine-minirootfs-3.23.3-x86_64.tar.gz",
 				"$(SRCROOT)/alpine-minirootfs-3.23.3-x86.tar.gz",
-				"$(SRCROOT)/root.tar.gz",
 			);
 			name = "Download Root";
 			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/alpine-minirootfs-3.23.3-x86_64.tar.gz",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/alpine-minirootfs-3.23.3-x86.tar.gz",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/root.tar.gz",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "RESOURCES_DIR=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$RESOURCES_DIR\"\nrm -f \"$RESOURCES_DIR/root.tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\ninstall -m 0644 \"$SRCROOT/root.tar.gz\" \"$RESOURCES_DIR/root.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\n";
+			shellScript = "RESOURCES_DIR=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$RESOURCES_DIR\"\nrm -f \"$RESOURCES_DIR/root.tar.gz\"\nrm -f \"$RESOURCES_DIR/Alpine3.23.3(x86_64).tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86_64.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\"\nxattr -c \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\" 2>/dev/null || true\n";
 			showEnvVarsInLog = 0;
 		};
 		BBEF197A268066D1001225BD /* Generate APK Repositories File */ = {
@@ -2067,17 +2075,17 @@
 			files = (
 			);
 			inputPaths = (
+				"$(SRCROOT)/alpine-minirootfs-3.23.3-x86_64.tar.gz",
 				"$(SRCROOT)/alpine-minirootfs-3.23.3-x86.tar.gz",
-				"$(SRCROOT)/root.tar.gz",
 			);
 			name = "Download Root";
 			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/alpine-minirootfs-3.23.3-x86_64.tar.gz",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/alpine-minirootfs-3.23.3-x86.tar.gz",
-				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/root.tar.gz",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "RESOURCES_DIR=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$RESOURCES_DIR\"\nrm -f \"$RESOURCES_DIR/root.tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\ninstall -m 0644 \"$SRCROOT/root.tar.gz\" \"$RESOURCES_DIR/root.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\n";
+			shellScript = "RESOURCES_DIR=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$RESOURCES_DIR\"\nrm -f \"$RESOURCES_DIR/root.tar.gz\"\nrm -f \"$RESOURCES_DIR/Alpine3.23.3(x86_64).tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\nrm -f \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\"\ninstall -m 0644 \"$SRCROOT/alpine-minirootfs-3.23.3-x86_64.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\"\nxattr -c \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86.tar.gz\" \"$RESOURCES_DIR/alpine-minirootfs-3.23.3-x86_64.tar.gz\" 2>/dev/null || true\n";
 			showEnvVarsInLog = 0;
 		};
 		BBFB2C572590257E00545EAB /* ShellScript */ = {
@@ -2096,6 +2104,29 @@
 			shellPath = /bin/sh;
 			shellScript = "mkdir -p \"$CONFIGURATION_BUILD_DIR\"\nln -sf \"$MESON_BUILD_DIR/$PRODUCT_NAME.a\" \"$CONFIGURATION_BUILD_DIR/$PRODUCT_NAME.a\"\n";
 		};
+		C0A200012F2F100100000001 /* Copy Alternate Icon Sizes */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"$(SRCROOT)/app/Icons/AlternateIconSizes.xcfilelist",
+			);
+			inputPaths = (
+				"$(SRCROOT)/app/Icons/AlternateIconSizes.xcfilelist",
+				"$(SRCROOT)/app/Icons/AlternateIconSizes.outputs.xcfilelist",
+			);
+			name = "Copy Alternate Icon Sizes";
+			outputFileListPaths = (
+				"$(SRCROOT)/app/Icons/AlternateIconSizes.outputs.xcfilelist",
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nresources_dir=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nmkdir -p \"$resources_dir\"\nwhile IFS= read -r source_path; do\n  [ -n \"$source_path\" ] || continue\n  source_path=$(printf '%s\\n' \"$source_path\" | sed \"s#^\\$(SRCROOT)#$SRCROOT#\")\n  cp -f \"$source_path\" \"$resources_dir/$(basename \"$source_path\")\"\ndone < \"$SRCROOT/app/Icons/AlternateIconSizes.xcfilelist\"\n";
+		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -2106,7 +2137,7 @@
 				497F6CF5254E5EA500C82F46 /* float80-test.c in Sources */,
 				497F6CF6254E5EA500C82F46 /* float80.c in Sources */,
 				497F6CF7254E5EA500C82F46 /* fpu.c in Sources */,
-				497F6CF8254E5EA500C82F46 /* interp.c in Sources */,
+				497F6CF8254E5EA500C82F46 /* amd64_interp.c in Sources */,
 				497F6CF9254E5EA500C82F46 /* memory.c in Sources */,
 				497F6CFA254E5EA500C82F46 /* tlb.c in Sources */,
 				497F6CFB254E5EA500C82F46 /* vec.c in Sources */,
@@ -2615,7 +2646,7 @@
 			baseConfigurationReference = BB0B85A42586F1CB00208600 /* ProjectDebug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CURRENT_PROJECT_VERSION = 484;
+				CURRENT_PROJECT_VERSION = 529;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -2629,7 +2660,7 @@
 			baseConfigurationReference = BB0B85A52586F1E100208600 /* ProjectRelease.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CURRENT_PROJECT_VERSION = 484;
+				CURRENT_PROJECT_VERSION = 529;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -2647,7 +2678,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 523;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2656,7 +2686,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -2676,7 +2705,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 523;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2685,7 +2713,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -2701,7 +2728,7 @@
 			baseConfigurationReference = BB28C7532689522C00BDC834 /* ProjectDebugLinux.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CURRENT_PROJECT_VERSION = 484;
+				CURRENT_PROJECT_VERSION = 529;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -2718,7 +2745,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 523;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2727,7 +2753,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -2745,10 +2770,8 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 522;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -2761,6 +2784,7 @@
 			buildSettings = {
 				DEAD_CODE_STRIPPING = YES;
 				PRODUCT_NAME = "libiSH-AOKApp";
+				SWIFT_VERSION = 5.0;
 			};
 			name = DebugLinux;
 		};
@@ -2771,7 +2795,6 @@
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 522;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2884,7 +2907,6 @@
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 522;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2904,7 +2926,6 @@
 				CODE_SIGN_ENTITLEMENTS = iSHFileProviderRelease.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 522;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -2991,6 +3012,7 @@
 			buildSettings = {
 				DEAD_CODE_STRIPPING = YES;
 				PRODUCT_NAME = "libiSH-AOKApp";
+				SWIFT_VERSION = 5.0;
 			};
 			name = "Debug-ApplePleaseFixFB19282108";
 		};
@@ -3000,6 +3022,7 @@
 			buildSettings = {
 				DEAD_CODE_STRIPPING = YES;
 				PRODUCT_NAME = "libiSH-AOKApp";
+				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
 		};
@@ -3009,10 +3032,8 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 519;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -3025,10 +3046,8 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 519;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -3040,7 +3059,7 @@
 			baseConfigurationReference = BB28C7522689522700BDC834 /* ProjectReleaseLinux.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
-				CURRENT_PROJECT_VERSION = 484;
+				CURRENT_PROJECT_VERSION = 529;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -3058,7 +3077,6 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 523;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
@@ -3067,7 +3085,6 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -3084,10 +3101,8 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 519;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
-				MARKETING_VERSION = 1.3;
 				PRODUCT_BUNDLE_IDENTIFIER = "app.ish.iSH-AOK";
 				PRODUCT_NAME = "iSH-AOK";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -3100,6 +3115,7 @@
 			buildSettings = {
 				DEAD_CODE_STRIPPING = YES;
 				PRODUCT_NAME = "libiSH-AOKApp";
+				SWIFT_VERSION = 5.0;
 			};
 			name = ReleaseLinux;
 		};
@@ -3110,7 +3126,6 @@
 				CODE_SIGN_ENTITLEMENTS = app/FileProvider/iSHFileProvider.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 519;
 				DEVELOPMENT_TEAM = UYU5FM4LQ4;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;

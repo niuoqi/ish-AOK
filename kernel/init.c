@@ -97,7 +97,7 @@ static struct task *construct_task(struct task *parent) {
     task->tgid = task->pid;
     task_setsid(task);
 
-    task_set_mm(task, mm_new());
+    task_set_mm(task, mm_new(task->abi));
     task->sighand = sighand_new();
     task->files = fdtable_new(3); // why is there a 3 here
 
@@ -107,10 +107,10 @@ static struct task *construct_task(struct task *parent) {
     struct task *old_current = current;
     current = task;
     task->fs->root = generic_open("/", O_RDONLY_, 0);
+    current = old_current;
     if (IS_ERR(task->fs->root))
         return ERR_PTR(task->fs->root);
     task->fs->pwd = fd_retain(task->fs->root);
-    current = old_current;
 
     return task;
 }
@@ -131,12 +131,12 @@ intptr_t become_first_process(void) {
 }
 
 intptr_t become_new_init_child(void) {
-    // locking? who needs locking?!
-    struct task *init = pid_get_task(1);
+    struct task *init = pid_get_task_ref(1);
     if (init == NULL)
         return _ESRCH;
 
     struct task *task = construct_task(init);
+    task_ref_cnt_mod(init, -1);
     if (IS_ERR(task))
         return PTR_ERR(task);
 
@@ -167,6 +167,14 @@ void get_console_device(int *major, int *minor) {
 
 int create_stdio(const char *file, int major, int minor) {
     struct fd *fd = generic_open(file, O_RDWR_, 0);
+    if (!IS_ERR(fd)) {
+        struct statbuf stat = {};
+        int stat_err = fd->mount->fs->fstat(fd, &stat);
+        if (stat_err < 0 || !S_ISCHR(stat.mode) || stat.rdev != dev_make(major, minor)) {
+            fd_close(fd);
+            fd = ERR_PTR(stat_err < 0 ? stat_err : _ENODEV);
+        }
+    }
     if (IS_ERR(fd)) {
         // fallback to adhoc files for stdio
         fd = adhoc_fd_create(NULL);
@@ -192,6 +200,9 @@ static struct fd *open_fd_from_actual_fd(int fd_no) {
     }
     fd->real_fd = fd_no;
     fd->dir = NULL;
+    int flags = realfs_getflags(fd);
+    if (flags >= 0)
+        fd->flags = flags;
     realfs_fstat(fd, &fd->stat);
     return fd;
 }

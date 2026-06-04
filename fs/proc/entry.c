@@ -24,30 +24,38 @@ int proc_entry_stat(struct proc_entry *entry, struct statbuf *stat) {
     memset(stat, 0, sizeof(*stat));
     stat->mode = proc_entry_mode(entry);
 
-    complex_lockt(&pids_lock, 1);
-    struct task *task = pid_get_task(entry->pid);
+    struct task *task = pid_get_task_ref(entry->pid);
     if (task != NULL) {
-        stat->uid = task->uid;
-        stat->gid = task->gid;
+        // generic_openat() holds inodes_lock across stat/open/fstat. Never
+        // block procfs stat on a task lock while that global lock is held, or
+        // a task exiting with general_lock held can stall unrelated file opens.
+        if (trylock(&task->general_lock) == 0) {
+            stat->uid = task->uid;
+            stat->gid = task->gid;
+            unlock(&task->general_lock);
+        } else {
+            stat->uid = task->uid;
+            stat->gid = task->gid;
+        }
+        task_ref_cnt_mod(task, -1);
     } // else the memset above will have initialized memory to zero, which is the root uid/gid
-    unlock(&pids_lock);
 
     stat->inode = proc_entry_inode(entry);
     return 0;
 }
 
 qword_t proc_entry_inode(struct proc_entry *entry) {
-    // Procfs entries need globally unique, stable-enough inode values so tools
-    // like du don't mistake unrelated proc directories for cycles.
-    uint64_t hash = 1469598103934665603ULL;
-#define FNV_MIX_BYTE(v) do { hash ^= (uint8_t) (v); hash *= 1099511628211ULL; } while (0)
+    // Keep procfs inode numbers unique enough to avoid bogus cycles, but also
+    // small enough to fit the legacy 32-bit stat ABI that userspace still hits.
+    uint32_t hash = 2166136261U;
+#define FNV_MIX_BYTE(v) do { hash ^= (uint8_t) (v); hash *= 16777619U; } while (0)
 #define FNV_MIX_VALUE(v) do { \
-    uint64_t value__ = (uint64_t) (uintptr_t) (v); \
+    uintptr_t value__ = (uintptr_t) (v); \
     for (size_t i__ = 0; i__ < sizeof(value__); i__++) \
         FNV_MIX_BYTE(value__ >> (i__ * 8)); \
 } while (0)
 
-    FNV_MIX_VALUE(entry->meta->parent);
+    FNV_MIX_VALUE(entry->parent);
     FNV_MIX_VALUE(entry->meta);
     if (entry->meta->getname || entry->meta->name != NULL) {
         char name[MAX_NAME + 1];
@@ -102,4 +110,25 @@ void proc_entry_cleanup(struct proc_entry *entry) {
     if (entry->child_names != NULL)
         free_string_array(entry->child_names);
     *entry = (struct proc_entry) {0};
+}
+
+void proc_set_entries_parent(struct proc_dir_entry *entries, size_t count, struct proc_dir_entry *parent) {
+    for (size_t i = 0; i < count; i++)
+        entries[i].parent = parent;
+}
+
+void proc_set_children_parent(struct proc_children *children, struct proc_dir_entry *parent) {
+    proc_set_entries_parent(children->entries, children->count, parent);
+}
+
+struct proc_dir_entry *proc_find_entry(struct proc_dir_entry *entries, size_t count, const char *name) {
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].name != NULL && strcmp(entries[i].name, name) == 0)
+            return &entries[i];
+    }
+    return NULL;
+}
+
+struct proc_dir_entry *proc_children_find(struct proc_children *children, const char *name) {
+    return proc_find_entry(children->entries, children->count, name);
 }

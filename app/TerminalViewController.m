@@ -13,6 +13,7 @@
 #import "UserPreferences.h"
 #import "AboutViewController.h"
 #import "CurrentRoot.h"
+#import "Diagnostics.h"
 #import "Roots.h"
 #import "NSObject+SaneKVO.h"
 #import "UIViewController+Extras.h"
@@ -22,25 +23,160 @@
 #include "kernel/init.h"
 #include "kernel/task.h"
 #include "kernel/calls.h"
+#include "kernel/fs.h"
 #include "fs/devices.h"
+#include "fs/path.h"
 
 static UISceneSession *ISHFindExistingWorkspaceSceneSession(UISceneSession *excludedSession) API_AVAILABLE(ios(13.0));
 static UISceneSession *ISHFindExistingWorkspaceSceneSession(UISceneSession *excludedSession) {
+    NSArray<NSString *> *forgottenHiddenSessions = [NSUserDefaults.standardUserDefaults arrayForKey:@"ISHWorkspaceForgottenHiddenSessions"];
     UISceneSession *bestSession = nil;
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        UISceneSession *session = scene.session;
+    for (UISceneSession *session in UIApplication.sharedApplication.openSessions) {
         if (session == nil || session == excludedSession)
             continue;
         if (![session.stateRestorationActivity.activityType isEqualToString:ISHSceneActivityTypeWorkspace])
             continue;
-        if (scene.activationState == UISceneActivationStateForegroundActive)
+        UIScene *connectedScene = nil;
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.session == session) {
+                connectedScene = scene;
+                break;
+            }
+        }
+        if (connectedScene == nil && [forgottenHiddenSessions containsObject:session.persistentIdentifier])
+            continue;
+        if (connectedScene == nil && bestSession == nil) {
+            bestSession = session;
+            continue;
+        }
+        if (connectedScene == nil)
+            continue;
+        if (connectedScene.activationState == UISceneActivationStateForegroundActive)
             return session;
-        if (bestSession == nil || scene.activationState == UISceneActivationStateForegroundInactive) {
+        if (bestSession == nil || connectedScene.activationState == UISceneActivationStateForegroundInactive) {
             bestSession = session;
         }
     }
     return bestSession;
 }
+
+#if !ISH_LINUX
+static BOOL ISHCommandIsDefaultLogin(NSArray<NSString *> *command) {
+    return command.count == 3 &&
+            [command[0] isEqualToString:@"/bin/login"] &&
+            [command[1] isEqualToString:@"-f"] &&
+            [command[2] isEqualToString:@"root"];
+}
+
+static BOOL ISHGuestExecutableExists(NSString *path, intptr_t *errOut) {
+    struct task *previousCurrent = NULL;
+    BOOL borrowedInit = [AppDelegate pushUsableInitTaskAsCurrent:&previousCurrent];
+    if (!borrowedInit) {
+        [AppDelegate popCurrentTask:previousCurrent];
+        if (errOut != NULL)
+            *errOut = _ENOENT;
+        return NO;
+    }
+    struct statbuf stat;
+    int err = generic_statat(AT_PWD, path.UTF8String, &stat, 0);
+    [AppDelegate popCurrentTask:previousCurrent];
+    if (err < 0) {
+        if (errOut != NULL)
+            *errOut = err;
+        return NO;
+    }
+    if (!S_ISREG(stat.mode)) {
+        if (errOut != NULL)
+            *errOut = _EACCES;
+        return NO;
+    }
+    if (!(stat.mode & 0111)) {
+        if (errOut != NULL)
+            *errOut = _EACCES;
+        return NO;
+    }
+    if (errOut != NULL)
+        *errOut = 0;
+    return YES;
+}
+
+static NSArray<NSString *> *ISHCommandDescriptions(NSArray<NSArray<NSString *> *> *commands) {
+    NSMutableArray<NSString *> *descriptions = [NSMutableArray arrayWithCapacity:commands.count];
+    for (NSArray<NSString *> *command in commands) {
+        [descriptions addObject:[command componentsJoinedByString:@" "]];
+    }
+    return descriptions;
+}
+
+static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *command,
+                                                          NSString **failureTitleOut,
+                                                          NSString **failureMessageOut,
+                                                          NSString **failureOverlayOut) {
+    if (!ISHCommandIsDefaultLogin(command))
+        return command;
+
+    intptr_t configuredErr = 0;
+    if (ISHGuestExecutableExists(command[0], &configuredErr))
+        return command;
+
+    NSArray<NSArray<NSString *> *> *candidates = @[
+        @[@"/usr/bin/login", @"-f", @"root"],
+        @[@"/bin/sh", @"-l"],
+        @[@"/usr/bin/sh", @"-l"],
+        @[@"/bin/ash", @"-l"],
+        @[@"/usr/bin/ash", @"-l"],
+        @[@"/bin/bash", @"-l"],
+        @[@"/usr/bin/bash", @"-l"],
+        @[@"/bin/busybox", @"sh"],
+        @[@"/usr/bin/busybox", @"sh"],
+    ];
+    NSMutableArray<NSDictionary<NSString *, id> *> *attempts = [NSMutableArray arrayWithCapacity:candidates.count + 1];
+    [attempts addObject:@{@"command": [command componentsJoinedByString:@" "],
+                          @"path": command[0],
+                          @"error": @(configuredErr),
+                          @"errorDescription": [AppDelegate descriptionForISHErrno:configuredErr]}];
+
+    for (NSArray<NSString *> *candidate in candidates) {
+        NSString *path = candidate.firstObject;
+        intptr_t err = 0;
+        if (ISHGuestExecutableExists(path, &err)) {
+            [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.fallback.selected"
+                                          details:@{@"configuredCommand": [command componentsJoinedByString:@" "],
+                                                    @"fallbackCommand": [candidate componentsJoinedByString:@" "],
+                                                    @"fallbackPath": path ?: @"",
+                                                    @"missingLoginError": @(configuredErr),
+                                                    @"missingLoginErrorDescription": [AppDelegate descriptionForISHErrno:configuredErr],
+                                                    @"candidates": ISHCommandDescriptions(candidates),
+                                                    @"attempts": attempts}];
+            return candidate;
+        }
+        [attempts addObject:@{@"command": [candidate componentsJoinedByString:@" "],
+                              @"path": path ?: @"",
+                              @"error": @(err),
+                              @"errorDescription": [AppDelegate descriptionForISHErrno:err]}];
+    }
+
+    NSString *configuredCommand = [command componentsJoinedByString:@" "];
+    if (failureTitleOut != NULL)
+        *failureTitleOut = @"No usable login shell found";
+    if (failureMessageOut != NULL) {
+        *failureMessageOut = [NSString stringWithFormat:
+                              @"The root filesystem does not contain the default session command, and no fallback shell was found.\n\nCommand: %@\nError: %@\nFallbacks checked: %@\n\nInstall login or a shell such as /bin/sh, or change Settings -> Launch Command.",
+                              configuredCommand,
+                              [AppDelegate descriptionForISHErrno:configuredErr],
+                              [ISHCommandDescriptions(candidates) componentsJoinedByString:@", "]];
+    }
+    if (failureOverlayOut != NULL)
+        *failureOverlayOut = @"No usable login shell found.";
+    [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.fallback.none"
+                                  details:@{@"configuredCommand": configuredCommand ?: @"",
+                                            @"missingLoginError": @(configuredErr),
+                                            @"missingLoginErrorDescription": [AppDelegate descriptionForISHErrno:configuredErr],
+                                            @"candidates": ISHCommandDescriptions(candidates),
+                                            @"attempts": attempts}];
+    return command;
+}
+#endif
 
 @interface TerminalViewController () <UIGestureRecognizerDelegate>
 
@@ -77,9 +213,13 @@ static UISceneSession *ISHFindExistingWorkspaceSceneSession(UISceneSession *excl
 @property (strong, nonatomic) UIView *terminalStartupOverlay;
 @property (strong, nonatomic) UIActivityIndicatorView *terminalStartupSpinner;
 @property (strong, nonatomic) UILabel *terminalStartupLabel;
+@property (copy, nonatomic) NSString *sessionFailureTitle;
+@property (copy, nonatomic) NSString *sessionFailureMessage;
+@property (copy, nonatomic) NSString *sessionFailureOverlayText;
 
 @property int sessionPid;
 @property (nonatomic) Terminal *sessionTerminal;
+@property (nonatomic) BOOL sessionStartInProgress;
 @property BOOL ignoreKeyboardMotion;
 @property (nonatomic) BOOL hasExternalKeyboard;
 @property (nonatomic) BOOL didApplyDeferredSafeAreaUpdate;
@@ -119,6 +259,14 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 }
 
 - (BOOL)shouldPreferConsoleForFreshSession {
+    switch (self.freshSessionTerminalDisplayMode) {
+        case ISHFreshSessionTerminalDisplayModeSessionShell:
+            return NO;
+        case ISHFreshSessionTerminalDisplayModeSystemConsole:
+            return YES;
+        case ISHFreshSessionTerminalDisplayModeAuto:
+            break;
+    }
     NSString *initialWindow = [NSUserDefaults.standardUserDefaults stringForKey:kPreferenceInitialWindowKey];
     if ([initialWindow isEqualToString:@"session-shell"])
         return NO;
@@ -146,17 +294,29 @@ static const NSInteger kMaximumTerminalFontSize = 72;
         return;
 
     if (_terminal == nil) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminalVC.applyTerminal"
+                                      details:@{@"action": @"clear"}];
         self.termView.terminal = nil;
         return;
     }
 
     if ([self _isTerminalInstalledElsewhere:_terminal]) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminalVC.applyTerminal"
+                                      details:@{@"action": @"skip-installed-elsewhere",
+                                                @"terminalUUID": _terminal.uuid.UUIDString ?: @"",
+                                                @"type": @(_terminal.type),
+                                                @"number": @(_terminal.number)}];
         self.termView.terminal = nil;
         NSLog(@"Skipping terminal attach for %@ because it is already installed elsewhere", _terminal.uuid.UUIDString);
         [self _showTerminalStartupFailureOverlayWithText:@"Terminal already open in another window."];
         return;
     }
 
+    [ISHDiagnosticsStore recordBreadcrumb:@"terminalVC.applyTerminal"
+                                  details:@{@"action": @"attach",
+                                            @"terminalUUID": _terminal.uuid.UUIDString ?: @"",
+                                            @"type": @(_terminal.type),
+                                            @"number": @(_terminal.number)}];
     self.termView.terminal = _terminal;
 }
 
@@ -168,13 +328,12 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     if (!Roots.instance.needsInitialRootSelection) {
         intptr_t bootError = [AppDelegate ensureBooted];
         if (bootError < 0) {
-            NSString *message = [NSString stringWithFormat:@"could not boot"];
-            NSString *subtitle = [NSString stringWithFormat:@"error code %ld", bootError];
-            if (bootError == _EINVAL)
-                subtitle = [subtitle stringByAppendingString:@"\n(try reinstalling the app, see release notes for details)"];
-            [self _showTerminalStartupFailureOverlayWithText:@"Could not boot iSH-AOK."];
+            NSString *message = [AppDelegate bootFailureTitle] ?: @"Could not boot iSH-AOK";
+            NSString *subtitle = [AppDelegate bootFailureMessage] ?: [AppDelegate descriptionForISHErrno:bootError];
+            NSString *overlayText = [AppDelegate bootFailureOverlayText] ?: @"Could not boot iSH-AOK.";
+            [self _showTerminalStartupFailureOverlayWithText:overlayText];
             [self showMessage:message subtitle:subtitle];
-            NSLog(@"boot failed with code %ld", bootError);
+            NSLog(@"boot failed: %@", subtitle);
         }
     }
 #endif
@@ -318,8 +477,8 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
     button.hidden = YES;
-    button.accessibilityLabel = @"Dashboard";
-    button.accessibilityHint = @"Opens the workspace dashboard.";
+    button.accessibilityLabel = @"Layout Manager";
+    button.accessibilityHint = @"Opens the workspace layout manager.";
     button.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
     button.layer.cornerRadius = 22;
     button.layer.masksToBounds = NO;
@@ -384,8 +543,8 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 - (void)_installWorkspaceButton {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
-    button.accessibilityLabel = @"Dashboard";
-    button.accessibilityHint = @"Opens the workspace dashboard.";
+    button.accessibilityLabel = @"Layout Manager";
+    button.accessibilityHint = @"Opens the workspace layout manager.";
     if (@available(iOS 13, *)) {
         [button setImage:[UIImage systemImageNamed:@"square.grid.2x2"] forState:UIControlStateNormal];
     } else {
@@ -571,12 +730,38 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 }
 
 - (void)startNewSession {
+    if (self.sessionStartInProgress) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.ignored"
+                                      details:@{@"reason": @"already-starting"}];
+        return;
+    }
+    if (self.sessionPid > 0 && self.sessionTerminal != nil) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.ignored"
+                                      details:@{@"reason": @"already-running",
+                                                @"pid": @(self.sessionPid)}];
+        self.terminal = [self preferredTerminalForFreshSession];
+        return;
+    }
+
+    self.sessionStartInProgress = YES;
     [self _showTerminalStartupOverlayWithText:@"Starting terminal..."];
     intptr_t err = [self startSession];
-    if (err < 0) {
-        [self _showTerminalStartupFailureOverlayWithText:@"Could not start session."];
-        [self showMessage:@"could not start session"
-                 subtitle:[NSString stringWithFormat:@"error code %ld", err]];
+    self.sessionStartInProgress = NO;
+	    if (err < 0) {
+	        Terminal *failedTerminal = self.sessionTerminal;
+	        self.sessionTerminal = nil;
+	        self.sessionPid = 0;
+	        [failedTerminal destroy];
+	        NSString *message = self.sessionFailureTitle ?: @"Could not start session";
+	        NSString *subtitle = self.sessionFailureMessage ?: [AppDelegate descriptionForISHErrno:err];
+	        NSString *overlayText = self.sessionFailureOverlayText ?: @"Could not start session.";
+	        if (err == [AppDelegate bootError] && [AppDelegate bootFailureMessage] != nil) {
+	            message = [AppDelegate bootFailureTitle] ?: message;
+	            subtitle = [AppDelegate bootFailureMessage];
+            overlayText = [AppDelegate bootFailureOverlayText] ?: overlayText;
+        }
+        [self _showTerminalStartupFailureOverlayWithText:overlayText];
+        [self showMessage:message subtitle:subtitle];
         return;
     }
     self.terminal = [self preferredTerminalForFreshSession];
@@ -605,6 +790,14 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 - (void)reconnectSessionFromTerminalUUID:(NSUUID *)uuid {
     Terminal *terminal = [Terminal terminalWithUUID:uuid];
     if (terminal == nil) {
+        if (self.sessionStartInProgress || self.sessionPid > 0 || self.sessionTerminal != nil) {
+            [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.reconnect.deferred"
+                                          details:@{@"reason": self.sessionStartInProgress ? @"starting" : @"session-exists",
+                                                    @"terminalUUID": uuid.UUIDString ?: @""}];
+            if (self.sessionTerminal != nil)
+                self.terminal = self.sessionTerminal;
+            return;
+        }
         [self startNewSession];
         return;
     }
@@ -624,36 +817,104 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 }
 
 - (intptr_t)startSession {
-    NSArray<NSString *> *command = UserPreferences.shared.launchCommand;
+	    NSArray<NSString *> *command = UserPreferences.shared.launchCommand;
+	    NSString *commandString = [command componentsJoinedByString:@" "];
+	    self.sessionFailureTitle = nil;
+	    self.sessionFailureMessage = nil;
+	    self.sessionFailureOverlayText = nil;
 
 #if !ISH_LINUX
-    intptr_t err = [AppDelegate ensureBooted];
-    if (err < 0)
+	    intptr_t err = [AppDelegate ensureBooted];
+	    if (err < 0) {
+	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+	                                      details:@{@"stage": @"ensureBooted",
+	                                                @"error": @(err),
+	                                                @"command": commandString ?: @""}];
+	        return err;
+	    }
+	    if ([AppDelegate bootUsesConsoleSessionFallback]) {
+	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.consoleFallback"
+	                                      details:@{@"reason": @"boot-init-fallback",
+	                                                @"command": commandString ?: @""}];
+	        return 0;
+	    }
+	    NSString *sessionFailureTitle = nil;
+	    NSString *sessionFailureMessage = nil;
+	    NSString *sessionFailureOverlayText = nil;
+	    command = ISHSessionCommandWithFallback(command,
+	                                            &sessionFailureTitle,
+	                                            &sessionFailureMessage,
+	                                            &sessionFailureOverlayText);
+	    commandString = [command componentsJoinedByString:@" "];
+	    if (sessionFailureMessage.length != 0) {
+	        self.sessionFailureTitle = sessionFailureTitle;
+	        self.sessionFailureMessage = sessionFailureMessage;
+	        self.sessionFailureOverlayText = sessionFailureOverlayText;
+	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+	                                      details:@{@"stage": @"launchCommandFallback",
+	                                                @"error": @(_ENOENT),
+	                                                @"command": commandString ?: @""}];
+	        return _ENOENT;
+	    }
+	    err = become_new_init_child();
+	    if (err < 0) {
+	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+                                      details:@{@"stage": @"become_new_init_child",
+                                                @"error": @(err),
+                                                @"command": commandString ?: @""}];
         return err;
-    err = become_new_init_child();
-    if (err < 0)
-        return err;
+    }
     struct tty *tty;
     self.sessionTerminal = nil;
     Terminal *terminal = [Terminal createPseudoTerminal:&tty];
     if (terminal == nil) {
         NSAssert(IS_ERR(tty), @"tty should be error");
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+                                      details:@{@"stage": @"createPseudoTerminal",
+                                                @"error": @((int) PTR_ERR(tty)),
+                                                @"command": commandString ?: @""}];
         return (int) PTR_ERR(tty);
     }
     self.sessionTerminal = terminal;
     NSString *stdioFile = [NSString stringWithFormat:@"/dev/pts/%d", tty->num];
     err = create_stdio(stdioFile.fileSystemRepresentation, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
-    if (err < 0)
+    if (err < 0) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+                                      details:@{@"stage": @"create_stdio",
+                                                @"error": @(err),
+                                                @"command": commandString ?: @"",
+                                                @"stdio": stdioFile ?: @""}];
         return err;
+    }
     tty_release(tty);
 
     char argv[4096];
     [Terminal convertCommand:command toArgs:argv limitSize:sizeof(argv)];
     const char *envp = "TERM=xterm-256color\0";
-    err = do_execve(command[0].UTF8String, command.count, argv, envp);
-    if (err < 0)
-        return err;
+	    err = do_execve(command[0].UTF8String, command.count, argv, envp);
+	    if (err < 0) {
+	        NSString *failureTitle = @"Could not start session command";
+	        NSString *failureMessage = [NSString stringWithFormat:
+	                                    @"The root filesystem was mounted, but the session command could not be executed.\n\nCommand: %@\nPath: %@\nError: %@\n\nInstall the missing program, choose a root filesystem with a shell, or change Settings -> Launch Command.",
+	                                    commandString ?: @"",
+	                                    command.firstObject ?: @"",
+	                                    [AppDelegate descriptionForISHErrno:err]];
+	        self.sessionFailureTitle = failureTitle;
+	        self.sessionFailureMessage = failureMessage;
+	        self.sessionFailureOverlayText = @"Could not start session command.";
+	        [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.failed"
+	                                      details:@{@"stage": @"do_execve",
+	                                                @"error": @(err),
+	                                                @"errorDescription": [AppDelegate descriptionForISHErrno:err],
+	                                                @"command": commandString ?: @"",
+	                                                @"path": command.firstObject ?: @""}];
+	        return err;
+    }
     self.sessionPid = current->pid;
+    [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.start.execed"
+                                  details:@{@"pid": @(self.sessionPid),
+                                            @"command": commandString ?: @"",
+                                            @"path": command.firstObject ?: @""}];
     task_start(current);
 #else
     const char *argv_arr[command.count + 1];
@@ -693,19 +954,15 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     if (pid != self.sessionPid)
         return;
 
-    [self.sessionTerminal destroy];
-    // On iOS 13, there are multiple windows, so just close this one.
-    if (@available(iOS 13, *)) {
-        // On iPhone, destroying scenes will fail, but the error doesn't actually go to the error handler, which is really stupid. Apple doesn't fix bugs, so I'm forced to just add a check here.
-        if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad && self.sceneSession != nil) {
-            [UIApplication.sharedApplication requestSceneSessionDestruction:self.sceneSession options:nil errorHandler:^(NSError *error) {
-                NSLog(@"scene destruction error %@", error);
-                self.sceneSession = nil;
-                [self processExited:notif];
-            }];
-            return;
-        }
-    }
+    Terminal *exitedTerminal = self.sessionTerminal;
+    [ISHDiagnosticsStore recordBreadcrumb:@"terminal.session.processExited"
+                                  details:@{@"pid": @(pid),
+                                            @"sceneSession": self.sceneSession.persistentIdentifier ?: @"",
+                                            @"restarting": @YES}];
+    self.sessionTerminal = nil;
+    self.sessionPid = 0;
+    [exitedTerminal setPendingDestroyReason:@"session-process-exited"];
+    [exitedTerminal destroy];
     current = NULL; // it's been freed
     [self startNewSession];
 }
@@ -714,7 +971,7 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 #if ISH_LINUX
 - (void)kernelPanicked:(NSNotification *)notif {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"panik" message:notif.userInfo[@"message"] preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"k" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 #endif
@@ -724,7 +981,7 @@ static const NSInteger kMaximumTerminalFontSize = 72;
         if (self.presentedViewController != nil)
             return;
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:message message:subtitle preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"k"
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
@@ -809,6 +1066,9 @@ static const NSInteger kMaximumTerminalFontSize = 72;
     BOOL showBadge = FsNeedsRepositoryUpdate();
     self.settingsBadge.hidden = !showBadge;
     self.floatingSettingsBadge.hidden = !showBadge;
+    NSString *badgeValue = showBadge ? @"Update available" : nil;
+    self.infoButton.accessibilityValue = badgeValue;
+    self.floatingSettingsButton.accessibilityValue = badgeValue;
 }
 
 - (UIStatusBarStyle)preferredStatusBarStyle {
@@ -1048,6 +1308,30 @@ static const NSInteger kMaximumTerminalFontSize = 72;
         }]];
     }
 
+    if (ISHLLMClientEnabled()) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"LLM Chat"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewController()];
+            [self presentViewController:navigationController animated:YES completion:nil];
+        }]];
+        NSString *terminalContext = Terminal_debugReadRows(self.terminal.type, self.terminal.number, 80) ?: @"";
+        [alert addAction:[UIAlertAction actionWithTitle:@"LLM: Explain Current Terminal"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            NSString *prompt = [NSString stringWithFormat:@"Explain the important details in this terminal output. If there is an error, identify the likely cause.\n\nTerminal output:\n```text\n%@\n```", terminalContext];
+            UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewControllerWithInitialPrompt(prompt)];
+            [self presentViewController:navigationController animated:YES completion:nil];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"LLM: Suggest Fix"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *action) {
+            NSString *prompt = [NSString stringWithFormat:@"Find the most likely error in this terminal output and suggest concrete commands or edits to fix it.\n\nTerminal output:\n```text\n%@\n```", terminalContext];
+            UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:ISHCreateLLMClientViewControllerWithInitialPrompt(prompt)];
+            [self presentViewController:navigationController animated:YES completion:nil];
+        }]];
+    }
+
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
@@ -1175,6 +1459,10 @@ static const NSInteger kMaximumTerminalFontSize = 72;
 }
 
 - (void)setTerminal:(Terminal *)terminal {
+    [ISHDiagnosticsStore recordBreadcrumb:@"terminalVC.setTerminal"
+                                  details:@{@"terminalUUID": terminal.uuid.UUIDString ?: @"",
+                                            @"type": terminal != nil ? @(terminal.type) : @(-1),
+                                            @"number": terminal != nil ? @(terminal.number) : @(-1)}];
     _terminal = terminal;
     [self _applyCurrentTerminalToViewIfPossible];
     BOOL installedElsewhere = [self _isTerminalInstalledElsewhere:_terminal];

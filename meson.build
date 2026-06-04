@@ -49,28 +49,26 @@ emu_src = [
     'emu/vec.c',
     'emu/mmx.c',
     'emu/float80.c',
-
+    'emu/amd64_interp.c',
+    'jit/jit.c',
+    'jit/gen.c',
+    'jit/helpers.c',
 ]
-if get_option('engine') == 'jit'
-    gadgets = 'jit/gadgets-' + host_machine.cpu_family()
-    emu_src += [
-        'jit/jit.c',
-        'jit/gen.c',
-        'jit/helpers.c',
-        gadgets+'/entry.S',
-        gadgets+'/memory.S',
-        gadgets+'/control.S',
-        gadgets+'/math.S',
-        gadgets+'/bits.S',
-        gadgets+'/string.S',
-        gadgets+'/misc.S',
-        offsets,
-    ]
-else
-    emu_src += [
-        'emu/interp.c',
-    ]
+jit_cpu_family = get_option('jit_cpu_family')
+if jit_cpu_family == ''
+    jit_cpu_family = host_machine.cpu_family()
 endif
+gadgets = 'jit/gadgets-' + jit_cpu_family
+emu_src += [
+    gadgets+'/entry.S',
+    gadgets+'/memory.S',
+    gadgets+'/control.S',
+    gadgets+'/math.S',
+    gadgets+'/bits.S',
+    gadgets+'/string.S',
+    gadgets+'/misc.S',
+    offsets,
+]
 
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
 
@@ -154,10 +152,13 @@ if get_option('kernel') == 'ish'
         'kernel/epoll.c',
 
         'util/timer.c',
+        'util/ro_locks.c',
+        'util/rw_locks.c',
         'util/sync.c',
         'util/fifo.c',
 
         'emu/memory.c',
+        'platform/standalone.c',
 
         'platform/' + host_machine.system() + '.c',
     ]

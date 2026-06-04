@@ -40,7 +40,10 @@ static NSString *const kBundledRootDisplayNameKey = @"displayName";
 static NSString *const kBundledRootArchiveNameKey = @"archiveName";
 static NSString *const kBundledRootImportNameKey = @"importName";
 static NSString *const kBundledRootInitialWindowKey = @"initialWindow";
+static NSString *const kBundledRootGuestABIKey = @"guestABI";
 static NSString *const kRootsErrorDomain = @"iSH.Roots";
+static NSString *const kRootMetadataFileName = @"ish-root.plist";
+static NSString *const kRootMetadataGuestABIKey = @"guestABI";
 
 NSNotificationName const RootsDidFinishInitialSelectionNotification = @"RootsDidFinishInitialSelectionNotification";
 
@@ -50,22 +53,45 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void)
     dispatch_once(&onceToken, ^{
         choices = @[
             @{
-                kBundledRootIdentifierKey: @"devuan12",
-                kBundledRootDisplayNameKey: @"Devuan5(Debian12)",
-                kBundledRootArchiveNameKey: @"root",
-                kBundledRootImportNameKey: @"Devuan5(Debian12)",
-                kBundledRootInitialWindowKey: @"terminal",
-            },
-            @{
                 kBundledRootIdentifierKey: @"alpine3233",
                 kBundledRootDisplayNameKey: @"Alpine3.23.3",
                 kBundledRootArchiveNameKey: @"alpine-minirootfs-3.23.3-x86",
                 kBundledRootImportNameKey: @"Alpine3.23.3",
                 kBundledRootInitialWindowKey: @"session-shell",
+                kBundledRootGuestABIKey: @"i386",
+            },
+            @{
+                kBundledRootIdentifierKey: @"alpine3233x8664",
+                kBundledRootDisplayNameKey: @"Alpine3.23.3(x86_64)",
+                kBundledRootArchiveNameKey: @"alpine-minirootfs-3.23.3-x86_64",
+                kBundledRootImportNameKey: @"Alpine3.23.3(x86_64)",
+                kBundledRootInitialWindowKey: @"session-shell",
+                kBundledRootGuestABIKey: @"amd64",
             },
         ];
     });
     return choices;
+}
+
+static NSURL *RootMetadataURL(NSURL *rootURL) {
+    return [rootURL URLByAppendingPathComponent:kRootMetadataFileName];
+}
+
+static NSDictionary<NSString *, id> *ReadRootMetadata(NSURL *rootURL) {
+    NSDictionary<NSString *, id> *metadata =
+        [NSDictionary dictionaryWithContentsOfURL:RootMetadataURL(rootURL)];
+    if (![metadata isKindOfClass:NSDictionary.class])
+        return nil;
+    return metadata;
+}
+
+static void WriteRootMetadata(NSURL *rootURL, NSDictionary<NSString *, id> *metadata) {
+    if (metadata.count == 0)
+        return;
+    NSError *error = nil;
+    if (![metadata writeToURL:RootMetadataURL(rootURL) error:&error]) {
+        NSLog(@"could not write root metadata for %@: %@", rootURL.lastPathComponent, error);
+    }
 }
 
 static BOOL RootURLLooksValid(NSURL *url) {
@@ -242,6 +268,8 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
 @property NSMutableOrderedSet<NSString *> *roots;
 @property BOOL updatingDomains;
 @property BOOL domainsNeedUpdate;
+@property BOOL fileProviderDomainSyncEnabled;
+@property NSUInteger fileProviderDomainSyncGeneration;
 @property BOOL wantsVersionFile;
 @property BOOL initialBundledRootImportInProgress;
 @property (nullable) NSError *initialBundledRootImportError;
@@ -264,12 +292,13 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
             }
         }
         self.roots = roots;
+        self.fileProviderDomainSyncEnabled = NO;
         [self observe:@[@"roots"] options:0 owner:self usingBlock:^(typeof(self) self) {
             if (self.defaultRoot == nil && self.roots.count)
                 self.defaultRoot = self.roots[0];
-            [self syncFileProviderDomains];
+            [self requestFileProviderDomainSync];
         }];
-        [self syncFileProviderDomains];
+        [self requestFileProviderDomainSync];
 
         if ((!self.defaultRoot || ![self.roots containsObject:self.defaultRoot]) && self.roots.count)
             self.defaultRoot = self.roots.firstObject;
@@ -296,13 +325,61 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
     return [RootsDir() URLByAppendingPathComponent:name];
 }
 
-- (void)syncFileProviderDomains {
-    if (self.updatingDomains) {
-        self.domainsNeedUpdate = YES;
-        return;
+- (nullable NSString *)guestABIForRootNamed:(NSString *)name {
+    NSDictionary<NSString *, id> *metadata = ReadRootMetadata([self rootUrl:name]);
+    NSString *guestABI = metadata[kRootMetadataGuestABIKey];
+    if ([guestABI isKindOfClass:NSString.class] && guestABI.length != 0)
+        return guestABI;
+
+    for (NSDictionary<NSString *, NSString *> *choice in BundledRootChoices()) {
+        NSString *baseName = choice[kBundledRootImportNameKey];
+        NSString *choiceGuestABI = choice[kBundledRootGuestABIKey];
+        if (baseName.length == 0 || choiceGuestABI.length == 0)
+            continue;
+        if ([name isEqualToString:baseName] ||
+                [name hasPrefix:[baseName stringByAppendingString:@" "]]) {
+            return choiceGuestABI;
+        }
     }
-    self.updatingDomains = YES;
-    self.domainsNeedUpdate = NO;
+    return nil;
+}
+
+- (void)syncFileProviderDomains {
+    [self requestFileProviderDomainSync];
+}
+
+- (void)resumeDeferredFileProviderDomainSync {
+    @synchronized (self) {
+        if (self.fileProviderDomainSyncEnabled)
+            return;
+        self.fileProviderDomainSyncEnabled = YES;
+        self.domainsNeedUpdate = YES;
+    }
+    [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.resumed"];
+    [self requestFileProviderDomainSync];
+}
+
+- (void)requestFileProviderDomainSync {
+    NSArray<NSString *> *rootsSnapshot = nil;
+    NSUInteger requestedGeneration = 0;
+    @synchronized (self) {
+        self.fileProviderDomainSyncGeneration++;
+        requestedGeneration = self.fileProviderDomainSyncGeneration;
+        if (!self.fileProviderDomainSyncEnabled) {
+            self.domainsNeedUpdate = YES;
+            [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.deferred"
+                                          details:@{@"roots": @(self.roots.count),
+                                                    @"generation": @(requestedGeneration)}];
+            return;
+        }
+        if (self.updatingDomains) {
+            self.domainsNeedUpdate = YES;
+            return;
+        }
+        self.updatingDomains = YES;
+        self.domainsNeedUpdate = NO;
+        rootsSnapshot = self.roots.array.copy;
+    }
 
     [NSFileProviderManager getDomainsWithCompletionHandler:^(NSArray<NSFileProviderDomain *> *domains, NSError *error) {
         void (^onError)(NSError *error) = ^(NSError *error) {
@@ -310,7 +387,7 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
                 NSLog(@"error adjusting domains: %@", error);
         };
         onError(error);
-        NSMutableOrderedSet<NSString *> *missingRoots = [self.roots mutableCopy];
+        NSMutableOrderedSet<NSString *> *missingRoots = [NSMutableOrderedSet orderedSetWithArray:rootsSnapshot ?: @[]];
         for (NSFileProviderDomain *domain in domains) {
             if ([missingRoots containsObject:domain.identifier]) {
                 [missingRoots removeObject:domain.identifier];
@@ -328,9 +405,15 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
                                                                 pathRelativeToDocumentStorage:rootId]
                            completionHandler:onError];
         }
-        if (self.domainsNeedUpdate)
-            [self syncFileProviderDomains];
-        self.updatingDomains = NO;
+        BOOL shouldResync = NO;
+        @synchronized (self) {
+            shouldResync = self.domainsNeedUpdate ||
+                self.fileProviderDomainSyncGeneration != requestedGeneration;
+            self.updatingDomains = NO;
+            self.domainsNeedUpdate = NO;
+        }
+        if (shouldResync)
+            [self requestFileProviderDomainSync];
     }];
 }
 
@@ -377,8 +460,15 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
                                      name:importName
                                     error:error
                          progressReporter:progress];
-    if (ok)
+    if (ok) {
+        NSString *guestABI = selectedChoice[kBundledRootGuestABIKey];
+        if (guestABI.length != 0) {
+            WriteRootMetadata([self rootUrl:importName], @{
+                kRootMetadataGuestABIKey: guestABI,
+            });
+        }
         _wantsVersionFile = YES;
+    }
     return ok;
 }
 

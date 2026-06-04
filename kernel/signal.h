@@ -14,15 +14,17 @@ typedef qword_t sigset_t_;
 #define SIG_IGN_ 1
 
 #define SA_SIGINFO_ 4
+#define SA_ONSTACK_ 0x08000000
+#define SA_RESTART_ 0x10000000
 #define SA_NODEFER_ 0x40000000
 #define SA_RESETHAND_ 0x80000000
 
 struct sigaction_ {
-    addr_t handler;
-    dword_t flags;
-    addr_t restorer;
+    guest_addr_t handler;
+    qword_t flags;
+    guest_addr_t restorer;
     sigset_t_ mask;
-} __attribute__((packed));
+};
 
 #define NUM_SIGS 64
 
@@ -60,14 +62,23 @@ struct sigaction_ {
 #define SIGSYS_    31
 
 #define SI_USER_ 0
+#define SI_QUEUE_ -1
 #define SI_TIMER_ -2
 #define SI_TKILL_ -6
 #define SI_KERNEL_ 128
+#define TRAP_BRKPT_ 1
 #define TRAP_TRACE_ 2
+#define ILL_ILLOPC_ 1
+#define FPE_INTDIV_ 1
 #define SEGV_MAPERR_ 1
 #define SEGV_ACCERR_ 2
 
 union sigval_ {
+    int_t sv_int;
+    guest_addr_t sv_ptr;
+};
+
+union i386_sigval_ {
     int_t sv_int;
     addr_t sv_ptr;
 };
@@ -81,6 +92,48 @@ struct siginfo_ {
             pid_t_ pid;
             uid_t_ uid;
         } kill;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            union sigval_ value;
+        } rt;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            int_t status;
+            clock_t_ utime;
+            clock_t_ stime;
+        } child;
+        struct {
+            guest_addr_t addr;
+        } fault;
+        struct {
+            guest_addr_t addr;
+            int_t syscall;
+        } sigsys;
+        struct {
+            int_t timer;
+            int_t overrun;
+            union sigval_ value;
+            int_t _private;
+        } timer;
+    };
+};
+
+struct i386_siginfo_ {
+    int_t sig;
+    int_t sig_errno;
+    int_t code;
+    union {
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+        } kill;
+        struct {
+            pid_t_ pid;
+            uid_t_ uid;
+            union i386_sigval_ value;
+        } rt;
         struct {
             pid_t_ pid;
             uid_t_ uid;
@@ -98,7 +151,7 @@ struct siginfo_ {
         struct {
             int_t timer;
             int_t overrun;
-            union sigval_ value;
+            union i386_sigval_ value;
             int_t _private;
         } timer;
     };
@@ -126,6 +179,8 @@ struct sigevent_ {
 void send_signal(struct task *task, int sig, struct siginfo_ info);
 // send a signal without regard for whether the signal is blocked or ignored
 void deliver_signal(struct task *task, int sig, struct siginfo_ info);
+// true when the next unblocked pending signal would run a handler with SA_RESTART
+bool signal_should_restart_syscall(void);
 // send a signal to current if it's not blocked or ignored, return whether that worked
 // exists specifically for sending SIGTTIN/SIGTTOU
 bool try_self_signal(int sig);
@@ -146,11 +201,15 @@ struct sighand {
 };
 struct sighand *sighand_new(void);
 struct sighand *sighand_copy(struct sighand *sighand);
+void sighand_retain(struct sighand *sighand);
 void sighand_release(struct sighand *sighand);
+void deliver_signal_with_sighand(struct task *task, struct sighand *sighand, int sig, struct siginfo_ info);
 
 dword_t sys_rt_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr, dword_t sigset_size);
+dword_t sys_rt_sigaction_guest(dword_t signum, guest_addr_t action_addr, guest_addr_t oldaction_addr, dword_t sigset_size);
 dword_t sys_sigaction(dword_t signum, addr_t action_addr, addr_t oldaction_addr);
 dword_t sys_rt_sigreturn(void);
+qword_t sys_rt_sigreturn_amd64(void);
 dword_t sys_sigreturn(void);
 
 #define SIG_BLOCK_ 0
@@ -158,7 +217,11 @@ dword_t sys_sigreturn(void);
 #define SIG_SETMASK_ 2
 typedef uint64_t sigset_t_;
 dword_t sys_rt_sigprocmask(dword_t how, addr_t set, addr_t oldset, dword_t size);
+dword_t sys_rt_sigprocmask_guest(dword_t how, guest_addr_t set, guest_addr_t oldset, dword_t size);
+dword_t sys_sigprocmask(dword_t how, addr_t set_addr, addr_t oldset_addr);
+dword_t sys_sigprocmask_guest(dword_t how, guest_addr_t set_addr, guest_addr_t oldset_addr);
 int_t sys_rt_sigpending(addr_t set_addr);
+int_t sys_rt_sigpending_guest(guest_addr_t set_addr);
 
 static inline sigset_t_ sig_mask(int sig) {
     assert(sig >= 1 && sig < NUM_SIGS);
@@ -183,18 +246,29 @@ struct stack_t_ {
 #define SS_ONSTACK_ 1
 #define SS_DISABLE_ 2
 #define MINSIGSTKSZ_ 2048
-dword_t sys_sigaltstack(addr_t ss, addr_t old_ss);
+dword_t sys_sigaltstack(guest_addr_t ss, guest_addr_t old_ss);
+dword_t sys_sigaltstack_guest(guest_addr_t ss, guest_addr_t old_ss);
 
 int_t sys_rt_sigsuspend(addr_t mask_addr, uint_t size);
+int_t sys_rt_sigsuspend_guest(guest_addr_t mask_addr, uint_t size);
 int_t sys_pause(void);
 int_t sys_rt_sigtimedwait(addr_t set_addr, addr_t info_addr, addr_t timeout_addr, uint_t set_size);
+int_t sys_rt_sigtimedwait_guest(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size);
 int_t sys_rt_sigtimedwait_time64(addr_t set_addr, addr_t info_addr, addr_t timeout_addr, uint_t set_size);
+int_t sys_rt_sigtimedwait_time64_guest(guest_addr_t set_addr, guest_addr_t info_addr, guest_addr_t timeout_addr, uint_t set_size);
+dword_t sys_rt_sigqueueinfo(pid_t_ pid, dword_t sig, addr_t uinfo_addr);
+dword_t sys_rt_sigqueueinfo_guest(pid_t_ pid, dword_t sig, guest_addr_t uinfo_addr);
+dword_t sys_rt_tgsigqueueinfo(pid_t_ tgid, pid_t_ tid, dword_t sig, addr_t uinfo_addr);
+dword_t sys_rt_tgsigqueueinfo_guest(pid_t_ tgid, pid_t_ tid, dword_t sig, guest_addr_t uinfo_addr);
 int_t sys_signalfd(int_t fd, addr_t mask_addr, dword_t sigsetsize);
 int_t sys_signalfd4(int_t fd, addr_t mask_addr, dword_t sigsetsize, int_t flags);
+int_t sys_signalfd_guest(int_t fd, guest_addr_t mask_addr, dword_t sigsetsize);
+int_t sys_signalfd4_guest(int_t fd, guest_addr_t mask_addr, dword_t sigsetsize, int_t flags);
 
 dword_t sys_kill(pid_t_ pid, dword_t sig);
 dword_t sys_tkill(pid_t_ tid, dword_t sig);
 dword_t sys_tgkill(pid_t_ tgid, pid_t_ tid, dword_t sig);
+int siginfo_to_user(struct task *task, guest_addr_t user_addr, const struct siginfo_ *info);
 
 // signal frame structs. There's a good chance this should go in its own header file
 
@@ -285,7 +359,7 @@ struct rt_sigframe_ {
     addr_t pinfo;
     addr_t puc;
     union {
-        struct siginfo_ info;
+        struct i386_siginfo_ info;
         char __pad[128];
     };
     struct ucontext_ uc;

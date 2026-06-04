@@ -29,13 +29,17 @@
 .irp type, read,write
 
 .macro \type\()_prep size, id
+    movq -TLB_entries+TLB_mmu(%_tlb), %r15
+    movq -TLB_entries+TLB_mem_changes(%_tlb), %r14
+    cmpq MMU_changes(%r15), %r14
+    jne handle_miss_\id
     movl %_addr, %r14d
     shrl $12, %r14d
     andl $0x3ff, %r14d
     movl %_addr, %r15d
     shrl $22, %r15d
     xor %r15d, %r14d
-    shll $4, %r14d
+    imull $TLB_ENTRY_SIZE, %r14d, %r14d
     movl %_addr, %r15d
     andl $0xfff, %r15d
     cmpl $(0x1000-(\size/8)), %r15d

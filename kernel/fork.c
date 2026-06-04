@@ -36,38 +36,12 @@
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_)
 
-static bool trace_session_fork_name(const char *name) {
-    return strcmp(name, "login") == 0 ||
-        strcmp(name, "sshd") == 0 ||
-        strcmp(name, "sh") == 0 ||
-        strcmp(name, "bash") == 0 ||
-        strcmp(name, "dash") == 0 ||
-        strcmp(name, "getty") == 0 ||
-        strcmp(name, "agetty") == 0;
-}
-
-static void trace_fork_tty(struct task *task, int *type_out, int *num_out) {
-    int type = -1;
-    int num = -1;
-    lock(&task->group->lock, 0);
-    struct tty *tty = task->group->tty;
-    if (tty != NULL) {
-        type = tty->type;
-        num = tty->num;
-    }
-    unlock(&task->group->lock);
-    if (type_out != NULL)
-        *type_out = type;
-    if (num_out != NULL)
-        *num_out = num;
-}
-
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
+    if (group == NULL)
+        return NULL;
     *group = *old_group;
     list_init(&group->threads);
-    list_add(&old_group->pgroup, &group->pgroup);
-    list_add(&old_group->session, &group->session);
     if (group->tty) {
         lock(&group->tty->lock, 0);
         group->tty->refcount++;
@@ -82,10 +56,14 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     return group;
 }
 
-static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid_addr, addr_t tls_addr, addr_t ctid_addr) {
+static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest_addr_t ptid_addr,
+        guest_addr_t tls_addr, guest_addr_t ctid_addr) {
     task->vfork = NULL;
-    if (stack != 0)
-        task->cpu.esp = stack;
+    if (stack != 0) {
+        task->cpu.esp = (addr_t) stack;
+        if (task->abi == GUEST_ABI_AMD64)
+            task->cpu.amd64_regs[amd64_rsp] = stack;
+    }
 
     int err;
     struct mm *mm = task->mm;
@@ -123,25 +101,43 @@ static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid
     }
 
     struct tgroup *old_group = task->group;
-    complex_lockt(&pids_lock, 0);
-    lock(&old_group->lock, 0);
+    struct tgroup *new_group = NULL;
     if (!(flags & CLONE_THREAD_)) {
-        task->group = tgroup_copy(old_group);
-        task->group->leader = task;
-        task->tgid = task->pid;
+        lock(&old_group->lock, 0);
+        new_group = tgroup_copy(old_group);
+        unlock(&old_group->lock);
+        if (new_group == NULL) {
+            err = _ENOMEM;
+            goto fail_free_sighand;
+        }
     } else {
         // New threads do not inherit the parent's alternate signal stack
         task->altstack = 0;
         task->altstack_size = 0;
+    }
+
+    complex_lockt(&pids_lock, 0);
+    lock(&old_group->lock, 0);
+    if (new_group != NULL) {
+        list_add(&old_group->pgroup, &new_group->pgroup);
+        list_add(&old_group->session, &new_group->session);
+        task->group = new_group;
+        task->group->leader = task;
+        task->tgid = task->pid;
     }
     list_add(&task->group->threads, &task->group_links);
     unlock(&old_group->lock);
     unlock(&pids_lock);
 
     if (flags & CLONE_SETTLS_) {
-        err = task_set_thread_area(task, tls_addr);
-        if (err < 0)
-            goto fail_free_sighand;
+        if (task->abi == GUEST_ABI_AMD64) {
+            // On amd64, CLONE_SETTLS passes the new thread's FS base directly.
+            task->cpu.tls_ptr = tls_addr;
+        } else {
+            err = task_set_thread_area(task, (addr_t) tls_addr);
+            if (err < 0)
+                goto fail_free_sighand;
+        }
     }
 
     err = _EFAULT;
@@ -172,7 +168,8 @@ fail_free_mem:
     return err;
 }
 
-dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t ctid) {
+static dword_t sys_clone_common(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
+        guest_addr_t tls, guest_addr_t ctid) {
     STRACE("clone(0x%x, 0x%x, 0x%x, 0x%x, 0x%x)", flags, stack, ptid, tls, ctid);
     if (flags & ~CSIGNAL_ & ~IMPLEMENTED_FLAGS) {
         FIXME("unimplemented clone flags 0x%x", flags & ~CSIGNAL_ & ~IMPLEMENTED_FLAGS);
@@ -182,17 +179,6 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
         return _EINVAL;
     if (flags & CLONE_THREAD_ && !(flags & CLONE_SIGHAND_))
         return _EINVAL;
-
-    char parent_comm[sizeof(current->comm)];
-    lock(&current->general_lock, 0);
-    strncpy(parent_comm, current->comm, sizeof(parent_comm));
-    parent_comm[sizeof(parent_comm) - 1] = '\0';
-    unlock(&current->general_lock);
-    bool trace_fork = trace_session_fork_name(parent_comm);
-    int tty_type = -1;
-    int tty_num = -1;
-    if (trace_fork)
-        trace_fork_tty(current, &tty_type, &tty_num);
 
     struct task *task = task_create_(current);
     if (task == NULL)
@@ -210,6 +196,8 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
         return err;
     }
     task->cpu.eax = 0;
+    if (task->abi == GUEST_ABI_AMD64)
+        task->cpu.amd64_regs[amd64_rax] = 0;
 
     struct vfork_info vfork;
     if (flags & CLONE_VFORK_) {
@@ -221,7 +209,12 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
 
     // task might be destroyed by the time we finish, so save the pid
     pid_t pid = task->pid;
+    if (amd64_trace_is_lineage_tgid(current->tgid)) {
+        printk("tracked kernel child: parent=%d tgid=%d abi=%d child=%d child_tgid=%d flags=%#x\n",
+               current->pid, current->tgid, current->abi, pid, task->tgid, flags);
+    }
     bool trace_child = false;
+    int ptrace_event = 0;
     if (current->ptrace.traced && !(flags & CLONE_UNTRACED_)) {
         dword_t trace_option = 0;
         if (flags & CLONE_VFORK_)
@@ -232,13 +225,11 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
             trace_option = PTRACE_O_TRACEFORK_;
 
         if (flags & CLONE_VFORK_)
-            current->ptrace.trap_event = PTRACE_EVENT_VFORK_;
+            ptrace_event = PTRACE_EVENT_VFORK_;
         else if (flags & CLONE_THREAD_)
-            current->ptrace.trap_event = PTRACE_EVENT_CLONE_;
+            ptrace_event = PTRACE_EVENT_CLONE_;
         else
-            current->ptrace.trap_event = PTRACE_EVENT_FORK_;
-        current->ptrace.eventmsg = pid;
-        send_signal(current, SIGTRAP_, SIGINFO_NIL);
+            ptrace_event = PTRACE_EVENT_FORK_;
 
         if (current->ptrace.options & trace_option) {
             ptrace_attach_fork_child(task, current);
@@ -249,17 +240,14 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
     task_start(task);
     if (trace_child)
         send_signal(task, SIGSTOP_, SIGINFO_NIL);
-
-    if (trace_fork) {
-        lock(&task->general_lock, 0);
-        char child_comm[sizeof(task->comm)];
-        strncpy(child_comm, task->comm, sizeof(child_comm));
-        child_comm[sizeof(child_comm) - 1] = '\0';
-        unlock(&task->general_lock);
-        printk("INFO: fork session parent=%d/%d(%s) child=%d/%d(%s) flags=%#x tty=%d:%d\n",
-               current->pid, current->tgid, parent_comm,
-               task->pid, task->tgid, child_comm, flags,
-               tty_type, tty_num);
+    if (trace_child) {
+        struct siginfo_ info = {
+            .sig = SIGTRAP_,
+            .code = SI_KERNEL_,
+            .kill.pid = current->pid,
+            .kill.uid = current->uid,
+        };
+        ptrace_event_stop(SIGTRAP_, &info, ptrace_event, pid);
     }
 
     if (flags & CLONE_VFORK_) {
@@ -277,6 +265,17 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
     return pid;
 }
 
+dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t ctid) {
+    return sys_clone_common(flags, stack, ptid, tls, ctid);
+}
+
+dword_t sys_clone_guest(qword_t flags, guest_addr_t stack, guest_addr_t ptid,
+        guest_addr_t tls, guest_addr_t ctid) {
+    if ((flags >> 32) != 0)
+        return _ENOSYS;
+    return sys_clone_common((dword_t) flags, stack, ptid, tls, ctid);
+}
+
 struct clone_args_ {
     qword_t flags;
     qword_t pidfd;
@@ -291,7 +290,7 @@ struct clone_args_ {
     qword_t cgroup;
 };
 
-dword_t sys_clone3(addr_t uargs_addr, dword_t size) {
+dword_t sys_clone3_guest(guest_addr_t uargs_addr, dword_t size) {
     STRACE("clone3(%#x, %u)", uargs_addr, size);
 
     struct clone_args_ args = {};
@@ -316,17 +315,14 @@ dword_t sys_clone3(addr_t uargs_addr, dword_t size) {
     if (flags & CLONE_PIDFD_)
         return _ENOSYS;
 
-    if ((args.child_tid >> 32) != 0 || (args.parent_tid >> 32) != 0 || (args.tls >> 32) != 0)
-        return _EINVAL;
-
     qword_t child_stack = args.stack;
     if (child_stack != 0 && args.stack_size != 0)
         child_stack += args.stack_size;
-    if ((child_stack >> 32) != 0)
-        return _EINVAL;
+    return sys_clone_common(flags, child_stack, args.parent_tid, args.tls, args.child_tid);
+}
 
-    return sys_clone(flags, (addr_t) child_stack, (addr_t) args.parent_tid,
-        (addr_t) args.tls, (addr_t) args.child_tid);
+dword_t sys_clone3(addr_t uargs_addr, dword_t size) {
+    return sys_clone3_guest(uargs_addr, size);
 }
 
 dword_t sys_unshare(dword_t flags) {

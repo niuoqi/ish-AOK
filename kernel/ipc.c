@@ -30,7 +30,21 @@
 #define SHM_RDONLY_  010000
 #define SHM_RND_     020000
 
-struct ipc_perm_ {
+struct ipc_perm_i386_ {
+    dword_t key;
+    uid_t_ uid;
+    uid_t_ gid;
+    uid_t_ cuid;
+    uid_t_ cgid;
+    dword_t mode;
+    word_t seq;
+    word_t __pad2;
+    dword_t __unused1;
+    dword_t __unused2;
+};
+static_assert(sizeof(struct ipc_perm_i386_) == 36, "i386 ipc_perm size");
+
+struct ipc_perm_amd64_ {
     dword_t key;
     uid_t_ uid;
     uid_t_ gid;
@@ -40,25 +54,41 @@ struct ipc_perm_ {
     word_t __pad1;
     word_t seq;
     word_t __pad2;
-    dword_t __unused1;
-    dword_t __unused2;
+    qword_t __unused1;
+    qword_t __unused2;
 };
+static_assert(sizeof(struct ipc_perm_amd64_) == 48, "amd64 ipc_perm size");
 
-struct shmid_ds_ {
-    struct ipc_perm_ shm_perm;
+struct kernel_shmid64_ds_i386_ {
+    struct ipc_perm_i386_ shm_perm;
     dword_t shm_segsz;
-    time_t_ shm_atime;
-    dword_t __unused1;
-    time_t_ shm_dtime;
-    dword_t __unused2;
-    time_t_ shm_ctime;
-    dword_t __unused3;
+    dword_t shm_atime;
+    dword_t shm_atime_high;
+    dword_t shm_dtime;
+    dword_t shm_dtime_high;
+    dword_t shm_ctime;
+    dword_t shm_ctime_high;
     pid_t_ shm_cpid;
     pid_t_ shm_lpid;
     dword_t shm_nattch;
     dword_t __unused4;
     dword_t __unused5;
 };
+static_assert(sizeof(struct kernel_shmid64_ds_i386_) == 84, "i386 kernel shmid64_ds size");
+
+struct shmid_ds_amd64_ {
+    struct ipc_perm_amd64_ shm_perm;
+    qword_t shm_segsz;
+    sqword_t shm_atime;
+    sqword_t shm_dtime;
+    sqword_t shm_ctime;
+    pid_t_ shm_cpid;
+    pid_t_ shm_lpid;
+    qword_t shm_nattch;
+    qword_t __unused4;
+    qword_t __unused5;
+};
+static_assert(sizeof(struct shmid_ds_amd64_) == 112, "amd64 shmid_ds size");
 
 struct shm_segment {
     struct list shm_segments;
@@ -85,13 +115,17 @@ struct shm_segment {
 struct shm_region {
     struct list mm_regions;
     struct shm_segment *segment;
-    addr_t addr;
+    guest_addr_t addr;
     pages_t pages;
 };
 
 static struct list shm_segments = LIST_INITIALIZER(shm_segments);
 static lock_t shm_lock = LOCK_INITIALIZER;
 static int shm_next_id = 1;
+
+static bool ipc_trace_enabled(void) {
+    return false;
+}
 
 static time_t_ ipc_now(void) {
     return (time_t_) sys_time(0);
@@ -211,7 +245,7 @@ static int shmget_internal(dword_t key, size_t size, int flags) {
     return id;
 }
 
-static addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, addr_t attach_addr, int shmflg) {
+static guest_addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, guest_addr_t attach_addr, int shmflg) {
     int prot = PROT_READ;
     unsigned mem_flags = P_READ | P_SHARED;
     if (!(shmflg & SHM_RDONLY_)) {
@@ -221,7 +255,7 @@ static addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, addr
 
     void *mapping = mmap(NULL, segment->alloc_size, prot, MAP_SHARED, segment->fd, 0);
     if (mapping == MAP_FAILED)
-        return (addr_t) errno_map();
+        return (guest_addr_t) errno_map();
 
     page_t page = 0;
     if (attach_addr != 0) {
@@ -229,7 +263,7 @@ static addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, addr
             attach_addr = BYTES_ROUND_DOWN(attach_addr);
         else if (PGOFFSET(attach_addr) != 0) {
             munmap(mapping, segment->alloc_size);
-            return (addr_t) _EINVAL;
+            return (guest_addr_t) _EINVAL;
         }
         page = PAGE(attach_addr);
     }
@@ -240,30 +274,33 @@ static addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, addr
         if (!pt_is_hole(&mm->mem, page, segment->pages)) {
             write_unlock(&mm->mem.lock);
             munmap(mapping, segment->alloc_size);
-            return (addr_t) _EINVAL;
+            return (guest_addr_t) _EINVAL;
         }
     } else {
         page = pt_find_hole(&mm->mem, segment->pages);
         if (page == BAD_PAGE) {
             write_unlock(&mm->mem.lock);
             munmap(mapping, segment->alloc_size);
-            return (addr_t) _ENOMEM;
+            return (guest_addr_t) _ENOMEM;
         }
-        attach_addr = page << PAGE_BITS;
+        attach_addr = (guest_addr_t) page << PAGE_BITS;
     }
 
     int err = pt_map(&mm->mem, page, segment->pages, mapping, 0, mem_flags);
     if (err < 0) {
         write_unlock(&mm->mem.lock);
         munmap(mapping, segment->alloc_size);
-        return (addr_t) err;
+        return (guest_addr_t) err;
     }
+    struct pt_entry *entry = mem_pt(&mm->mem, page);
+    if (entry != NULL && entry->data != NULL)
+        entry->data->shared_key = (uintptr_t) segment;
 
     struct shm_region *region = malloc(sizeof(*region));
     if (region == NULL) {
         pt_unmap_always(&mm->mem, page, segment->pages);
         write_unlock(&mm->mem.lock);
-        return (addr_t) _ENOMEM;
+        return (guest_addr_t) _ENOMEM;
     }
     *region = (struct shm_region) {
         .segment = segment,
@@ -283,16 +320,16 @@ static addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment, addr
     return attach_addr;
 }
 
-static addr_t shmat_internal(int id, addr_t shmaddr, int shmflg) {
+static guest_addr_t shmat_internal(int id, guest_addr_t shmaddr, int shmflg) {
     lock(&shm_lock, 0);
     struct shm_segment *segment = shm_segment_find_by_id(id);
     unlock(&shm_lock);
     if (segment == NULL || segment->removed)
-        return (addr_t) _EINVAL;
+        return (guest_addr_t) _EINVAL;
     return shm_region_attach(current->mm, segment, shmaddr, shmflg);
 }
 
-static int shmdt_internal(struct mm *mm, addr_t addr, pid_t_ lpid, bool from_release) {
+static int shmdt_internal(struct mm *mm, guest_addr_t addr, pid_t_ lpid, bool from_release) {
     write_lock(&mm->mem.lock);
     struct shm_region *region, *tmp;
     list_for_each_entry_safe(&mm->shm_regions, region, tmp, mm_regions) {
@@ -317,7 +354,39 @@ static int shmdt_internal(struct mm *mm, addr_t addr, pid_t_ lpid, bool from_rel
     return from_release ? 0 : _EINVAL;
 }
 
-static int shmctl_internal(int id, int cmd, addr_t ptr) {
+static int shmctl_ipc_set(struct shm_segment *segment, uid_t_ uid, uid_t_ gid, mode_t_ mode) {
+    segment->uid = uid;
+    segment->gid = gid;
+    segment->mode = mode & 0777;
+    segment->ctime = ipc_now();
+    return 0;
+}
+
+static void shmctl_fill_ipc_perm_i386(struct ipc_perm_i386_ *perm, struct shm_segment *segment) {
+    *perm = (struct ipc_perm_i386_) {
+        .key = segment->key,
+        .uid = segment->uid,
+        .gid = segment->gid,
+        .cuid = segment->cuid,
+        .cgid = segment->cgid,
+        .mode = segment->mode,
+        .seq = 0,
+    };
+}
+
+static void shmctl_fill_ipc_perm_amd64(struct ipc_perm_amd64_ *perm, struct shm_segment *segment) {
+    *perm = (struct ipc_perm_amd64_) {
+        .key = segment->key,
+        .uid = segment->uid,
+        .gid = segment->gid,
+        .cuid = segment->cuid,
+        .cgid = segment->cgid,
+        .mode = segment->mode,
+        .seq = 0,
+    };
+}
+
+static int shmctl_internal_i386(int id, int cmd, addr_t ptr) {
     int cmd_base = cmd & ~IPC_64_;
     lock(&shm_lock, 0);
     struct shm_segment *segment = shm_segment_find_by_id(id);
@@ -334,7 +403,7 @@ static int shmctl_internal(int id, int cmd, addr_t ptr) {
     }
 
     if (cmd_base == IPC_SET_) {
-        struct shmid_ds_ info;
+        struct kernel_shmid64_ds_i386_ info;
         unlock(&shm_lock);
         if (ptr == 0)
             return _EFAULT;
@@ -346,25 +415,13 @@ static int shmctl_internal(int id, int cmd, addr_t ptr) {
             unlock(&shm_lock);
             return _EINVAL;
         }
-        segment->uid = info.shm_perm.uid;
-        segment->gid = info.shm_perm.gid;
-        segment->mode = info.shm_perm.mode & 0777;
-        segment->ctime = ipc_now();
+        shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, (mode_t_) info.shm_perm.mode);
         unlock(&shm_lock);
         return 0;
     }
 
     if (cmd_base == IPC_STAT_) {
-        struct shmid_ds_ info = {
-            .shm_perm = {
-                .key = segment->key,
-                .uid = segment->uid,
-                .gid = segment->gid,
-                .cuid = segment->cuid,
-                .cgid = segment->cgid,
-                .mode = segment->mode,
-                .seq = 0,
-            },
+        struct kernel_shmid64_ds_i386_ info = {
             .shm_segsz = segment->size,
             .shm_atime = segment->atime,
             .shm_dtime = segment->dtime,
@@ -373,6 +430,64 @@ static int shmctl_internal(int id, int cmd, addr_t ptr) {
             .shm_lpid = segment->lpid,
             .shm_nattch = segment->nattch,
         };
+        shmctl_fill_ipc_perm_i386(&info.shm_perm, segment);
+        unlock(&shm_lock);
+        if (ptr == 0)
+            return _EFAULT;
+        if (user_write(ptr, &info, sizeof(info)))
+            return _EFAULT;
+        return 0;
+    }
+
+    unlock(&shm_lock);
+    return _EINVAL;
+}
+
+static int shmctl_internal_amd64(int id, int cmd, guest_addr_t ptr) {
+    int cmd_base = cmd & ~IPC_64_;
+    lock(&shm_lock, 0);
+    struct shm_segment *segment = shm_segment_find_by_id(id);
+    if (segment == NULL) {
+        unlock(&shm_lock);
+        return _EINVAL;
+    }
+
+    if (cmd_base == IPC_RMID_) {
+        segment->removed = true;
+        shm_segment_maybe_destroy(segment);
+        unlock(&shm_lock);
+        return 0;
+    }
+
+    if (cmd_base == IPC_SET_) {
+        struct shmid_ds_amd64_ info;
+        unlock(&shm_lock);
+        if (ptr == 0)
+            return _EFAULT;
+        if (user_read(ptr, &info, sizeof(info)))
+            return _EFAULT;
+        lock(&shm_lock, 0);
+        segment = shm_segment_find_by_id(id);
+        if (segment == NULL) {
+            unlock(&shm_lock);
+            return _EINVAL;
+        }
+        shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, info.shm_perm.mode);
+        unlock(&shm_lock);
+        return 0;
+    }
+
+    if (cmd_base == IPC_STAT_) {
+        struct shmid_ds_amd64_ info = {
+            .shm_segsz = segment->size,
+            .shm_atime = segment->atime,
+            .shm_dtime = segment->dtime,
+            .shm_ctime = segment->ctime,
+            .shm_cpid = segment->cpid,
+            .shm_lpid = segment->lpid,
+            .shm_nattch = segment->nattch,
+        };
+        shmctl_fill_ipc_perm_amd64(&info.shm_perm, segment);
         unlock(&shm_lock);
         if (ptr == 0)
             return _EFAULT;
@@ -412,44 +527,90 @@ void ipc_mm_copy(struct mm *dst, struct mm *src) {
 void ipc_mm_release(struct mm *mm) {
     struct shm_region *region, *tmp;
     list_for_each_entry_safe(&mm->shm_regions, region, tmp, mm_regions) {
-        addr_t addr = region->addr;
+        guest_addr_t addr = region->addr;
         shmdt_internal(mm, addr, current ? current->pid : 0, true);
     }
 }
 
-int_t sys_ipc(uint_t call, int_t first, int_t second, int_t third, addr_t ptr, int_t fifth) {
-    STRACE("ipc(%u, %d, %d, %d, %#x, %d)", call, first, second, third, ptr, fifth);
+static int_t sys_ipc_common(uint_t call, int_t first, int_t second, guest_addr_t third,
+        guest_addr_t ptr, int_t fifth) {
+    STRACE("ipc(%u, %d, %d, %#llx, %#llx, %d)", call, first, second,
+            (unsigned long long) third, (unsigned long long) ptr, fifth);
     use(fifth);
 
     uint_t version = call >> 16;
     uint_t op = call & 0xffff;
     use(version);
+    if (ipc_trace_enabled()) {
+        printk("ipc trace: pid=%d comm=%s call=%#x version=%u op=%u first=%d second=%d third=%#llx ptr=%#llx fifth=%d\n",
+               current->pid, current->comm, call, version, op, first, second,
+               (unsigned long long) third, (unsigned long long) ptr, fifth);
+    }
 
     switch (op) {
         case IPCOP_SHMGET_:
-            return shmget_internal((dword_t) first, (size_t) second, third);
+            return shmget_internal((dword_t) first, (size_t) second, (int_t) third);
         case IPCOP_SHMAT_: {
-            addr_t out_addr = shmat_internal(first, ptr, second);
+            guest_addr_t out_addr = shmat_internal(first, ptr, second);
+            if (ipc_trace_enabled()) {
+                printk("ipc trace: pid=%d comm=%s shmat via ipc shmid=%d shmaddr=%#llx shmflg=%#x result=%#llx\n",
+                       current->pid, current->comm, first, (unsigned long long) ptr,
+                       second, (unsigned long long) out_addr);
+            }
             if (IS_ERR((void *) (uintptr_t) out_addr))
                 return (int_t) PTR_ERR((void *) (uintptr_t) out_addr);
-            if (user_put((addr_t) third, out_addr))
-                return _EFAULT;
+            if (current->abi == GUEST_ABI_AMD64) {
+                if (user_put((guest_addr_t) third, out_addr))
+                    return _EFAULT;
+            } else {
+                addr_t out_addr_i386 = (addr_t) out_addr;
+                if (user_put((guest_addr_t) third, out_addr_i386))
+                    return _EFAULT;
+            }
             return 0;
         }
         case IPCOP_SHMDT_:
             return shmdt_internal(current->mm, ptr, current->pid, false);
         case IPCOP_SHMCTL_:
-            return shmctl_internal(first, second, ptr);
+            if (current->abi == GUEST_ABI_AMD64)
+                return shmctl_internal_amd64(first, second, ptr);
+            return shmctl_internal_i386(first, second, (addr_t) ptr);
         default:
+            if (ipc_trace_enabled()) {
+                printk("ipc trace: pid=%d comm=%s unimplemented ipc op=%u version=%u\n",
+                       current->pid, current->comm, op, version);
+            }
             return _ENOSYS;
     }
+}
+
+int_t sys_ipc(uint_t call, int_t first, int_t second, addr_t third, addr_t ptr, int_t fifth) {
+    return sys_ipc_common(call, first, second, third, ptr, fifth);
+}
+
+int_t sys_ipc_guest(uint_t call, int_t first, int_t second, guest_addr_t third, guest_addr_t ptr, int_t fifth) {
+    return sys_ipc_common(call, first, second, third, ptr, fifth);
 }
 
 int_t sys_shmget(dword_t key, dword_t size, dword_t shmflg) {
     return shmget_internal(key, size, shmflg);
 }
 
+int_t sys_shmget_guest(dword_t key, qword_t size, dword_t shmflg) {
+    return shmget_internal(key, (size_t) size, shmflg);
+}
+
 addr_t sys_shmat(int_t shmid, addr_t shmaddr, int_t shmflg) {
+    guest_addr_t result = shmat_internal(shmid, shmaddr, shmflg);
+    if (ipc_trace_enabled()) {
+        printk("ipc trace: pid=%d comm=%s shmat direct shmid=%d shmaddr=%#x shmflg=%#x result=%#llx\n",
+               current->pid, current->comm, shmid, shmaddr, shmflg,
+               (unsigned long long) result);
+    }
+    return (addr_t) result;
+}
+
+guest_addr_t sys_shmat_guest(int_t shmid, guest_addr_t shmaddr, int_t shmflg) {
     return shmat_internal(shmid, shmaddr, shmflg);
 }
 
@@ -457,6 +618,14 @@ int_t sys_shmdt(addr_t shmaddr) {
     return shmdt_internal(current->mm, shmaddr, current->pid, false);
 }
 
+int_t sys_shmdt_guest(guest_addr_t shmaddr) {
+    return shmdt_internal(current->mm, shmaddr, current->pid, false);
+}
+
 int_t sys_shmctl(int_t shmid, int_t cmd, addr_t buf) {
-    return shmctl_internal(shmid, cmd, buf);
+    return shmctl_internal_i386(shmid, cmd, buf);
+}
+
+int_t sys_shmctl_guest(int_t shmid, int_t cmd, guest_addr_t buf) {
+    return shmctl_internal_amd64(shmid, cmd, buf);
 }

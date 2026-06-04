@@ -1,4 +1,7 @@
 #include "kernel/task.h"
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -13,7 +16,6 @@
 #include "fs/poll.h"
 #include "fs/real.h"
 #include "fs/sock.h"
-
 #include "fs/sockrestart.h"
 
 #if defined(__linux__)
@@ -40,6 +42,30 @@ static int real_poll_update(struct real_poll *real, int fd, int types, void *dat
 static inline bool poll_fd_has_host_wait(struct poll_fd *pollfd);
 static void poll_fd_free(struct poll_fd *poll_fd);
 
+static bool poll_fd_needs_periodic_host_rescan(struct poll_fd *poll_fd) {
+#if defined(__APPLE__)
+    if (poll_fd == NULL || poll_fd->fd == NULL)
+        return false;
+    if (poll_fd->fd->ops != &realfs_fdops)
+        return false;
+    if (!(poll_fd->types & POLL_WRITE))
+        return false;
+    return is_adhoc_fd(poll_fd->fd) && S_ISFIFO(poll_fd->fd->stat.mode);
+#else
+    (void) poll_fd;
+    return false;
+#endif
+}
+
+static bool poll_needs_periodic_host_rescan(struct poll *poll_) {
+    struct poll_fd *poll_fd;
+    list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
+        if (poll_fd_needs_periodic_host_rescan(poll_fd))
+            return true;
+    }
+    return false;
+}
+
 static bool poll_deadline_remaining(const struct timespec *deadline, struct timespec *remaining) {
     if (deadline == NULL || remaining == NULL)
         return false;
@@ -57,6 +83,9 @@ static bool poll_trace_comm(const char *comm) {
     if (comm == NULL)
         return false;
     return strcmp(comm, "apk") == 0 ||
+        strcmp(comm, "apt") == 0 ||
+        strcmp(comm, "apt-get") == 0 ||
+        strncmp(comm, "http", 4) == 0 ||
         strcmp(comm, "wget") == 0 ||
         strcmp(comm, "curl") == 0 ||
         strcmp(comm, "ping") == 0 ||
@@ -70,9 +99,25 @@ static bool poll_trace_comm(const char *comm) {
 }
 
 static bool poll_wait_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_POLL_WAIT") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
     if (current == NULL)
         return false;
-    return poll_trace_comm(current->comm) && false;
+    return poll_trace_comm(current->comm);
+}
+
+static bool poll_epoll_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("ISH_TRACE_EPOLL") != NULL ? 1 : 0;
+    if (!enabled)
+        return false;
+    if (current == NULL)
+        return false;
+    return strcmp(current->comm, "compile") == 0;
 }
 
 static void poll_wait_trace_fd(struct poll_fd *poll_fd, int host_events, const char *phase) {
@@ -82,7 +127,7 @@ static void poll_wait_trace_fd(struct poll_fd *poll_fd, int host_events, const c
     char path[MAX_PATH];
     path[0] = '\0';
     generic_getpath(poll_fd->fd, path);
-    printk("INFO: net poll_wait %s pid=%d comm=%s real=%d types=%#x host=%#x path=%s\n",
+    fprintf(stderr, "ish-pollwait: %s pid=%d comm=%s real=%d types=%#x host=%#x path=%s\n",
            phase, current->pid, current->comm, poll_fd->fd->real_fd,
            poll_fd->types, host_events, path);
 }
@@ -91,14 +136,14 @@ static void poll_wait_trace_raw_event(struct poll *poll_, struct real_poll_event
     if (!poll_wait_trace_enabled() || event == NULL)
         return;
 #if HAVE_KQUEUE
-    printk("INFO: net poll_wait %s pid=%d comm=%s ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p notify_fd=%d\n",
+    fprintf(stderr, "ish-pollwait: %s pid=%d comm=%s ident=%llu filter=%d flags=%#x fflags=%#x data=%lld udata=%p notify_fd=%d\n",
            phase, current->pid, current->comm,
            (unsigned long long) event->real.ident, event->real.filter,
            event->real.flags, event->real.fflags,
            (long long) event->real.data, event->real.udata,
            poll_ != NULL ? poll_->notify_pipe[0] : -1);
 #elif HAVE_EPOLL
-    printk("INFO: net poll_wait %s pid=%d comm=%s events=%#x udata=%p notify_fd=%d\n",
+    fprintf(stderr, "ish-pollwait: %s pid=%d comm=%s events=%#x udata=%p notify_fd=%d\n",
            phase, current->pid, current->comm,
            event->real.events, event->real.data.ptr,
            poll_ != NULL ? poll_->notify_pipe[0] : -1);
@@ -114,13 +159,52 @@ static void poll_drop_unknown_event(struct poll *poll_, struct real_poll_event *
         return;
     int err = real_poll_update(&poll_->real, ident, 0, NULL);
     if (poll_wait_trace_enabled()) {
-        printk("INFO: net poll_wait drop-raw pid=%d comm=%s ident=%d err=%d errno=%d\n",
+        fprintf(stderr, "ish-pollwait: drop-raw pid=%d comm=%s ident=%d err=%d errno=%d\n",
                current->pid, current->comm, ident, err, err < 0 ? errno : 0);
     }
 #else
     (void) poll_;
     (void) event;
 #endif
+}
+
+static int poll_deliver_ready_locked(struct poll *poll_, struct poll_fd *poll_fd,
+                                     int poll_types, poll_callback_t callback,
+                                     void *context, const char *phase) {
+    struct fd *fd = poll_fd->fd;
+
+    if (poll_fd->types & POLL_EDGETRIGGERED)
+        poll_types &= ~poll_fd->triggered_types;
+    if (!poll_types)
+        return 0;
+
+    int handled = callback(context, poll_types, poll_fd->info);
+    if (poll_wait_trace_enabled()) {
+        fprintf(stderr, "ish-pollwait: %s pid=%d comm=%s real=%d events=%#x handled=%d\n",
+               phase, current->pid, current->comm,
+               fd != NULL ? fd->real_fd : -1, poll_types, handled);
+    }
+    int res = handled == 1 ? 1 : 0;
+
+    // The real poll does not actually get the FDs set as oneshot.
+    // But this loop is done while holding the lock, so only one
+    // thread can get each oneshot event. This doesn't solve the
+    // thundering herd problem at all, but at least the semantics
+    // are right. I'll just leave that as a TODO.
+    if (poll_fd->types & POLL_ONESHOT) {
+        list_remove(&poll_fd->polls);
+        list_remove(&poll_fd->fds);
+        if (poll_fd_has_host_wait(poll_fd))
+            real_poll_update(&poll_->real, fd->real_fd, 0, NULL);
+        // Keep poll_fd storage alive on the freelist so stale host
+        // readiness events cannot turn into a use-after-free.
+        poll_fd_free(poll_fd);
+        return res;
+    }
+
+    if (poll_fd->types & POLL_EDGETRIGGERED)
+        poll_fd->triggered_types |= poll_types;
+    return res;
 }
 
 static int poll_scan_ready_locked(struct poll *poll_, poll_callback_t callback, void *context) {
@@ -140,41 +224,26 @@ static int poll_scan_ready_locked(struct poll *poll_, poll_callback_t callback, 
             path[0] = '\0';
             if (fd != NULL)
                 generic_getpath(fd, path);
-            printk("INFO: net poll_wait scan pid=%d comm=%s real=%d raw=%#x masked=%#x types=%#x path=%s\n",
+            fprintf(stderr, "ish-pollwait: scan pid=%d comm=%s real=%d raw=%#x masked=%#x types=%#x path=%s\n",
                    current->pid, current->comm,
                    fd != NULL ? fd->real_fd : -1,
                    raw_poll_types, poll_types,
                    poll_fd->types, path);
         }
+        if (poll_epoll_trace_enabled() && fd != NULL && fd->real_fd < 0 &&
+                (raw_poll_types != 0 || poll_types != 0)) {
+            char path[MAX_PATH];
+            path[0] = '\0';
+            generic_getpath(fd, path);
+            printk("epoll-trace: scan pid=%d comm=%s real=%d raw=%#x masked=%#x req=%#x path=%s ops=%p\n",
+                   current->pid, current->comm, fd->real_fd,
+                   raw_poll_types, poll_types, poll_fd->types, path, fd->ops);
+        }
         if (!poll_types)
             continue;
 
-        int handled = callback(context, poll_types, poll_fd->info);
-        if (poll_wait_trace_enabled()) {
-            printk("INFO: net poll_wait callback pid=%d comm=%s real=%d events=%#x handled=%d\n",
-                   current->pid, current->comm,
-                   fd != NULL ? fd->real_fd : -1, poll_types, handled);
-        }
-        if (handled == 1)
-            res++;
-
-        // The real poll does not actually get the FDs set as oneshot.
-        // But this loop is done while holding the lock, so only one
-        // thread can get each oneshot event. This doesn't solve the
-        // thundering herd problem at all, but at least the semantics
-        // are right. I'll just leave that as a TODO.
-        if (poll_fd->types & POLL_ONESHOT) {
-            list_remove(&poll_fd->polls);
-            list_remove(&poll_fd->fds);
-            if (poll_fd_has_host_wait(poll_fd))
-                real_poll_update(&poll_->real, fd->real_fd, 0, NULL);
-            // Keep poll_fd storage alive on the freelist so stale host
-            // readiness events cannot turn into a use-after-free.
-            poll_fd_free(poll_fd);
-        }
-
-        if (poll_fd->types & POLL_EDGETRIGGERED)
-            poll_fd->triggered_types |= poll_types;
+        res += poll_deliver_ready_locked(poll_, poll_fd, poll_types,
+                                         callback, context, "callback");
     }
     return res;
 }
@@ -373,7 +442,7 @@ void poll_wakeup(struct fd *fd, int events) {
         lock(&poll->lock,0);
         if (poll_fd->types & POLL_EDGETRIGGERED)
             poll_fd->triggered_types &= ~events;
-        if (poll->notify_pipe[1] != -1 && !poll->notify_pending) {
+        if (poll->notify_pipe[1] != -1) {
             ssize_t wrote;
             do {
                 wrote = write(poll->notify_pipe[1], "", 1);
@@ -456,6 +525,10 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                 } else {
                     struct timespec remaining_timeout = {0};
                     struct timespec *wait_timeout = NULL;
+                    struct timespec periodic_rescan_timeout = {
+                        .tv_sec = 0,
+                        .tv_nsec = 100 * 1000 * 1000L,
+                    };
                     if (deadline != NULL) {
                         if (!poll_deadline_remaining(deadline, &remaining_timeout)) {
                             pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
@@ -466,9 +539,17 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
                         }
                         wait_timeout = &remaining_timeout;
                     }
+                    if (poll_needs_periodic_host_rescan(poll_)) {
+                        if (wait_timeout == NULL ||
+                                wait_timeout->tv_sec > periodic_rescan_timeout.tv_sec ||
+                                (wait_timeout->tv_sec == periodic_rescan_timeout.tv_sec &&
+                                 wait_timeout->tv_nsec > periodic_rescan_timeout.tv_nsec)) {
+                            wait_timeout = &periodic_rescan_timeout;
+                        }
+                    }
                     pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
                     if (poll_wait_trace_enabled()) {
-                        printk("INFO: net poll_wait sleep pid=%d comm=%s timeout=%lds.%09ld waiters=%d\n",
+                        fprintf(stderr, "ish-pollwait: sleep pid=%d comm=%s timeout=%lds.%09ld waiters=%d\n",
                                current->pid, current->comm,
                                wait_timeout != NULL ? wait_timeout->tv_sec : -1L,
                                wait_timeout != NULL ? wait_timeout->tv_nsec : -1L,
@@ -482,7 +563,7 @@ poll_wait_done:
             lock(&poll_->lock, 0);
         } while (sockrestart_should_restart_listen_wait(1) && errno == EINTR);
         if (poll_wait_trace_enabled()) {
-            printk("INFO: net poll_wait wake pid=%d comm=%s err=%d errno=%d notify_pending=%d\n",
+            fprintf(stderr, "ish-pollwait: wake pid=%d comm=%s err=%d errno=%d notify_pending=%d\n",
                    current->pid, current->comm, err, err < 0 ? errno : 0, poll_->notify_pending);
             if (err > 0) {
                 for (int i = 0; i < err; i++) {
@@ -517,7 +598,11 @@ poll_wait_done:
             break;
         }
 
-        // dead with any edge-triggered notifications
+        // Deliver host readiness notifications directly. fd->ops->poll() is
+        // still the preferred readiness source, but Darwin can report EOF/HUP
+        // through kqueue when a follow-up zero-time probe returns no bits. If
+        // we only rescan, that host event can wake us forever without ever
+        // reaching the guest.
         for (int i = 0; i < err; i++) {
             struct poll_fd *candidate = rpe_data(&e[i]);
             struct poll_fd *triggered_poll_fd = poll_find_ptr(poll_, candidate);
@@ -525,10 +610,26 @@ poll_wait_done:
             if (triggered_poll_fd == NULL)
                 triggered_poll_fd = poll_find_real_fd(poll_, (int) e[i].real.ident);
 #endif
-            if (triggered_poll_fd != NULL && triggered_poll_fd->poll == poll_ &&
-                    triggered_poll_fd->types & POLL_EDGETRIGGERED) {
-                triggered_poll_fd->triggered_types &= ~rpe_events(&e[i]);
+            if (triggered_poll_fd == NULL || triggered_poll_fd->poll != poll_)
+                continue;
+            int host_events = rpe_events(&e[i]);
+            if (poll_epoll_trace_enabled()) {
+                struct fd *fd = triggered_poll_fd->fd;
+                char path[MAX_PATH];
+                path[0] = '\0';
+                if (fd != NULL)
+                    generic_getpath(fd, path);
+                printk("epoll-trace: host pid=%d comm=%s real=%d host=%#x req=%#x path=%s ops=%p\n",
+                       current->pid, current->comm,
+                       fd != NULL ? fd->real_fd : -1, host_events,
+                       triggered_poll_fd->types, path,
+                       fd != NULL ? (void *) fd->ops : NULL);
             }
+            if (triggered_poll_fd->types & POLL_EDGETRIGGERED)
+                triggered_poll_fd->triggered_types &= ~host_events;
+            int poll_types = host_events & (triggered_poll_fd->types | POLL_HUP | POLL_ERR | POLL_NVAL);
+            res += poll_deliver_ready_locked(poll_, triggered_poll_fd, poll_types,
+                                             callback, context, "host-callback");
         }
 
         while (poll_->notify_pipe[0] != -1) {
@@ -544,6 +645,8 @@ poll_wait_done:
             break;
         }
         if (res < 0)
+            break;
+        if (res > 0)
             break;
     }
 
@@ -672,7 +775,7 @@ static int real_poll_update(struct real_poll *real, int fd, int types, void *dat
     return real_poll_check_receipts(e, count);
 }
 
-static int real_poll_wait(struct real_poll *real, struct real_poll_event *events, int max, struct timespec *timeout) {//mkemke
+static int real_poll_wait(struct real_poll *real, struct real_poll_event *events, int max, struct timespec *timeout) {
     return kevent(real->fd, NULL, 0, (struct kevent *) events, max, timeout);
 }
 

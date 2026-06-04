@@ -46,12 +46,16 @@ _xaddr .req x3
     and w8, _addr, 0xfff
     cmp x8, (0x1000-(\size/8))
     b.hi crosspage_load_\id
+    .ifc \type,write
+        bl resolve_write_ptr
+        b back_\id
+    .endif
     and w8, _addr, 0xfffff000
     str w8, [_tlb, (-TLB_entries+TLB_dirty_page)]
     ubfx x9, _xaddr, 12, 10
     eor x9, x9, _xaddr, lsr 22
-    lsl x9, x9, 4
-    add x9, x9, _tlb
+    mov w10, TLB_ENTRY_SIZE
+    madd x9, x9, x10, _tlb
     .ifc \type,read
         ldr w10, [x9, TLB_ENTRY_page]
     .else
@@ -132,9 +136,11 @@ back_write_done_\id :
     strb w10, [_cpu, CPU_of]
     setf_c
 .endm
-.macro setf_a src, dst
-    str \src, [_cpu, CPU_op1]
-    str \dst, [_cpu, CPU_op2]
+.macro setf_a src, dst, s=
+    movs w10, \src, \s
+    str w10, [_cpu, CPU_op1]
+    movs w10, \dst, \s
+    str w10, [_cpu, CPU_op2]
     ldr w10, [_cpu, CPU_flags_res]
     orr w10, w10, AF_OPS
     str w10, [_cpu, CPU_flags_res]

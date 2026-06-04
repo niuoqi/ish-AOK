@@ -13,6 +13,7 @@
 #import "UIViewController+Extras.h"
 #import "NSObject+SaneKVO.h"
 #import "UserPreferences.h"
+#import "WorkspaceViewController.h"
 
 @interface RootsTableViewController ()
 @end
@@ -29,6 +30,42 @@
 @end
 
 @implementation RootsTableViewController
+
+- (BOOL)_bundledChoiceRequiresAMD64Bringup:(NSDictionary<NSString *, NSString *> *)choice {
+    return [choice[@"guestABI"] isEqualToString:@"amd64"];
+}
+
+- (NSString *)_bundledChoiceSubtitle:(NSDictionary<NSString *, NSString *> *)choice {
+    if ([self _bundledChoiceRequiresAMD64Bringup:choice]) {
+        return @"Experimental x86_64 guest rootfs for amd64 bring-up.";
+    }
+    return @"i386 guest rootfs.";
+}
+
+- (void)_beginBundledImportChoice:(NSDictionary<NSString *, NSString *> *)choice {
+    [self startBundledImportChoice:choice];
+}
+
+- (void)_confirmBundledImportChoiceIfNeeded:(NSDictionary<NSString *, NSString *> *)choice {
+    if (![self _bundledChoiceRequiresAMD64Bringup:choice]) {
+        [self _beginBundledImportChoice:choice];
+        return;
+    }
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"Import x86_64 Filesystem?"
+                                            message:@"This rootfs is for experimental amd64 bring-up. It may fail early or boot only partially."
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Import Anyway"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [self _beginBundledImportChoice:choice];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
 - (void)_completeRootSelectionWithName:(NSString *)rootName {
     if (rootName.length == 0)
@@ -102,8 +139,11 @@
                         [self presentError:error title:@"Import failed"];
                     return;
                 }
+                NSString *currentInitialWindow =
+                    [NSUserDefaults.standardUserDefaults stringForKey:kPreferenceInitialWindowKey];
                 if (!self.choosesRootOnSelection &&
                     wasInitialSelection &&
+                    ![currentInitialWindow isEqualToString:ISHInitialWindowWorkspaceValue] &&
                     ([initialWindow isEqualToString:@"terminal"] ||
                      [initialWindow isEqualToString:@"session-shell"])) {
                     [NSUserDefaults.standardUserDefaults setObject:initialWindow
@@ -130,7 +170,7 @@
         [alert addAction:[UIAlertAction actionWithTitle:displayName
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(__unused UIAlertAction *action) {
-            [self startBundledImportChoice:choice];
+            [self _confirmBundledImportChoiceIfNeeded:choice];
         }]];
     }
 
@@ -269,7 +309,7 @@
     }
     if ([self sectionShowsBundledChoices:section]) {
         if (!self.showsInstalledRootsSection)
-            return @"Choose one of the bundled filesystems below, or tap Import to browse for another archive.";
+            return @"Choose one of the bundled filesystems below, or tap Import to browse for another archive. x86_64 roots are experimental amd64 bring-up targets right now.";
         return @"These bundled filesystems can be imported again at any time.";
     }
     return nil;
@@ -282,24 +322,31 @@
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"BundledRootChoice"];
         NSDictionary<NSString *, NSString *> *choice = self.bundledChoices[indexPath.row];
         cell.textLabel.text = choice[@"displayName"];
-        cell.detailTextLabel.text = nil;
+        cell.detailTextLabel.text = [self _bundledChoiceSubtitle:choice];
         cell.accessoryType = UITableViewCellAccessoryNone;
+        cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         return cell;
     }
 
     NSString *ident = @"Root";
-    if ([Roots.instance.roots[indexPath.row] isEqual:Roots.instance.defaultRoot])
+    BOOL isDefaultRoot = [Roots.instance.roots[indexPath.row] isEqual:Roots.instance.defaultRoot];
+    if (isDefaultRoot)
         ident = @"Default Root";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:ident forIndexPath:indexPath];
     cell.textLabel.text = Roots.instance.roots[indexPath.row];
+    if (isDefaultRoot) {
+        cell.accessibilityTraits |= UIAccessibilityTraitSelected;
+    } else {
+        cell.accessibilityTraits &= ~UIAccessibilityTraitSelected;
+    }
     return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self sectionShowsBundledChoices:indexPath.section]) {
         [tableView deselectRowAtIndexPath:indexPath animated:YES];
-        [self startBundledImportChoice:self.bundledChoices[indexPath.row]];
+        [self _confirmBundledImportChoiceIfNeeded:self.bundledChoices[indexPath.row]];
         return;
     }
     if (self.choosesRootOnSelection && [self sectionShowsInstalledRoots:indexPath.section]) {

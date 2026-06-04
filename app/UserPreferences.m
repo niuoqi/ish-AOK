@@ -7,9 +7,10 @@
 
 #import "UserPreferences.h"
 #import "fs/proc/ish.h"
+#include "jit/jit.h"
 #include "task.h"
 
-// Stuff to allow for cleaning up when doEnableExtraLocking is disabled.  -mke
+// Helpers for cleanup when extra locking is disabled.
 extern bool doEnableExtraLocking;
 extern lock_t pids_lock;
 extern struct list alive_pids_list;
@@ -28,6 +29,12 @@ static NSString *const kPreferenceThemeKey = @"ModernTheme";
 static NSString *const kPreferenceDisableDimmingKey = @"Disable Dimming";
 static NSString *const kPreferenceEnableMulticoreKey = @"Enable Multicore";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
+static NSString *const kPreferenceEnableExperimentalAmd64JitKey = @"Enable Experimental amd64 JIT";
+static NSString *const kPreferenceEnableLLMClientKey = @"Enable LLM Client";
+static NSString *const kPreferenceLLMProviderKey = @"LLM Provider";
+static NSString *const kPreferenceLLMServerURLKey = @"LLM Server URL";
+static NSString *const kPreferenceLLMModelKey = @"LLM Model";
+static NSString *const kPreferenceLLMAPIKeyKey = @"LLM API Key";
 
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
 NSString *const kPreferenceBootCommandKey = @"Boot Command";
@@ -130,6 +137,15 @@ bool remove_user_default_impl(const char *name) {
     return true;
 }
 
+bool amd64_jit_preference_get(void) {
+    return [NSUserDefaults.standardUserDefaults boolForKey:kPreferenceEnableExperimentalAmd64JitKey];
+}
+
+void amd64_jit_preference_set(bool enabled) {
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kPreferenceEnableExperimentalAmd64JitKey];
+    amd64_jit_set_enabled(enabled);
+}
+
 // TODO: Move these to Linux
 #if ISH_LINUX
 char **(*get_all_defaults_keys)(void);
@@ -159,7 +175,13 @@ bool (*remove_user_default)(const char *name);
         _defaults = [NSUserDefaults standardUserDefaults];
         [_defaults registerDefaults:@{
             kPreferenceEnableMulticoreKey: @(YES),
-	    kPreferenceEnableExtraLockingKey: @(YES),
+            kPreferenceEnableExtraLockingKey: @(YES),
+            kPreferenceEnableExperimentalAmd64JitKey: @(NO),
+            kPreferenceEnableLLMClientKey: @(NO),
+            kPreferenceLLMProviderKey: @"OpenRouter Free",
+            kPreferenceLLMServerURLKey: @"https://openrouter.ai/api/v1",
+            kPreferenceLLMModelKey: @"openrouter/free",
+            kPreferenceLLMAPIKeyKey: @"",
             kPreferenceFontSizeKey: @(12),
             kPreferenceCapsLockMappingKey: @(CapsLockMapControl),
             kPreferenceOptionMappingKey: @(OptionMapNone),
@@ -190,6 +212,7 @@ bool (*remove_user_default)(const char *name);
         get_user_default = get_user_default_impl;
         set_user_default = set_user_default_impl;
         remove_user_default = remove_user_default_impl;
+        amd64_jit_set_enabled([_defaults boolForKey:kPreferenceEnableExperimentalAmd64JitKey]);
         friendlyPreferenceMapping = @{
             @"enable_multicore": kPreferenceEnableMulticoreKey,
             @"enable_extralocking": kPreferenceEnableExtraLockingKey,
@@ -201,6 +224,12 @@ bool (*remove_user_default)(const char *name);
             @"font_family": kPreferenceFontFamilyKey,
             @"font_size": kPreferenceFontSizeKey,
             @"disable_dimming": kPreferenceDisableDimmingKey,
+            @"enable_experimental_amd64_jit": kPreferenceEnableExperimentalAmd64JitKey,
+            @"enable_llm_client": kPreferenceEnableLLMClientKey,
+            @"llm_provider": kPreferenceLLMProviderKey,
+            @"llm_server_url": kPreferenceLLMServerURLKey,
+            @"llm_model": kPreferenceLLMModelKey,
+            @"llm_api_key": kPreferenceLLMAPIKeyKey,
             @"launch_command": kPreferenceLaunchCommandKey,
             @"boot_command": kPreferenceBootCommandKey,
             @"cursor_style": kPreferenceCursorStyleKey,
@@ -227,6 +256,12 @@ bool (*remove_user_default)(const char *name);
             kPreferenceFontFamilyKey: property(fontFamily),
             kPreferenceFontSizeKey: property(fontSize),
             kPreferenceDisableDimmingKey: property(shouldDisableDimming),
+            kPreferenceEnableExperimentalAmd64JitKey: property(shouldEnableExperimentalAmd64Jit),
+            kPreferenceEnableLLMClientKey: property(shouldEnableLLMClient),
+            kPreferenceLLMProviderKey: property(llmProvider),
+            kPreferenceLLMServerURLKey: property(llmServerURL),
+            kPreferenceLLMModelKey: property(llmModel),
+            kPreferenceLLMAPIKeyKey: property(llmAPIKey),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
             kPreferenceCursorStyleKey: property(cursorStyle),
@@ -436,6 +471,84 @@ bool (*remove_user_default)(const char *name);
     return [*value isKindOfClass:NSNumber.class];
 }
 
+// MARK: shouldEnableExperimentalAmd64Jit
+- (BOOL)shouldEnableExperimentalAmd64Jit {
+    return [_defaults boolForKey:kPreferenceEnableExperimentalAmd64JitKey];
+}
+
+- (void)setShouldEnableExperimentalAmd64Jit:(BOOL)enabled {
+    amd64_jit_preference_set(enabled);
+}
+
+- (BOOL)validateShouldEnableExperimentalAmd64Jit:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: shouldEnableLLMClient
+- (BOOL)shouldEnableLLMClient {
+    return [_defaults boolForKey:kPreferenceEnableLLMClientKey];
+}
+
+- (void)setShouldEnableLLMClient:(BOOL)enabled {
+    [_defaults setBool:enabled forKey:kPreferenceEnableLLMClientKey];
+}
+
+- (BOOL)validateShouldEnableLLMClient:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: llmProvider
+- (NSString *)llmProvider {
+    return [_defaults stringForKey:kPreferenceLLMProviderKey] ?: @"Custom";
+}
+
+- (void)setLlmProvider:(NSString *)llmProvider {
+    [_defaults setObject:llmProvider ?: @"Custom" forKey:kPreferenceLLMProviderKey];
+}
+
+- (BOOL)validateLlmProvider:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSString.class];
+}
+
+// MARK: llmServerURL
+- (NSString *)llmServerURL {
+    return [_defaults stringForKey:kPreferenceLLMServerURLKey] ?: @"";
+}
+
+- (void)setLlmServerURL:(NSString *)llmServerURL {
+    [_defaults setObject:llmServerURL ?: @"" forKey:kPreferenceLLMServerURLKey];
+}
+
+- (BOOL)validateLlmServerURL:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSString.class];
+}
+
+// MARK: llmModel
+- (NSString *)llmModel {
+    return [_defaults stringForKey:kPreferenceLLMModelKey] ?: @"";
+}
+
+- (void)setLlmModel:(NSString *)llmModel {
+    [_defaults setObject:llmModel ?: @"" forKey:kPreferenceLLMModelKey];
+}
+
+- (BOOL)validateLlmModel:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSString.class];
+}
+
+// MARK: llmAPIKey
+- (NSString *)llmAPIKey {
+    return [_defaults stringForKey:kPreferenceLLMAPIKeyKey] ?: @"";
+}
+
+- (void)setLlmAPIKey:(NSString *)llmAPIKey {
+    [_defaults setObject:llmAPIKey ?: @"" forKey:kPreferenceLLMAPIKeyKey];
+}
+
+- (BOOL)validateLlmAPIKey:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSString.class];
+}
+
 // MARK: ShouldEnablemulticore
 - (BOOL)shouldEnableMulticore {
     return [_defaults boolForKey:kPreferenceEnableMulticoreKey];
@@ -459,8 +572,8 @@ bool (*remove_user_default)(const char *name);
 }
 
 - (BOOL)validateShouldEnableExtraLocking:(id *)value error:(NSError **)error {
-    // Should set task->critical_region.count to 0 for all active processes when this is set to false.  Otherwise stuff blows up.  -mke
-    if(doEnableExtraLocking == true) {  // This needs to be the opposite of what you would expect because of reasons.  -mke
+    // Toggling this at runtime still needs coordinated cleanup of active tasks.
+    if(doEnableExtraLocking == true) {
 //        complex_lockt(&pids_lock, 0, __FILE__, __LINE__);
  //       zero_critical_regions_count();
   //      unlock(&pids_lock);
